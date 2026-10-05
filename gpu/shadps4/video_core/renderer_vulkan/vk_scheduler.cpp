@@ -210,8 +210,14 @@ void Scheduler::WaitHostCopies() {
         BbStats::WaitTimer timer{BbStats::host_copies_wait_ns};
         BbStats::host_copy_waits.fetch_add(1, std::memory_order_relaxed);
         KickRecording(true);
-        while (host_copies_done.load(std::memory_order_acquire) < host_copies_issued) {
+        for (u64 done = host_copies_done.load(std::memory_order_acquire);
+             done < host_copies_issued; done = host_copies_done.load(std::memory_order_acquire)) {
+#ifdef __APPLE__
+            // Release the core while the recorder copies; fences retain the same sequence.
+            host_copies_done.wait(done, std::memory_order_acquire);
+#else
             std::this_thread::yield();
+#endif
         }
     }
     BbStats::WaitTimer timer{BbStats::copy_threads_wait_ns};
@@ -296,6 +302,10 @@ void Scheduler::RecorderThread(std::stop_token stoken) {
         }
         // current_cmdbuf only changes after SyncRecording(), which waits for this thread.
         chunk->Execute(current_cmdbuf);
+#ifdef __APPLE__
+        // ponytail: wake at batch end; target-specific wakeups if batch latency dominates.
+        host_copies_done.notify_one();
+#endif
         {
             std::scoped_lock lk{recorder_mutex};
             free_chunks.push_back(std::move(chunk));

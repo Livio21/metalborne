@@ -154,3 +154,65 @@ baseline; a speedup and stable 30 FPS have not been established. MetalFX remains
 off by default. See [runtime evidence and allocation findings](MACOS_METALFX.md).
 
 Local evidence: `out/macos-metalfx-run/spatial-private-output.log`.
+
+## Recording-mode comparison (2026-10-05)
+
+With the character and camera stationary in the heavier starting-room scene
+(about 1380 draws/frame), four baseline windows averaged 14.53 guest Flip FPS;
+five windows with threaded recording disabled averaged 14.86 FPS. This small
+difference does not establish a gain, so threaded recording remains enabled.
+Earlier windows with a moving camera, and windows collected during compilation,
+are excluded. Copy-pool routing also has no valid matched-scene gain.
+
+Local evidence: `out/macos-optimization/before.log` and `phases.jsonl`.
+
+### Blocking host-copy waits on macOS
+
+`Scheduler::WaitHostCopies` now uses C++ atomic wait on macOS. The recorder wakes
+the waiter after each command batch, retaining the existing release/acquire
+completion sequence and guest fence ordering. Other platforms retain yielding.
+Notifying after every small copy was rejected after a slower gameplay run;
+notifications are batched instead. Waiting can extend to the end of the batch.
+
+The build succeeded, and the batch-wait version reached the same stationary
+starting-room view with about 1380 draws/frame, 1280x720 rendering, MetalFX off,
+FIFO presentation and the conservative GPU settings. The last six warm windows
+of the previous-renderer run averaged 17.57 guest Flip FPS and 14.06 microseconds
+of GPU command-thread CPU time per draw; six warm batch-wait windows averaged
+19.57 FPS and 7.76 microseconds/draw. This is about 45% less command-thread CPU
+time per draw in this short comparison. The guest pacing median remained 50 ms;
+the 30 FPS target is not met in this scene. These are separate runs, not a
+sustained performance guarantee or a display scanout measurement. No compiler
+was running during either comparison window.
+
+Local evidence: `out/macos-optimization/baseline-repeat.log`, `batch-wait.log`
+and `batch-wait-build.log`. A smoke check for forward progress through host-copy
+waits, after entering gameplay and leaving it still for at least 30 seconds:
+
+```bash
+python3 - out/macos-optimization/batch-wait.log <<'PY'
+import pathlib, re, sys
+log = pathlib.Path(sys.argv[1]).read_text(errors='replace')
+rows = re.findall(r'Guest flip stats: ([\d.]+) FPS.*?([\d.]+) draws/frame.*?host copies ([\d.]+)% \(([\d.]+)/frame\)', log)
+game = [tuple(map(float, row)) for row in rows if float(row[1]) >= 500]
+assert len(game) >= 3, 'Need three gameplay windows; check for a stalled waiter'
+assert all(fps > 0 and waits > 0 for fps, draws, blocked, waits in game[-3:])
+assert not re.search(r'Assertion failed|SIGBUS|SIGSEGV', log)
+print('Gameplay progressed through host-copy waits; check visuals separately')
+PY
+```
+
+### User-supplied patch collection
+
+The supplied `Bloodborne.xml` was imported locally as
+`out/macos-run/patches/Bloodborne-user.xml`, with all its entries disabled in
+`out/macos-run/patches.json`. It has not replaced the bundled XML or been
+published. The existing external-patch loader can select individual entries.
+
+The 192 literal writes in `Performance Patch (Perf Increase)` fit the v1.09
+ELF loadable segments and do not conflict with the bundled 1280x720 writes.
+These checks do not establish runtime compatibility or an FPS gain. The
+`rgba8f color space` patch changes game render-target precision; `lower specific
+renders` lowers selected pass resolutions. Both require a visual comparison.
+`30 FPS++` changes game timing, and the faster-loading patch requests vblank
+500 or higher. Neither is enabled for the original 30 FPS / 60 Hz target.
