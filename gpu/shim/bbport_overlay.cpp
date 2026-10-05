@@ -11,8 +11,11 @@
 #include <SDL3/SDL.h>
 #include "bbport_settings.h"
 #include "imgui.h"
-#include "imgui_impl_vulkan.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
+#include "imgui_impl_vulkan.h"
+#ifdef __APPLE__
+#include "macos_metalfx.h"
+#endif
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 
 // DejaVu Sans (Cyrillic), embedded (third_party/fonts, Bitstream Vera license).
@@ -415,31 +418,13 @@ void FpsCounter() {
 
 } // namespace
 
-void Init(const Vulkan::Instance& instance, vk::Format format, u32 image_count) {
-    std::scoped_lock lock{imgui_mutex};
-    if (initialized) {
-        return;
-    }
-    IMGUI_CHECKVERSION();
-    ImGui::CreateContext();
-    ImGuiIO& io = ImGui::GetIO();
-    io.IniFilename = nullptr; // window positions are not kept
-    io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard | ImGuiConfigFlags_NavEnableGamepad;
-    io.BackendFlags |= ImGuiBackendFlags_HasGamepad;
-    io.BackendPlatformName = "bbport";
-
-    ImGui::StyleColorsDark();
-    ImGuiStyle& style = ImGui::GetStyle();
-    style.WindowRounding = 6.0f;
-    style.FrameRounding = 4.0f;
-    style.GrabRounding = 4.0f;
-    style.Colors[ImGuiCol_WindowBg].w = 0.92f;
-
-    ImFontConfig font_config;
-    font_config.FontDataOwnedByAtlas = false;
-    io.Fonts->AddFontFromMemoryTTF(const_cast<unsigned char*>(bb_font_ttf),
-                                   int(bb_font_ttf_end - bb_font_ttf), 18.0f, &font_config);
-
+static const Vulkan::Instance* renderer_instance;
+static vk::Format renderer_format;
+static u32 renderer_images;
+#ifdef __APPLE__
+static bool metal_renderer = false;
+#endif
+static bool InitVulkan(const Vulkan::Instance& instance, vk::Format format, u32 image_count) {
     const vk::Instance vk_instance = instance.GetInstance();
     ImGui_ImplVulkan_LoadFunctions(
         instance.ApiVersion(),
@@ -468,8 +453,39 @@ void Init(const Vulkan::Instance& instance, vk::Format format, u32 image_count) 
     };
     if (!ImGui_ImplVulkan_Init(&info)) {
         std::printf("Overlay: ImGui Vulkan backend init failed\n");
-        ImGui::DestroyContext();
+        return false;
+    }
+    return true;
+}
+
+void Init(const Vulkan::Instance& instance, vk::Format format, u32 image_count) {
+    std::scoped_lock lock{imgui_mutex};
+    if (initialized) {
         return;
+    }
+    IMGUI_CHECKVERSION();
+    ImGui::CreateContext();
+    ImGuiIO& io = ImGui::GetIO();
+    io.IniFilename = nullptr; // window positions are not kept
+    io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard | ImGuiConfigFlags_NavEnableGamepad;
+    io.BackendFlags |= ImGuiBackendFlags_HasGamepad;
+    io.BackendPlatformName = "bbport";
+
+    ImGui::StyleColorsDark();
+    ImGuiStyle& style = ImGui::GetStyle();
+    style.WindowRounding = 6.0f;
+    style.FrameRounding = 4.0f;
+    style.GrabRounding = 4.0f;
+    style.Colors[ImGuiCol_WindowBg].w = 0.92f;
+
+    ImFontConfig font_config;
+    font_config.FontDataOwnedByAtlas = false;
+    io.Fonts->AddFontFromMemoryTTF(const_cast<unsigned char*>(bb_font_ttf),
+                                   int(bb_font_ttf_end - bb_font_ttf), 18.0f, &font_config);
+
+    renderer_instance = &instance; renderer_format = format; renderer_images = image_count;
+    if (!InitVulkan(instance, format, image_count)) {
+        ImGui::DestroyContext(); return;
     }
     initialized = true;
     std::printf("Overlay: menu ready (Insert or L3+R3)\n");
@@ -588,7 +604,7 @@ bool CapturesInput() {
     return menu_open;
 }
 
-void Render(vk::CommandBuffer cmdbuf, vk::ImageView view, vk::Extent2D extent) {
+static bool BuildFrame(vk::Extent2D extent, void* metal_pass = nullptr) {
     // Present interval for the FPS readout (measured also while nothing is drawn).
     const auto now = std::chrono::steady_clock::now();
     const float ms = std::chrono::duration<float, std::milli>(now - last_present).count();
@@ -597,9 +613,8 @@ void Render(vk::CommandBuffer cmdbuf, vk::ImageView view, vk::Extent2D extent) {
         frame_ms_avg = frame_ms_avg == 0.0f ? ms : frame_ms_avg * 0.95f + ms * 0.05f;
     }
     if (!Visible()) {
-        return;
+        return false;
     }
-    std::scoped_lock lock{imgui_mutex};
     ImGuiIO& io = ImGui::GetIO();
     io.DisplaySize = ImVec2(float(extent.width), float(extent.height));
     io.DeltaTime = ms > 0.0f && ms < 1000.0f ? ms / 1000.0f : 1.0f / 60.0f;
@@ -612,6 +627,10 @@ void Render(vk::CommandBuffer cmdbuf, vk::ImageView view, vk::Extent2D extent) {
         base_scale = scale;
     }
 
+#ifdef __APPLE__
+    if (metal_pass) BbMetalFX::OverlayNewFrame(metal_pass);
+    else
+#endif
     ImGui_ImplVulkan_NewFrame();
     ImGui::NewFrame();
     if (menu_open) {
@@ -622,6 +641,19 @@ void Render(vk::CommandBuffer cmdbuf, vk::ImageView view, vk::Extent2D extent) {
     }
     ImGui::Render();
 
+    return true;
+}
+
+void Render(vk::CommandBuffer cmdbuf, vk::ImageView view, vk::Extent2D extent) {
+    std::scoped_lock lock{imgui_mutex};
+#ifdef __APPLE__
+    if (metal_renderer) {
+        BbMetalFX::OverlayShutdown();
+        metal_renderer = false;
+        if (!InitVulkan(*renderer_instance, renderer_format, renderer_images)) return;
+    }
+#endif
+    if (!BuildFrame(extent)) return;
     const vk::RenderingAttachmentInfo attachment{
         .imageView = view,
         .imageLayout = vk::ImageLayout::eColorAttachmentOptimal,
@@ -641,5 +673,28 @@ void Render(vk::CommandBuffer cmdbuf, vk::ImageView view, vk::Extent2D extent) {
     }
     cmdbuf.endRendering();
 }
+
+#ifdef __APPLE__
+bool RenderMetal(void* device, void* pass, void* command, void* encoder, u32 width, u32 height) {
+    std::scoped_lock lock{imgui_mutex};
+    if (!Visible()) return true;
+    if (!metal_renderer) {
+        // Vulkan font uploads/draws must finish before replacing the renderer backend.
+        std::scoped_lock submit_lock{Vulkan::Scheduler::submit_mutex};
+        if (renderer_instance->GetDevice().waitIdle() != vk::Result::eSuccess) return false;
+        ImGui_ImplVulkan_Shutdown();
+        if (!BbMetalFX::OverlayInit(device)) {
+            InitVulkan(*renderer_instance, renderer_format, renderer_images);
+            return false;
+        }
+        metal_renderer = true;
+        std::printf("Overlay: native Metal renderer ready\n");
+    }
+    if (BuildFrame({width, height}, pass)) {
+        BbMetalFX::OverlayRender(ImGui::GetDrawData(), command, encoder);
+    }
+    return true;
+}
+#endif
 
 } // namespace BbOverlay

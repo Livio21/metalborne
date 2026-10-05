@@ -75,6 +75,9 @@ public:
     }
 
     bool IsHDRSupported() const {
+#ifdef __APPLE__
+        if (metalfx && metalfx->NativePresentation()) return false;
+#endif
         return swapchain.HasHDR();
     }
 
@@ -109,7 +112,7 @@ public:
 private:
 #ifdef __APPLE__
     void ApplyMetalFX(Frame* frame, vk::Image& source, u32& width, u32& height);
-    std::unique_ptr<BbMetalFX::Spatial> metalfx;
+    std::unique_ptr<BbMetalFX::Presentation> metalfx;
     u32 metalfx_input_width{1920}, metalfx_input_height{1080};
     Frame* last_metalfx_frame{}; // Presentation thread owns this cached result.
     vk::Image last_metalfx_image{};
@@ -135,7 +138,7 @@ private:
     AmdGpu::Liverpool* liverpool;
     Scheduler draw_scheduler;
     BbStageStats<1> backpressure_stats{"Frame preparation", {"frames-ahead wait"}};
-    BbStageStats<4> api_stats{"Host presentation stages", {"acquire/resize", "MetalFX", "record/submit", "queue-present"}};
+    BbStageStats<4> api_stats{"Host presentation stages", {"acquire/resize", "Metal bridge", "record/submit", "queue-present"}};
     std::deque<u64> recent_frame_ticks; ///< bbport: BB_FRAMES_AHEAD bound (PrepareFrame)
     Scheduler present_scheduler;
     Scheduler flip_scheduler;

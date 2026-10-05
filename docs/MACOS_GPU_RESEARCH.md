@@ -241,3 +241,14 @@ shared Metal heap path, capability-query results and the initial CPU completion
 bridge. [Performance diagnostics](MACOS_PERFORMANCE.md#presentation-diagnostics-and-30-fps-defaults-2026-10-05)
 separate guest flip timing, swap-thread delay, presentation API stages and the
 frames-ahead wait. The changes do not establish a new gameplay FPS result.
+
+## Native presentation follow-up: 2026-10-06
+
+[Native Metal presentation](MACOS_NATIVE_METAL.md) now displays Vulkan-rendered
+gameplay through a Metal render pass and drawable, including the settings
+overlay and optional MetalFX spatial scaling. It removes the hybrid path's
+shared-output copy and final Vulkan swapchain blit. The game shader/compute
+backend and host post-processing still use Vulkan; a full native graphics
+backend and a measured performance advantage remain unproven. The next focused
+step is to render the host frame directly into exportable storage, then execute
+a representative captured game workload through native Metal.

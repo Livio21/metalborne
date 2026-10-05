@@ -258,7 +258,9 @@ bool Instance::CreateDevice() {
 #ifdef __APPLE__
     add_extension("VK_KHR_portability_subset");
     const char* metalfx = std::getenv("BB_METALFX");
-    if (metalfx && std::strcmp(metalfx, "spatial") == 0) {
+    const char* presentation = std::getenv("BB_PRESENT_BACKEND");
+    if ((metalfx && std::strcmp(metalfx, "spatial") == 0) ||
+        (presentation && std::strcmp(presentation, "metal") == 0)) {
         external_memory_metal = add_extension("VK_EXT_external_memory_metal");
     }
 #endif

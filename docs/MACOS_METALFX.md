@@ -5,6 +5,11 @@ consistent delivery at roughly **33.33 ms per game frame**.
 
 ## Current status
 
+An opt-in [native Metal presentation path](MACOS_NATIVE_METAL.md) can now sample
+MetalFX's private output directly into a drawable, removing the shared-output
+round trip described below. Use `BB_PRESENT_BACKEND=metal` to select it. The
+default remains the hybrid Vulkan presentation path covered by this document.
+
 The macOS renderer now contains an opt-in MetalFX spatial pass between its
 post-processed game frame and its final Vulkan swapchain blit. This retains
 bbport's PS4 command handling and shader recompiler. It is a hybrid Vulkan/Metal

@@ -135,17 +135,26 @@ Presenter::Presenter(Frontend::WindowSDL& window_, AmdGpu::Liverpool* liverpool_
     const vk::Device device = instance.GetDevice();
 
 #ifdef __APPLE__
-    if (const char* mode = std::getenv("BB_METALFX"); mode && std::strcmp(mode, "off") != 0) {
-        if (std::strcmp(mode, "spatial") != 0) {
-            std::fprintf(stderr, "MetalFX: unsupported mode '%s'; use spatial or off.\n", mode);
-        } else if (!instance.HasExternalMemoryMetal()) {
-            std::fprintf(stderr, "MetalFX: driver lacks VK_EXT_external_memory_metal; using Vulkan.\n");
+    const char* backend = std::getenv("BB_PRESENT_BACKEND");
+    const bool native = backend && std::strcmp(backend, "metal") == 0;
+    const char* mode = std::getenv("BB_METALFX");
+    const bool spatial = mode && std::strcmp(mode, "spatial") == 0;
+    if (backend && !native && std::strcmp(backend, "vulkan") != 0) {
+        std::fprintf(stderr, "Unknown presentation backend '%s'; using Vulkan.\n", backend);
+    }
+    if (mode && !spatial && std::strcmp(mode, "off") != 0) {
+        std::fprintf(stderr, "MetalFX: unsupported mode '%s'; use spatial or off.\n", mode);
+    }
+    if (native || spatial) {
+        if (!instance.HasExternalMemoryMetal()) {
+            std::fprintf(stderr, "Metal: driver lacks VK_EXT_external_memory_metal; using Vulkan.\n");
         } else {
-            metalfx = std::make_unique<BbMetalFX::Spatial>(instance.GetInstance(),
+            metalfx = std::make_unique<BbMetalFX::Presentation>(instance.GetInstance(),
                 instance.GetPhysicalDevice(), device, VULKAN_HPP_DEFAULT_DISPATCHER.vkGetInstanceProcAddr,
                 VULKAN_HPP_DEFAULT_DISPATCHER.vkGetDeviceProcAddr);
+            if (native) metalfx->SetNativeLayer(window.GetWindowInfo().render_surface);
             if (!metalfx->Available()) {
-                std::fprintf(stderr, "MetalFX: texture export entry points unavailable; using Vulkan.\n");
+                std::fprintf(stderr, "Metal: texture export entry points unavailable; using Vulkan.\n");
                 metalfx.reset();
             } else {
                 const char* resolution = std::getenv("BB_METALFX_INPUT_RES");
@@ -157,7 +166,8 @@ Presenter::Presenter(Frontend::WindowSDL& window_, AmdGpu::Liverpool* liverpool_
                 }
                 expected_frame_width = metalfx_input_width;
                 expected_frame_height = metalfx_input_height;
-                std::fprintf(stderr, "MetalFX spatial requested; activates when the window exceeds the input size.\n");
+                std::fprintf(stderr, native ? "Native Metal presentation requested (experimental).\n"
+                    : "MetalFX spatial requested; activates when the window exceeds the input size.\n");
             }
         }
     }
@@ -543,9 +553,13 @@ Frame* Presenter::PrepareBlankFrame(bool present_thread) {
 
 #ifdef __APPLE__
 void Presenter::ApplyMetalFX(Frame* frame, vk::Image& source, u32& width, u32& height) {
-    const auto fit = FitImage(frame->width, frame->height, swapchain.GetWidth(), swapchain.GetHeight());
-    if (fit.extent.width < frame->width || fit.extent.height < frame->height ||
-        (fit.extent.width == frame->width && fit.extent.height == frame->height)) return;
+    const bool native = metalfx->NativePresentation();
+    const u32 target_width = native ? std::max(0, window.GetWidth()) : swapchain.GetWidth();
+    const u32 target_height = native ? std::max(0, window.GetHeight()) : swapchain.GetHeight();
+    if (!target_width || !target_height) return;
+    const auto fit = FitImage(frame->width, frame->height, target_width, target_height);
+    if (!native && (fit.extent.width < frame->width || fit.extent.height < frame->height ||
+        (fit.extent.width == frame->width && fit.extent.height == frame->height))) return;
     if (const auto* previous = metalfx->Find(frame->id); previous && previous->input &&
         (previous->input_width != frame->width || previous->input_height != frame->height ||
          previous->output_width != fit.extent.width || previous->output_height != fit.extent.height)) {
@@ -605,7 +619,7 @@ void Presenter::ApplyMetalFX(Frame* frame, vk::Image& source, u32& width, u32& h
             .image = output, .subresourceRange = range},
     };
     command.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands, vk::PipelineStageFlagBits::eAllCommands,
-                            {}, {}, {}, release);
+                            {}, {}, {}, vk::ArrayProxy<const vk::ImageMemoryBarrier>{output ? 3u : 2u, release.data()});
     // Keep layout transitions within Vulkan; external handoffs use GENERAL on
     // both sides, so release/acquire barriers describe the same layout pair.
     const std::array external_release{
@@ -622,7 +636,8 @@ void Presenter::ApplyMetalFX(Frame* frame, vk::Image& source, u32& width, u32& h
             .image = output, .subresourceRange = range},
     };
     command.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
-        vk::PipelineStageFlagBits::eAllCommands, {}, {}, {}, external_release);
+        vk::PipelineStageFlagBits::eAllCommands, {}, {}, {},
+        vk::ArrayProxy<const vk::ImageMemoryBarrier>{output ? 2u : 1u, external_release.data()});
     const auto tick = scheduler.CurrentTick();
     SubmitInfo ready{};
     ready.AddWait(frame->ready_semaphore, frame->ready_tick);
@@ -631,7 +646,7 @@ void Presenter::ApplyMetalFX(Frame* frame, vk::Image& source, u32& width, u32& h
     // APIs' ownership and completion explicit until GPU-side synchronization is available.
     scheduler.Wait(tick);
     const auto copied = std::chrono::steady_clock::now();
-    const bool success = metalfx->Encode(frame->id);
+    const bool success = metalfx->Encode(frame->id, native ? target_width : 0, native ? target_height : 0);
     const auto scaled = std::chrono::steady_clock::now();
     const std::array acquire{
         vk::ImageMemoryBarrier{
@@ -646,9 +661,10 @@ void Presenter::ApplyMetalFX(Frame* frame, vk::Image& source, u32& width, u32& h
             .image = output, .subresourceRange = range},
     };
     scheduler.CommandBuffer().pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
-        vk::PipelineStageFlagBits::eAllCommands, {}, {}, {}, acquire);
+        vk::PipelineStageFlagBits::eAllCommands, {}, {}, {},
+        vk::ArrayProxy<const vk::ImageMemoryBarrier>{output ? 2u : 1u, acquire.data()});
     images->initialized = true;
-    if (success) {
+    if (success && output) {
         source = output; width = images->output_width; height = images->output_height;
         last_metalfx_frame = frame; last_metalfx_image = output;
         last_metalfx_width = width; last_metalfx_height = height;
@@ -662,9 +678,9 @@ void Presenter::ApplyMetalFX(Frame* frame, vk::Image& source, u32& width, u32& h
         scale_ms += std::chrono::duration<double, std::milli>(scaled - copied).count();
         ++count;
         if (scaled - window >= std::chrono::seconds(5)) {
-            std::printf("MetalFX bridge: %u frames; Vulkan copy/completion %.2f ms/frame; "
+            std::printf("%s bridge: %u frames; Vulkan copy/completion %.2f ms/frame; "
                         "Metal encode/completion %.2f ms/frame (CPU wall time)\n",
-                        count, copy_ms / count, scale_ms / count);
+                        native ? "Native Metal" : "MetalFX", count, copy_ms / count, scale_ms / count);
             count = 0; copy_ms = scale_ms = 0; window = scaled;
         }
     }
@@ -685,6 +701,31 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
             free_cv.notify_one();
         }
     };
+
+#ifdef __APPLE__
+    if (metalfx && metalfx->NativePresentation() && !frame->is_hdr) {
+        vk::Image source = frame->image;
+        u32 width = frame->width, height = frame->height;
+        ApplyMetalFX(frame, source, width, height);
+        if (metalfx->NativePresentation()) {
+            // Metal has finished reading the exported input. Signal the existing frame
+            // fence after its Vulkan ownership acquire, before allowing frame reuse.
+            Check(instance.GetDevice().resetFences(frame->present_done));
+            SubmitInfo ready{};
+            ready.AddWait(frame->ready_semaphore, frame->ready_tick);
+            ready.AddSignal(frame->present_done);
+            present_scheduler.Flush(ready);
+            if (timing && !is_reusing_frame && is_game_frame) {
+                api_stats.Observe({0, BbPresentStats::Milliseconds(clock() - started), 0, 0});
+            }
+            free_frame();
+            if (!is_reusing_frame && is_game_frame) DebugState.IncFlipFrameNum();
+            return;
+        }
+        // A failed native command/allocation falls back to a newly configured swapchain.
+        swapchain.Recreate(window.GetWidth(), window.GetHeight());
+    }
+#endif
 
     // Recreate the swapchain if the window was resized.
     if (window.GetWidth() != swapchain.GetWidth() || window.GetHeight() != swapchain.GetHeight()) {

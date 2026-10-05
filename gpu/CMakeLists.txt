@@ -154,8 +154,9 @@ target_compile_definitions(bbgpu PRIVATE BOOST_ASIO_STANDALONE NDEBUG)
 target_compile_options(bbgpu PRIVATE -Wno-deprecated-declarations -Wno-missing-field-initializers)
 # Runtime symbols (runtime_memory_*, runtime_process_*) resolve against bb-probe.
 if(APPLE)
-    target_sources(bbgpu PRIVATE shim/macos_metalfx.mm)
-    set_source_files_properties(shim/macos_metalfx.mm PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
+    target_sources(bbgpu PRIVATE shim/macos_metalfx.mm third_party/imgui/backends/imgui_impl_metal.mm)
+    set_source_files_properties(shim/macos_metalfx.mm third_party/imgui/backends/imgui_impl_metal.mm
+        PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
     target_link_libraries(bbgpu PRIVATE "-framework MetalFX")
     target_link_options(bbgpu PRIVATE -Wl,-undefined,dynamic_lookup)
     target_link_libraries(bbgpu PRIVATE "-framework Metal" "-framework QuartzCore" "-framework Cocoa")

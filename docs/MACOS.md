@@ -150,6 +150,11 @@ new graphics backend. The current branch uses the Vulkan-to-Metal route.
 
 ## MetalFX and presentation timing
 
+`BB_PRESENT_BACKEND=metal` selects experimental native Metal presentation, with
+optional MetalFX and the native settings overlay. PS4 rendering still uses
+Vulkan, and the default presentation backend remains Vulkan. See the
+[native Metal launch options and remaining backend work](MACOS_NATIVE_METAL.md).
+
 The macOS launcher targets the unpatched 30 FPS game with FIFO presentation.
 Experimental MetalFX spatial upscaling is available through `BB_METALFX=spatial`;
 it has rendered the title and Hunter's Dream, and remains disabled by default

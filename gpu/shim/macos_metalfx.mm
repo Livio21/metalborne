@@ -1,16 +1,19 @@
 #import <Metal/Metal.h>
 #import <MetalFX/MetalFX.h>
+#import <QuartzCore/CAMetalLayer.h>
 #define VK_NO_PROTOTYPES
 #include <vulkan/vulkan.h>
 #include <vulkan/vulkan_metal.h>
 #include "macos_metalfx.h"
+#include "bbport_overlay.h"
+#include "imgui_impl_metal.h"
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <map>
 
 namespace BbMetalFX {
-struct Spatial::Impl {
+struct Presentation::Impl {
     struct Texture {
         VkImage image{};
         VkDeviceMemory memory{};
@@ -35,11 +38,14 @@ struct Spatial::Impl {
     PFN_vkBindImageMemory bind_memory;
     PFN_vkGetMemoryMetalHandleEXT export_texture;
     id<MTLCommandQueue> queue;
+    CAMetalLayer* layer;
+    id<MTLRenderPipelineState> present_pipeline;
     VkFormat format{VK_FORMAT_R8G8B8A8_UNORM};
     MTLPixelFormat metal_format{MTLPixelFormatRGBA8Unorm};
     const char* format_name{"RGBA8"};
     std::map<uint32_t, Slot> slots;
     bool available = true, announced = false, completed = false;
+    bool spatial = true, presented = false;
 
     Impl(VkInstance instance, VkPhysicalDevice p, VkDevice d,
          PFN_vkGetInstanceProcAddr ip, PFN_vkGetDeviceProcAddr dp) : physical(p), device(d) {
@@ -169,83 +175,173 @@ struct Spatial::Impl {
     }
     void Disable(const char* why) {
         available = false;
-        std::fprintf(stderr, "MetalFX spatial unavailable: %s; using Vulkan presentation.\n", why);
+        if (layer) layer.framebufferOnly = NO;
+        std::fprintf(stderr, "%s unavailable: %s; using Vulkan presentation.\n",
+                     layer ? "Native Metal presentation" : "MetalFX spatial", why);
     }
 };
-Spatial::Spatial(VkInstance i, VkPhysicalDevice p, VkDevice d,
+Presentation::Presentation(VkInstance i, VkPhysicalDevice p, VkDevice d,
                  PFN_vkGetInstanceProcAddr ip, PFN_vkGetDeviceProcAddr dp)
     : impl(std::make_unique<Impl>(i, p, d, ip, dp)) {}
-Spatial::~Spatial() = default;
-bool Spatial::Available() const { return impl->available; }
-const Images* Spatial::Find(uint32_t key) const {
+Presentation::~Presentation() = default;
+bool Presentation::Available() const { return impl->available; }
+void Presentation::SetNativeLayer(void* handle) {
+    impl->layer = (__bridge CAMetalLayer*)handle;
+    const char* mode = std::getenv("BB_METALFX");
+    impl->spatial = mode && std::strcmp(mode, "spatial") == 0;
+}
+bool Presentation::NativePresentation() const { return impl->available && impl->layer; }
+const Images* Presentation::Find(uint32_t key) const {
     const auto found = impl->slots.find(key);
     return found == impl->slots.end() ? nullptr : &found->second.images;
 }
-Images* Spatial::Prepare(uint32_t key, uint32_t iw, uint32_t ih, uint32_t ow, uint32_t oh) {
+Images* Presentation::Prepare(uint32_t key, uint32_t iw, uint32_t ih, uint32_t ow, uint32_t oh) {
     @autoreleasepool {
-        if (!impl->available || ow < iw || oh < ih || (ow == iw && oh == ih)) return nullptr;
+        if (!impl->available || !iw || !ih || !ow || !oh) return nullptr;
+        const bool native = NativePresentation();
+        if (!native && (ow < iw || oh < ih || (ow == iw && oh == ih))) return nullptr;
         auto& s = impl->slots[key];
         if (s.images.input_width == iw && s.images.input_height == ih &&
             s.images.output_width == ow && s.images.output_height == oh) return &s.images;
         impl->Release(s);
-        if (!impl->Allocate(s.input, iw, ih) || !impl->Allocate(s.output, ow, oh)) {
+        if (!impl->Allocate(s.input, iw, ih) || (!native && !impl->Allocate(s.output, ow, oh))) {
             impl->Release(s); impl->Disable("exportable placement heap textures could not be allocated");
             return nullptr;
         }
         id<MTLDevice> device = s.input.metal.device;
-        if (s.output.metal.device != device || ![MTLFXSpatialScalerDescriptor supportsDevice:device]) {
+        const bool scale = impl->spatial && ow >= iw && oh >= ih && (ow != iw || oh != ih);
+        if ((!native && s.output.metal.device != device) ||
+            (scale && ![MTLFXSpatialScalerDescriptor supportsDevice:device])) {
             impl->Release(s); impl->Disable("GPU does not support the spatial scaler"); return nullptr;
         }
         if (!impl->queue) impl->queue = [device newCommandQueue];
-        MTLFXSpatialScalerDescriptor* desc = [MTLFXSpatialScalerDescriptor new];
-        desc.inputWidth = iw; desc.inputHeight = ih; desc.outputWidth = ow; desc.outputHeight = oh;
-        desc.colorTextureFormat = s.input.metal.pixelFormat;
-        desc.outputTextureFormat = s.output.metal.pixelFormat;
-        desc.colorProcessingMode = MTLFXSpatialScalerColorProcessingModePerceptual;
-        s.scaler = [desc newSpatialScalerWithDevice:device];
-        MTLTextureDescriptor* scaled_desc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:
-            s.output.metal.pixelFormat width:ow height:oh mipmapped:NO];
-        scaled_desc.storageMode = MTLStorageModePrivate;
-        scaled_desc.usage = s.scaler.outputTextureUsage;
-        s.scaled = [device newTextureWithDescriptor:scaled_desc];
-        if (!impl->queue || !s.scaler || !s.scaled ||
-            (s.input.metal.usage & s.scaler.colorTextureUsage) != s.scaler.colorTextureUsage ||
-            (s.scaled.usage & s.scaler.outputTextureUsage) != s.scaler.outputTextureUsage) {
-            impl->Release(s); impl->Disable("scaler creation or texture usage requirements failed");
-            return nullptr;
+        if (!impl->queue) {
+            impl->Release(s); impl->Disable("Metal command queue allocation failed"); return nullptr;
         }
-        // Supply MetalFX's fence for the driver's untracked heap resources.
-        if (s.input.metal.hazardTrackingMode == MTLHazardTrackingModeUntracked ||
-            s.output.metal.hazardTrackingMode == MTLHazardTrackingModeUntracked) {
-            s.scaler.fence = [device newFence];
-            if (!s.scaler.fence) {
-                impl->Release(s); impl->Disable("untracked-resource fence allocation failed"); return nullptr;
+        if (scale) {
+            MTLFXSpatialScalerDescriptor* desc = [MTLFXSpatialScalerDescriptor new];
+            desc.inputWidth = iw; desc.inputHeight = ih; desc.outputWidth = ow; desc.outputHeight = oh;
+            desc.colorTextureFormat = s.input.metal.pixelFormat;
+            desc.outputTextureFormat = s.input.metal.pixelFormat;
+            desc.colorProcessingMode = MTLFXSpatialScalerColorProcessingModePerceptual;
+            s.scaler = [desc newSpatialScalerWithDevice:device];
+            MTLTextureDescriptor* scaled_desc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:
+                s.input.metal.pixelFormat width:ow height:oh mipmapped:NO];
+            scaled_desc.storageMode = MTLStorageModePrivate;
+            scaled_desc.usage = s.scaler.outputTextureUsage | MTLTextureUsageShaderRead;
+            s.scaled = [device newTextureWithDescriptor:scaled_desc];
+            if (!impl->queue || !s.scaler || !s.scaled ||
+                (s.input.metal.usage & s.scaler.colorTextureUsage) != s.scaler.colorTextureUsage ||
+                (s.scaled.usage & s.scaler.outputTextureUsage) != s.scaler.outputTextureUsage) {
+                impl->Release(s); impl->Disable("scaler creation or texture usage requirements failed");
+                return nullptr;
+            }
+            // Supply MetalFX's fence for the driver's untracked heap resources.
+            if (s.input.metal.hazardTrackingMode == MTLHazardTrackingModeUntracked) {
+                s.scaler.fence = [device newFence];
+                if (!s.scaler.fence) {
+                    impl->Release(s); impl->Disable("untracked-resource fence allocation failed"); return nullptr;
+                }
             }
         }
         s.images = {s.input.image, s.output.image, iw, ih, ow, oh, false};
         if (!impl->announced) {
             impl->announced = true;
-            std::fprintf(stderr, "MetalFX spatial prepared: %ux%u -> %ux%u %s; GPU textures, CPU completion bridge (experimental).\n", iw, ih, ow, oh, impl->format_name);
+            std::fprintf(stderr, "%s prepared: %ux%u -> %ux%u %s; GPU textures, CPU completion bridge (experimental).\n",
+                native ? "Native Metal presentation" : "MetalFX spatial", iw, ih, ow, oh, impl->format_name);
         }
         return &s.images;
     }
 }
-bool Spatial::Encode(uint32_t key) {
+bool Presentation::Encode(uint32_t key, uint32_t window_width, uint32_t window_height) {
     @autoreleasepool {
         auto& s = impl->slots.at(key);
         id<MTLCommandBuffer> command = [impl->queue commandBuffer];
         if (!command) { impl->Disable("Metal command buffer allocation failed"); return false; }
-        command.label = @"bbport MetalFX spatial";
-        s.scaler.colorTexture = s.input.metal; s.scaler.outputTexture = s.scaled;
-        s.scaler.inputContentWidth = s.images.input_width;
-        s.scaler.inputContentHeight = s.images.input_height;
-        if (s.scaler.fence) {
-            id<MTLBlitCommandEncoder> fence_encoder = [command blitCommandEncoder];
-            if (!fence_encoder) { impl->Disable("Metal input fence encoder allocation failed"); return false; }
-            [fence_encoder updateFence:s.scaler.fence];
-            [fence_encoder endEncoding];
+        command.label = NativePresentation() ? @"Metalborne native presentation" : @"bbport MetalFX spatial";
+        if (s.scaler) {
+            s.scaler.colorTexture = s.input.metal; s.scaler.outputTexture = s.scaled;
+            s.scaler.inputContentWidth = s.images.input_width;
+            s.scaler.inputContentHeight = s.images.input_height;
+            if (s.scaler.fence) {
+                id<MTLBlitCommandEncoder> fence_encoder = [command blitCommandEncoder];
+                if (!fence_encoder) { impl->Disable("Metal input fence encoder allocation failed"); return false; }
+                [fence_encoder updateFence:s.scaler.fence];
+                [fence_encoder endEncoding];
+            }
+            [s.scaler encodeToCommandBuffer:command];
         }
-        [s.scaler encodeToCommandBuffer:command];
+        if (NativePresentation()) {
+            CAMetalLayer* layer = impl->layer;
+            if (!window_width || !window_height) return false;
+            if (layer.device && layer.device != s.input.metal.device) {
+                impl->Disable("window and exported textures use different Metal devices"); return false;
+            }
+            layer.device = s.input.metal.device;
+            layer.pixelFormat = MTLPixelFormatBGRA8Unorm;
+            layer.framebufferOnly = YES;
+            layer.displaySyncEnabled = YES;
+            layer.drawableSize = CGSizeMake(window_width, window_height);
+            if (!impl->present_pipeline) {
+                NSString* source = @R"MSL(
+                    #include <metal_stdlib>
+                    using namespace metal;
+                    struct Varying { float4 position [[position]]; float2 uv; };
+                    vertex Varying present_vertex(uint id [[vertex_id]]) {
+                        const float2 p[] = {float2(-1,-1), float2(3,-1), float2(-1,3)};
+                        return {float4(p[id],0,1), float2((p[id].x+1)*0.5,(1-p[id].y)*0.5)};
+                    }
+                    fragment half4 present_fragment(Varying v [[stage_in]], texture2d<half> image [[texture(0)]]) {
+                        constexpr sampler linear_sampler(coord::normalized, address::clamp_to_edge, filter::linear);
+                        return half4(image.sample(linear_sampler,v.uv).rgb,1);
+                    }
+                )MSL";
+                NSError* error = nil;
+                id<MTLLibrary> library = [layer.device newLibraryWithSource:source options:nil error:&error];
+                MTLRenderPipelineDescriptor* desc = [MTLRenderPipelineDescriptor new];
+                desc.vertexFunction = [library newFunctionWithName:@"present_vertex"];
+                desc.fragmentFunction = [library newFunctionWithName:@"present_fragment"];
+                desc.colorAttachments[0].pixelFormat = layer.pixelFormat;
+                if (library) impl->present_pipeline = [layer.device newRenderPipelineStateWithDescriptor:desc error:&error];
+                if (!impl->present_pipeline) {
+                    std::fprintf(stderr, "Native Metal shader error: %s\n", error.localizedDescription.UTF8String);
+                    impl->Disable("presentation pipeline creation failed"); return false;
+                }
+            }
+            id<CAMetalDrawable> drawable = [layer nextDrawable];
+            if (!drawable) return false; // Occlusion/resize can temporarily exhaust drawables.
+            MTLRenderPassDescriptor* pass = [MTLRenderPassDescriptor renderPassDescriptor];
+            pass.colorAttachments[0].texture = drawable.texture;
+            pass.colorAttachments[0].loadAction = MTLLoadActionClear;
+            pass.colorAttachments[0].storeAction = MTLStoreActionStore;
+            pass.colorAttachments[0].clearColor = MTLClearColorMake(0,0,0,1);
+            id<MTLRenderCommandEncoder> encoder = [command renderCommandEncoderWithDescriptor:pass];
+            if (!encoder) { impl->Disable("presentation encoder allocation failed"); return false; }
+            if (s.scaler.fence) [encoder waitForFence:s.scaler.fence beforeStages:MTLRenderStageFragment];
+            [encoder setViewport:MTLViewport{double(window_width-s.images.output_width)/2,
+                double(window_height-s.images.output_height)/2, double(s.images.output_width),
+                double(s.images.output_height), 0, 1}];
+            [encoder setRenderPipelineState:impl->present_pipeline];
+            [encoder setFragmentTexture:s.scaler ? s.scaled : s.input.metal atIndex:0];
+            [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+            const bool overlay = BbOverlay::RenderMetal((__bridge void*)layer.device,
+                (__bridge void*)pass, (__bridge void*)command, (__bridge void*)encoder,
+                window_width, window_height);
+            [encoder endEncoding];
+            [command presentDrawable:drawable];
+            [command commit];
+            [command waitUntilCompleted];
+            if (!overlay || command.status != MTLCommandBufferStatusCompleted) {
+                impl->Disable(!overlay ? "Metal overlay initialization failed" : "Metal presentation command failed");
+                return false;
+            }
+            if (!impl->presented) {
+                impl->presented = true;
+                std::fprintf(stderr, "Native Metal presentation: first drawable completed successfully%s.\n",
+                             s.scaler ? " with MetalFX spatial" : "");
+            }
+            return true;
+        }
         // ponytail: the driver uses shared heap storage; MetalFX needs private output.
         // Keep the GPU blit until the driver supports private heap interop.
         id<MTLBlitCommandEncoder> copy = [command blitCommandEncoder];
@@ -267,5 +363,12 @@ bool Spatial::Encode(uint32_t key) {
         }
         return true;
     }
+}
+bool OverlayInit(void* device) { return ImGui_ImplMetal_Init((__bridge id<MTLDevice>)device); }
+void OverlayShutdown() { ImGui_ImplMetal_Shutdown(); }
+void OverlayNewFrame(void* pass) { ImGui_ImplMetal_NewFrame((__bridge MTLRenderPassDescriptor*)pass); }
+void OverlayRender(void* data, void* command, void* encoder) {
+    ImGui_ImplMetal_RenderDrawData(static_cast<ImDrawData*>(data),
+        (__bridge id<MTLCommandBuffer>)command, (__bridge id<MTLRenderCommandEncoder>)encoder);
 }
 }

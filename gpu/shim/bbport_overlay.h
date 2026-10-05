@@ -6,7 +6,13 @@
 #pragma once
 
 #include "common/types.h"
-#include "video_core/renderer_vulkan/vk_common.h"
+
+namespace vk {
+enum class Format;
+class CommandBuffer;
+class ImageView;
+struct Extent2D;
+}
 
 union SDL_Event;
 struct SDL_Window;
@@ -30,6 +36,10 @@ bool Visible();
 
 /// Present thread: draws into `view` (layout ColorAttachmentOptimal).
 void Render(vk::CommandBuffer cmdbuf, vk::ImageView view, vk::Extent2D extent);
+#ifdef __APPLE__
+/// Same settings/input context, rendered into the native Metal presentation pass.
+bool RenderMetal(void* device, void* pass, void* command, void* encoder, u32 width, u32 height);
+#endif
 
 /// The menu is open: the game's input is held neutral.
 bool CapturesInput();
