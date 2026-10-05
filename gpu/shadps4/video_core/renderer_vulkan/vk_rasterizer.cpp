@@ -1344,15 +1344,43 @@ void Rasterizer::DispatchRecord(const ComputePipeline* pipeline) {
     mark();
 #ifdef __APPLE__
     std::vector<std::vector<u8>> metal_before;
+    std::array<std::unique_ptr<BbMetalFX::SharedBuffer>, 2> metal_shared;
     // ponytail: prove one simple buffer-only shader first; images/aliasing need their own contract.
     static bool metal_checked = false; // DispatchRecord is serialized on the draw recording owner.
-    if (!metal_checked && pipeline->metal_reference && cs.pgm_hash == 0x3d5ebf4e &&
-        std::getenv("BB_METAL_COMPUTE_MSL") && cs.buffers.size() == 2 &&
-        cs.images.empty() && cs.samplers.empty() && !cs.uses_dma &&
+    static bool metal_validated = false;
+    static const char* copy_hle = std::getenv("BB_BUFFER_COPY_HLE");
+    const bool copy_candidate = pipeline->metal_reference && cs.pgm_hash == 0x3d5ebf4e &&
+        cs.buffers.size() == 2 && cs.images.empty() && cs.samplers.empty() && !cs.uses_dma &&
+        !cs.buffers[0].is_written && cs.buffers[1].is_written &&
         cs_program.num_thread_x.full == 64 && cs_program.num_thread_y.full == 1 &&
-        cs_program.num_thread_z.full == 1 && cs_program.dim_x &&
-        cs_program.dim_y == 1 && cs_program.dim_z == 1 && buffer_infos.size() == 2 &&
-        push_data.ud_regs[0] && push_data.ud_regs[0] <= uint64_t(cs_program.dim_x) * 64) {
+        cs_program.num_thread_z.full == 1 && cs_program.dim_x && cs_program.dim_y == 1 && cs_program.dim_z == 1 &&
+        push_data.ud_regs[0] && push_data.ud_regs[0] <= uint64_t(cs_program.dim_x) * 64 &&
+        buffer_infos.size() == 2;
+    if (copy_candidate && metal_validated && copy_hle && std::strcmp(copy_hle, "1") == 0 && bound_buffers.size() == 2) {
+        const auto& src = bound_buffers[0];
+        const auto& dst = bound_buffers[1];
+        const uint64_t size = uint64_t(push_data.ud_regs[0]) * 4;
+        const bool disjoint = src.buffer->Handle() != dst.buffer->Handle() ||
+            src.offset + size <= dst.offset || dst.offset + size <= src.offset;
+        if (size <= src.size && size <= dst.size && disjoint &&
+            src.offset % 4 == 0 && dst.offset % 4 == 0 &&
+            src.buffer->Handle() == buffer_infos[0].buffer && dst.buffer->Handle() == buffer_infos[1].buffer &&
+            src.offset == buffer_infos[0].offset + push_data.buf_offsets[0] &&
+            dst.offset == buffer_infos[1].offset + push_data.buf_offsets[1]) {
+            const vk::BufferCopy copy{src.offset, dst.offset, size};
+            runtime.CopyBuffer(src.buffer, dst.buffer, {&copy, 1});
+            bound_buffers.clear(); // CopyBuffer records transfer access; don't overwrite it with shader access.
+            ResetBindings(true);
+            DebugState.IncDispatch();
+            scheduler.KickRecording();
+            static uint64_t copies = 0;
+            if (++copies <= 3 || copies % 300 == 0)
+                std::fprintf(stderr, "Buffer copy HLE: verified shader replaced by GPU buffer copy #%llu (%llu bytes).\n",
+                    static_cast<unsigned long long>(copies), static_cast<unsigned long long>(size));
+            return;
+        }
+    }
+    if (copy_candidate && !metal_checked && std::getenv("BB_METAL_COMPUTE_MSL")) {
         bool valid = true;
         for (size_t i = 0; i < buffer_infos.size(); ++i) {
             const auto& buffer = buffer_infos[i];
@@ -1368,6 +1396,52 @@ void Rasterizer::DispatchRecord(const ComputePipeline* pipeline) {
             std::fprintf(stderr, "Native Metal compute proof: exact SPIR-V module matched; shader %016llx.\n",
                          static_cast<unsigned long long>(cs.pgm_hash));
             metal_before = ReadComputeBuffers(instance, scheduler, buffer_infos);
+            const char* bridge = std::getenv("BB_METAL_COMPUTE_BRIDGE");
+            if (((bridge && std::strcmp(bridge, "gpu") == 0) || (copy_hle && std::strcmp(copy_hle, "1") == 0)) && instance.HasExternalMemoryMetal()) {
+                const auto features = instance.GetPhysicalDevice().getExternalBufferProperties(
+                    vk::PhysicalDeviceExternalBufferInfo{
+                        .usage = vk::BufferUsageFlagBits::eStorageBuffer | vk::BufferUsageFlagBits::eTransferSrc | vk::BufferUsageFlagBits::eTransferDst,
+                        .handleType = static_cast<vk::ExternalMemoryHandleTypeFlagBits>(VK_EXTERNAL_MEMORY_HANDLE_TYPE_MTLHEAP_BIT_EXT)}).externalMemoryProperties.externalMemoryFeatures;
+                if (features & vk::ExternalMemoryFeatureFlagBits::eExportable) {
+                    for (size_t i = 0; i < metal_shared.size(); ++i)
+                        metal_shared[i] = std::make_unique<BbMetalFX::SharedBuffer>(
+                            instance.GetDevice(), static_cast<VkPhysicalDeviceMemoryProperties>(instance.GetMemoryProperties()),
+                            buffer_infos[i].range, VULKAN_HPP_DEFAULT_DISPATCHER.vkGetDeviceProcAddr);
+                }
+                if (!metal_shared[0] || !metal_shared[1] || !metal_shared[0]->Handle() || !metal_shared[1]->Handle()) {
+                    metal_shared = {};
+                    std::fprintf(stderr, "Native Metal compute bridge unavailable; using CPU snapshot clones.\n");
+                } else {
+                    const auto sources = buffer_infos;
+                    const std::array<vk::Buffer, 2> targets{metal_shared[0]->Handle(), metal_shared[1]->Handle()};
+                    const u32 family = instance.GetGraphicsQueueFamilyIndex();
+                    scheduler.Record([sources, targets, family](vk::CommandBuffer command) {
+                        std::array<vk::BufferMemoryBarrier2, 2> release;
+                        for (size_t i = 0; i < targets.size(); ++i) {
+                            command.copyBuffer(sources[i].buffer, targets[i], vk::BufferCopy{sources[i].offset, 0, sources[i].range});
+                            release[i] = {
+                                .srcStageMask = vk::PipelineStageFlagBits2::eCopy,
+                                .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
+                                .dstStageMask = vk::PipelineStageFlagBits2::eNone,
+                                .dstAccessMask = vk::AccessFlagBits2::eNone,
+                                .srcQueueFamilyIndex = family, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_EXTERNAL,
+                                .buffer = targets[i], .offset = 0, .size = sources[i].range,
+                            };
+                        }
+                        const vk::MemoryBarrier2 restore{
+                            .srcStageMask = vk::PipelineStageFlagBits2::eCopy,
+                            .srcAccessMask = vk::AccessFlagBits2::eTransferRead,
+                            .dstStageMask = vk::PipelineStageFlagBits2::eComputeShader,
+                            .dstAccessMask = vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite,
+                        };
+                        command.pipelineBarrier2(vk::DependencyInfo{
+                            .memoryBarrierCount = 1, .pMemoryBarriers = &restore,
+                            .bufferMemoryBarrierCount = 2, .pBufferMemoryBarriers = release.data()});
+                    });
+                    scheduler.Finish();
+                    std::fprintf(stderr, "Native Metal compute bridge: GPU copies into shared buffers; no CPU uploads to Metal.\n");
+                }
+            }
         }
     }
 #endif
@@ -1388,9 +1462,53 @@ void Rasterizer::DispatchRecord(const ComputePipeline* pipeline) {
     if (!metal_before.empty()) {
         const auto reference = ReadComputeBuffers(instance, scheduler, buffer_infos);
         std::array<BbMetalFX::ComputeBuffer, 2> buffers;
-        for (size_t i = 0; i < buffers.size(); ++i) buffers[i] = {metal_before[i], reference[i]};
-        BbMetalFX::CheckCompute(buffers,
+        for (size_t i = 0; i < buffers.size(); ++i)
+            buffers[i] = {metal_before[i], reference[i], metal_shared[i] ? metal_shared[i]->NativeHandle() : nullptr};
+        metal_validated = BbMetalFX::CheckCompute(buffers,
             {reinterpret_cast<const u8*>(&push_data), sizeof(push_data)}, dim_x, 64);
+        if (metal_shared[0]) {
+            const std::array<vk::Buffer, 2> targets{metal_shared[0]->Handle(), metal_shared[1]->Handle()};
+            const u32 family = instance.GetGraphicsQueueFamilyIndex();
+            scheduler.Record([targets, family](vk::CommandBuffer command) {
+                std::array<vk::BufferMemoryBarrier2, 2> acquire;
+                for (size_t i = 0; i < targets.size(); ++i) acquire[i] = {
+                    .srcStageMask = vk::PipelineStageFlagBits2::eNone,
+                    .srcAccessMask = vk::AccessFlagBits2::eNone,
+                    .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+                    .dstAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
+                    .srcQueueFamilyIndex = VK_QUEUE_FAMILY_EXTERNAL, .dstQueueFamilyIndex = family,
+                    .buffer = targets[i], .offset = 0, .size = VK_WHOLE_SIZE,
+                };
+                command.pipelineBarrier2(vk::DependencyInfo{
+                    .bufferMemoryBarrierCount = 2, .pBufferMemoryBarriers = acquire.data()});
+            });
+            scheduler.Finish(); // Acquire completes before either API's shared handles are retired.
+            if (copy_hle && std::strcmp(copy_hle, "1") == 0 &&
+                ((push_data.buf_offsets[0] | push_data.buf_offsets[1]) & 3)) metal_validated = false;
+            if (copy_hle && std::strcmp(copy_hle, "1") == 0 && metal_validated) {
+                const vk::BufferCopy copy{push_data.buf_offsets[0], push_data.buf_offsets[1], uint64_t(push_data.ud_regs[0]) * 4};
+                scheduler.Record([targets, copy](vk::CommandBuffer command) {
+                    command.fillBuffer(targets[1], copy.dstOffset, copy.size, 0xa5a5a5a5);
+                    const vk::MemoryBarrier2 barrier{
+                        .srcStageMask = vk::PipelineStageFlagBits2::eAllTransfer,
+                        .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
+                        .dstStageMask = vk::PipelineStageFlagBits2::eCopy,
+                        .dstAccessMask = vk::AccessFlagBits2::eTransferRead | vk::AccessFlagBits2::eTransferWrite,
+                    };
+                    command.pipelineBarrier2(vk::DependencyInfo{.memoryBarrierCount = 1, .pMemoryBarriers = &barrier});
+                    command.copyBuffer(targets[0], targets[1], copy);
+                });
+                const std::array<vk::DescriptorBufferInfo, 2> clones{
+                    vk::DescriptorBufferInfo{targets[0], 0, reference[0].size()},
+                    vk::DescriptorBufferInfo{targets[1], 0, reference[1].size()}};
+                const auto copied = ReadComputeBuffers(instance, scheduler, clones);
+                metal_validated = copied == reference;
+                std::fprintf(stderr, "Buffer copy HLE proof: %s; poisoned destination then copied; all buffer bytes compared with the Vulkan shader.\n",
+                             metal_validated ? "PASS" : "MISMATCH");
+            }
+        } else if (copy_hle && std::strcmp(copy_hle, "1") == 0) {
+            metal_validated = false; // The live shortcut needs both the native and GPU-copy proofs.
+        }
     }
 #endif
 

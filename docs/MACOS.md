@@ -154,6 +154,9 @@ new graphics backend. The current branch uses the Vulkan-to-Metal route.
 optional MetalFX and the native settings overlay. PS4 rendering still uses
 Vulkan, and the default presentation backend remains Vulkan. See the
 [native Metal launch options and remaining backend work](MACOS_NATIVE_METAL.md).
+That document also covers an opt-in real-game Metal compute comparison, shared
+GPU buffer interop, and a guarded buffer-copy shortcut validated against the
+original shader's output. The full PS4 renderer transition remains unfinished.
 
 The macOS launcher targets the unpatched 30 FPS game with FIFO presentation.
 Experimental MetalFX spatial upscaling is available through `BB_METALFX=spatial`;

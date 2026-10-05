@@ -139,8 +139,10 @@ MetalFX or a speedup from removing the blit.
 
 ## Next transition steps
 
-The host frame now renders directly into exportable storage. Next validate a
-real captured game shader/workload on Metal (the buffer-copy proof below now passes).
+The host frame renders directly into exportable storage, and the real game
+buffer-copy workload below passes on native Metal, including shared GPU buffers.
+The next transition requires native buffer/cache ownership that avoids copying
+each game's sparse-arena binding across APIs, followed by texture workloads.
 The full backend still needs native resource/cache management, bindings,
 graphics/compute pipelines and command submission. Geometry/tessellation and
 guest completion semantics require their own proofs; presentation alone does
@@ -219,3 +221,58 @@ is `out/macos-native-metal/buffer-capabilities.c`; the specification's
 [Metal external-memory API](https://docs.vulkan.org/features/latest/features/proposals/VK_EXT_external_memory_metal.html)
 defines the resource export mechanism, while the installed driver query
 establishes this limitation.
+
+### GPU buffer bridge and optional copy shortcut
+
+`BB_METAL_COMPUTE_BRIDGE=gpu` populates the native proof buffers with Vulkan GPU
+copies into exported coherent placement heaps. Metal uses native buffers over
+those same allocations; no CPU upload populates them. Both APIs complete and
+transfer ownership explicitly, with a Metal fence for untracked heap resources.
+The diagnostic still reads back the original inputs and Vulkan reference for
+byte comparison. Failed shared-buffer allocation falls back to snapshot clones.
+It does not replace the game's live compute dispatch.
+
+`BB_BUFFER_COPY_HLE=1` additionally checks a GPU buffer-copy alternative against
+the original shader. It poisons the cloned destination before the copy and
+compares all bytes, including untouched ranges. Only after both proofs pass can
+later matching dispatches use the existing `Runtime::CopyBuffer` helper. The
+shortcut checks the exact shader module, resource roles, workgroup shape, bound
+ranges, alignment and non-overlap. It preserves the cache's GPU-write
+invalidation and transfer-access barrier tracking. A failed proof keeps the
+original compute path. This is an opt-in Vulkan buffer-copy optimization; it
+uses the driver's transfer path rather than a direct native Metal dispatch.
+It adds no diagnostic readbacks or API completion waits to subsequent copies.
+
+Use the existing proof command with `BB_METAL_COMPUTE_BRIDGE=gpu`, and optionally
+`BB_BUFFER_COPY_HLE=1`. For the optional shortcut, add these assertions to the
+same runnable check after the successful compute comparison:
+
+```python
+assert 'GPU copies into shared buffers; no CPU uploads to Metal' in log
+assert 'Buffer copy HLE proof: PASS; poisoned destination then copied' in log
+assert 'verified shader replaced by GPU buffer copy #1' in log
+assert 'Buffer copy HLE proof: MISMATCH' not in log
+```
+
+The first shared-buffer run, `out/macos-native-metal/compute-bridge.log`, matched
+the same 7,864,320 bytes with zero mismatches. Central Yharnam and HUD were
+visually inspected and the run exited with status 0. Metal returned invalid GPU
+timestamp data for this run; its timing is excluded from performance evidence.
+The diagnostic now reports GPU timing as unavailable when the timestamp pair
+is missing, reversed or outside a plausible duration. Scene changes prevent a
+matched FPS comparison.
+
+The final build's `out/macos-native-metal/compute-copy-hle.log` passed both the
+shared-buffer Metal comparison and the poisoned-destination GPU-copy comparison.
+At least 7,500 later live dispatches used the guarded shortcut, including
+3,932,160- and 5,013,504-byte copies. Central Yharnam, the character and HUD were
+visually inspected, the runnable check passed, and the run exited with status 0.
+This establishes correctness and removal of compute binding/dispatch commands
+for those copies. Scene/camera changes prevent a measured speedup claim.
+
+The final negative run, `out/macos-native-metal/compute-copy-hle-negative.log`,
+used the shared GPU bridge, the intentionally incorrect local MSL, and the
+shortcut flag. The Metal comparison recorded 226,410 mismatches; no shortcut
+was enabled. Central Yharnam and HUD continued to render through the original
+compute path, and the run exited with status 0. A log assertion confirmed both
+continued gameplay and the absence of any live shortcut calls.

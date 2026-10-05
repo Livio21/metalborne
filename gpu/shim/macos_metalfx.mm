@@ -15,6 +15,85 @@
 #include <vector>
 
 namespace BbMetalFX {
+struct SharedBuffer::Impl {
+    VkDevice device;
+    VkBuffer buffer{};
+    VkDeviceMemory memory{};
+    id<MTLHeap> heap;
+    id<MTLBuffer> metal;
+    PFN_vkDestroyBuffer destroy;
+    PFN_vkFreeMemory free;
+    Impl(VkDevice d, const VkPhysicalDeviceMemoryProperties& properties, uint64_t size,
+         PFN_vkGetDeviceProcAddr proc) : device(d) {
+#define BUFFER_PROC(name) auto name = reinterpret_cast<PFN_##name>(proc(d, #name))
+        BUFFER_PROC(vkCreateBuffer); BUFFER_PROC(vkGetBufferMemoryRequirements);
+        BUFFER_PROC(vkAllocateMemory); BUFFER_PROC(vkBindBufferMemory);
+        BUFFER_PROC(vkGetMemoryMetalHandleEXT);
+        destroy = reinterpret_cast<PFN_vkDestroyBuffer>(proc(d, "vkDestroyBuffer"));
+        free = reinterpret_cast<PFN_vkFreeMemory>(proc(d, "vkFreeMemory"));
+#undef BUFFER_PROC
+        if (!vkGetMemoryMetalHandleEXT || !size || size > 16 * 1024 * 1024) return;
+        const auto fail = [](const char* where, VkResult result) {
+            std::fprintf(stderr, "Native Metal shared buffer unavailable: %s (VkResult=%d).\n", where, result);
+        };
+        VkExternalMemoryBufferCreateInfo external{.sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO,
+            .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_MTLHEAP_BIT_EXT};
+        VkBufferCreateInfo info{.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .pNext = &external,
+            .size = size, .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+            .sharingMode = VK_SHARING_MODE_EXCLUSIVE};
+        VkResult result = vkCreateBuffer(d, &info, nullptr, &buffer);
+        if (result != VK_SUCCESS) { fail("vkCreateBuffer", result); return; }
+        VkMemoryRequirements req{};
+        vkGetBufferMemoryRequirements(d, buffer, &req);
+        uint32_t type = properties.memoryTypeCount;
+        for (uint32_t i = 0; i < properties.memoryTypeCount; ++i) {
+            const auto wanted = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+            if ((req.memoryTypeBits & (1u << i)) && (properties.memoryTypes[i].propertyFlags & wanted) == wanted) {
+                type = i; break;
+            }
+        }
+        if (type == properties.memoryTypeCount) { fail("coherent shared memory required", VK_ERROR_FEATURE_NOT_PRESENT); return; }
+        VkExportMemoryAllocateInfo exported{.sType = VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO,
+            .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_MTLHEAP_BIT_EXT};
+        VkMemoryDedicatedAllocateInfo dedicated{.sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO,
+            .pNext = &exported, .buffer = buffer};
+        VkMemoryAllocateInfo allocation{.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+            .pNext = &dedicated, .allocationSize = req.size, .memoryTypeIndex = type};
+        result = vkAllocateMemory(d, &allocation, nullptr, &memory);
+        if (result != VK_SUCCESS) { fail("vkAllocateMemory", result); return; }
+        result = vkBindBufferMemory(d, buffer, memory, 0);
+        if (result != VK_SUCCESS) { fail("vkBindBufferMemory", result); return; }
+        VkMemoryGetMetalHandleInfoEXT query{.sType = VK_STRUCTURE_TYPE_MEMORY_GET_METAL_HANDLE_INFO_EXT,
+            .memory = memory, .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_MTLHEAP_BIT_EXT};
+        void* handle = nullptr;
+        result = vkGetMemoryMetalHandleEXT(d, &query, &handle);
+        if (result != VK_SUCCESS || !handle) { fail("vkGetMemoryMetalHandleEXT", result); return; }
+        heap = (__bridge id<MTLHeap>)handle;
+        if (heap.type != MTLHeapTypePlacement || heap.storageMode != MTLStorageModeShared)
+            { fail("shared placement heap required", VK_ERROR_FEATURE_NOT_PRESENT); return; }
+        const MTLResourceOptions options = MTLResourceStorageModeShared |
+            (heap.cpuCacheMode << MTLResourceCPUCacheModeShift) |
+            (heap.hazardTrackingMode << MTLResourceHazardTrackingModeShift);
+        const auto layout = [heap.device heapBufferSizeAndAlignWithLength:size options:options];
+        if (layout.size > req.size || layout.size > heap.size || layout.align > req.alignment)
+            { fail("Metal/Vulkan buffer layout differs", VK_ERROR_FEATURE_NOT_PRESENT); return; }
+        metal = [heap newBufferWithLength:size options:options offset:0];
+        if (!metal) fail("newBufferWithLength:offset:", VK_ERROR_OUT_OF_DEVICE_MEMORY);
+    }
+    ~Impl() {
+        metal = nil;
+        if (buffer) destroy(device, buffer, nullptr);
+        if (memory) free(device, memory, nullptr);
+        heap = nil;
+    }
+};
+SharedBuffer::SharedBuffer(VkDevice device, const VkPhysicalDeviceMemoryProperties& properties,
+                           uint64_t size, PFN_vkGetDeviceProcAddr proc)
+    : impl(std::make_unique<Impl>(device, properties, size, proc)) {}
+SharedBuffer::~SharedBuffer() = default;
+VkBuffer SharedBuffer::Handle() const { return impl->metal ? impl->buffer : VK_NULL_HANDLE; }
+void* SharedBuffer::NativeHandle() const { return (__bridge void*)impl->metal; }
+
 bool CheckCompute(std::span<const ComputeBuffer> buffers, std::span<const uint8_t> push,
                   uint32_t groups, uint32_t threads) {
     @autoreleasepool {
@@ -29,7 +108,7 @@ bool CheckCompute(std::span<const ComputeBuffer> buffers, std::span<const uint8_
         NSString* source = [NSString stringWithContentsOfFile:@(path)
                             encoding:NSUTF8StringEncoding error:&error];
         if (!source) return fail(error.localizedDescription);
-        id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+        id<MTLDevice> device = buffers[0].native ? ((__bridge id<MTLBuffer>)buffers[0].native).device : MTLCreateSystemDefaultDevice();
         if (!device) return fail(@"Metal device unavailable");
         MTLCompileOptions* options = [MTLCompileOptions new];
         options.fastMathEnabled = NO;
@@ -50,15 +129,27 @@ bool CheckCompute(std::span<const ComputeBuffer> buffers, std::span<const uint8_
             const auto& b = buffers[i];
             if (b.before.empty() || b.before.size() != b.reference.size() || b.before.size() > 16 * 1024 * 1024)
                 return fail(@"invalid buffer snapshot");
-            id<MTLBuffer> buffer = [device newBufferWithBytes:b.before.data() length:b.before.size() options:MTLResourceStorageModeShared];
+            id<MTLBuffer> buffer = b.native ? (__bridge id<MTLBuffer>)b.native :
+                [device newBufferWithBytes:b.before.data() length:b.before.size() options:MTLResourceStorageModeShared];
             if (!buffer) return fail(@"buffer allocation failed");
+            if (buffer.device != device || buffer.length < b.before.size() || !buffer.contents)
+                return fail(@"incompatible shared buffer");
             native.push_back(buffer);
             [arguments setBuffer:buffer offset:0 atIndex:i];
         }
         id<MTLCommandQueue> queue = [device newCommandQueue];
         id<MTLCommandBuffer> command = [queue commandBuffer];
+        id<MTLFence> fence = nil;
+        if (buffers[0].native) {
+            fence = [device newFence];
+            id<MTLBlitCommandEncoder> release = [command blitCommandEncoder];
+            if (!fence || !release) return fail(@"shared buffer fence unavailable");
+            [release updateFence:fence];
+            [release endEncoding];
+        }
         id<MTLComputeCommandEncoder> encoder = [command computeCommandEncoder];
         if (!encoder) return fail(@"command encoder unavailable");
+        if (fence) [encoder waitForFence:fence];
         [encoder setComputePipelineState:pipeline];
         [encoder setBuffer:argument_buffer offset:0 atIndex:0];
         [encoder setBytes:push.data() length:push.size() atIndex:1];
@@ -78,9 +169,13 @@ bool CheckCompute(std::span<const ComputeBuffer> buffers, std::span<const uint8_
             }
             compared += b.reference.size();
         }
-        std::fprintf(stderr, "Native Metal compute proof: %s; %zu buffers, %zu bytes compared, %zu bytes changed, %zu mismatches; %ux1x1 groups, %ux1x1 threads; GPU %.3f ms.\n",
+        char timing[40] = "unavailable";
+        const double start = command.GPUStartTime, duration = command.GPUEndTime - start;
+        if (start > 0 && duration >= 0 && duration < 60)
+            std::snprintf(timing, sizeof(timing), "%.3f ms", duration * 1000);
+        std::fprintf(stderr, "Native Metal compute proof: %s; %zu buffers, %zu bytes compared, %zu bytes changed, %zu mismatches; %ux1x1 groups, %ux1x1 threads; GPU %s.\n",
                      mismatches ? "MISMATCH" : "PASS", buffers.size(), compared, changed, mismatches,
-                     groups, threads, (command.GPUEndTime - command.GPUStartTime) * 1000);
+                     groups, threads, timing);
         return mismatches == 0;
     }
 }

@@ -7,6 +7,18 @@
 namespace BbMetalFX {
 struct ComputeBuffer {
     std::span<const uint8_t> before, reference;
+    void* native{}; // Optional GPU-populated shared clone; retained by SharedBuffer.
+};
+class SharedBuffer {
+public:
+    SharedBuffer(VkDevice device, const VkPhysicalDeviceMemoryProperties& properties,
+                 uint64_t size, PFN_vkGetDeviceProcAddr proc);
+    ~SharedBuffer();
+    VkBuffer Handle() const;
+    void* NativeHandle() const;
+private:
+    struct Impl;
+    std::unique_ptr<Impl> impl;
 };
 // One-shot shadow dispatch: clones buffers and leaves the live Vulkan resources untouched.
 bool CheckCompute(std::span<const ComputeBuffer> buffers, std::span<const uint8_t> push,
