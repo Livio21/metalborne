@@ -16,5 +16,8 @@ namespace Vulkan {
  * @param device The vulkan device handle
  */
 vk::ShaderModule CompileSPV(std::span<const u32> code, vk::Device device);
+#ifdef __APPLE__
+bool IsMetalComputeReference(vk::ShaderModule module);
+#endif
 
 } // namespace Vulkan

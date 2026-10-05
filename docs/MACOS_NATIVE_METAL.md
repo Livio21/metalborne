@@ -1,4 +1,4 @@
-# Experimental native Metal presentation
+# Experimental native Metal renderer transition
 
 Updated 2026-10-06. This is the first native Metal presentation stage of the
 renderer transition. The game and host CPU code still run under Rosetta;
@@ -140,8 +140,82 @@ MetalFX or a speedup from removing the blit.
 ## Next transition steps
 
 The host frame now renders directly into exportable storage. Next validate a
-real captured game shader/workload on Metal.
+real captured game shader/workload on Metal (the buffer-copy proof below now passes).
 The full backend still needs native resource/cache management, bindings,
 graphics/compute pipelines and command submission. Geometry/tessellation and
 guest completion semantics require their own proofs; presentation alone does
 not establish full native rendering.
+
+## Native game compute proof
+
+An opt-in shadow dispatch validates Bloodborne's two-buffer copy shader
+`0x3d5ebf4e` against its actual Vulkan output. It requires an exact byte match
+between the supplied SPIR-V and the module compiled for the live pipeline,
+including cached modules and overrides. A shader hash alone is insufficient.
+Only direct 64x1x1 dispatches with two valid, non-overlapping buffer ranges and
+bounded accesses qualify. Image, sampler, DMA and indirect workloads are excluded.
+
+The existing scheduler completes a GPU readback before the real Vulkan dispatch
+and another afterward. Native Metal compiles the locally translated MSL through
+`newLibraryWithSource`, binds cloned buffers through a tier-2 argument buffer,
+uses the real push constants/group count, and compares every buffer byte with
+the Vulkan reference. Both written and untouched bytes are checked. The game's
+live resources continue to use the original Vulkan result, even on mismatch.
+The diagnostic runs once per process, is off by default, and retains no captured
+resources on disk. Readbacks and runtime compilation can cause a visible pause.
+
+Generate the MSL from your own locally cached module with an installed
+SPIRV-Cross CLI, then run:
+
+```bash
+spirv-cross "$SPV" --msl --msl-version 30100 --msl-argument-buffers \
+  --msl-argument-buffer-tier 2 --output out/compute-copy.metal
+BB_METAL_COMPUTE_SPV="$SPV" BB_METAL_COMPUTE_MSL="$PWD/out/compute-copy.metal" \
+  BB_PRESENT_BACKEND=metal BB_METALFX=off BB_FRAME_STATS=1 bash macos/run.sh
+```
+
+`$SPV` must be the copy module from your own cache. Game-derived shaders and
+buffer contents must remain local. This uses native runtime compilation and
+requires no Xcode Metal command-line compiler.
+
+One runnable check, after entering gameplay and closing normally:
+
+```bash
+python3 - out/compute-proof.log <<'PY'
+from pathlib import Path
+import re, sys
+log = Path(sys.argv[1]).read_text(errors='replace')
+assert 'exact SPIR-V module matched; shader 000000003d5ebf4e' in log
+m = re.search(r'Native Metal compute proof: PASS; 2 buffers, (\d+) bytes compared, (\d+) bytes changed, 0 mismatches;', log)
+assert m and int(m[1]) > 0 and int(m[2]) > 0, 'Need a successful dispatch with a nonzero effect'
+assert len(re.findall(r'Guest flip stats: [\d.]+ FPS.*? [1-9]\d{3,} draws/frame', log)) >= 3
+assert not re.search(r'compute proof: FAILED|compute proof: MISMATCH|failed assertion|Assertion failed|SIGBUS|SIGSEGV', log)
+print('Real Metal compute output matched Vulkan and gameplay continued')
+PY
+```
+
+On Apple M5, `out/macos-native-metal/compute-proof.log` recorded 7,864,320
+compared bytes across two buffers, 226,410 changed bytes, zero mismatches,
+15,360 groups and 64 threads/group. Metal reported 0.079 ms for this dispatch.
+Central Yharnam, the character and HUD were visually inspected afterward; the
+run exited with status 0. This proves one real game compute workload, not a
+replacement for Vulkan compute or the full renderer. The diagnostic's copies,
+waits and compilation are not included in that GPU time; no gameplay speedup
+or stable 30 FPS is established.
+
+An intentionally incorrect local MSL variant writing zeros recorded 226,410
+mismatches in `out/macos-native-metal/compute-proof-negative.log`. The game
+continued to render Central Yharnam and exited with status 0. The runnable check
+rejects that log. This exercises the output comparison without modifying the
+live Vulkan resources.
+
+The installed KosmicKrisp 0.19 driver also reported external-memory features
+`0x6` (import/export) for ordinary Metal-heap buffers, but `0x0` for sparse
+Metal-heap buffers with storage/transfer/device-address usage. bbport's guest
+buffer cache uses sparse arenas. A direct native compute replacement therefore
+needs a different buffer ownership contract or a GPU copy bridge; ordinary
+buffer export alone cannot share the existing sparse arenas. The local probe
+is `out/macos-native-metal/buffer-capabilities.c`; the specification's
+[Metal external-memory API](https://docs.vulkan.org/features/latest/features/proposals/VK_EXT_external_memory_metal.html)
+defines the resource export mechanism, while the installed driver query
+establishes this limitation.

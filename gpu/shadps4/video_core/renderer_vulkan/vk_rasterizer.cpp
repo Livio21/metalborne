@@ -25,8 +25,49 @@
 #include "video_core/renderer_vulkan/vk_shader_hle.h"
 #include "video_core/texture_cache/image_view.h"
 #include "video_core/texture_cache/texture_cache.h"
+#ifdef __APPLE__
+#include "macos_metalfx.h"
+#endif
 
 namespace Vulkan {
+#ifdef __APPLE__
+// Diagnostic only: two completed readbacks, never enabled by default or used for rendering.
+static std::vector<std::vector<u8>> ReadComputeBuffers(
+    const Instance& instance, Scheduler& scheduler, std::span<const vk::DescriptorBufferInfo> inputs) {
+    std::vector<VideoCore::Buffer> readbacks;
+    for (const auto& input : inputs)
+        readbacks.emplace_back(instance, 0, input.range, VideoCore::MemoryType::HostCached,
+                               "Metal compute proof");
+    std::vector<vk::DescriptorBufferInfo> sources(inputs.begin(), inputs.end());
+    std::vector<vk::Buffer> targets;
+    for (const auto& readback : readbacks) targets.push_back(readback.Handle());
+    scheduler.Record([sources, targets](vk::CommandBuffer command) {
+        vk::MemoryBarrier2 barrier{
+            .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+            .srcAccessMask = vk::AccessFlagBits2::eMemoryWrite,
+            .dstStageMask = vk::PipelineStageFlagBits2::eCopy,
+            .dstAccessMask = vk::AccessFlagBits2::eTransferRead,
+        };
+        command.pipelineBarrier2(vk::DependencyInfo{.memoryBarrierCount = 1, .pMemoryBarriers = &barrier});
+        for (size_t i = 0; i < sources.size(); ++i)
+            command.copyBuffer(sources[i].buffer, targets[i], vk::BufferCopy{sources[i].offset, 0, sources[i].range});
+        barrier = {
+            .srcStageMask = vk::PipelineStageFlagBits2::eCopy,
+            .srcAccessMask = vk::AccessFlagBits2::eTransferRead | vk::AccessFlagBits2::eTransferWrite,
+            .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands | vk::PipelineStageFlagBits2::eHost,
+            .dstAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite | vk::AccessFlagBits2::eHostRead,
+        };
+        command.pipelineBarrier2(vk::DependencyInfo{.memoryBarrierCount = 1, .pMemoryBarriers = &barrier});
+    });
+    scheduler.Finish();
+    std::vector<std::vector<u8>> result;
+    for (auto& readback : readbacks) {
+        readback.Invalidate(0, readback.SizeBytes());
+        result.emplace_back(readback.mapped_data.begin(), readback.mapped_data.end());
+    }
+    return result;
+}
+#endif
 
 static Shader::PushData MakeUserData(const AmdGpu::Regs& regs) {
     // TODO(roamic): Add support for multiple viewports and geometry shaders when ViewportIndex
@@ -1301,6 +1342,35 @@ void Rasterizer::DispatchRecord(const ComputePipeline* pipeline) {
 
     scheduler.EndRendering();
     mark();
+#ifdef __APPLE__
+    std::vector<std::vector<u8>> metal_before;
+    // ponytail: prove one simple buffer-only shader first; images/aliasing need their own contract.
+    static bool metal_checked = false; // DispatchRecord is serialized on the draw recording owner.
+    if (!metal_checked && pipeline->metal_reference && cs.pgm_hash == 0x3d5ebf4e &&
+        std::getenv("BB_METAL_COMPUTE_MSL") && cs.buffers.size() == 2 &&
+        cs.images.empty() && cs.samplers.empty() && !cs.uses_dma &&
+        cs_program.num_thread_x.full == 64 && cs_program.num_thread_y.full == 1 &&
+        cs_program.num_thread_z.full == 1 && cs_program.dim_x &&
+        cs_program.dim_y == 1 && cs_program.dim_z == 1 && buffer_infos.size() == 2 &&
+        push_data.ud_regs[0] && push_data.ud_regs[0] <= uint64_t(cs_program.dim_x) * 64) {
+        bool valid = true;
+        for (size_t i = 0; i < buffer_infos.size(); ++i) {
+            const auto& buffer = buffer_infos[i];
+            valid &= buffer.buffer && buffer.range && buffer.range <= 16 * 1024 * 1024 &&
+                     buffer.range % 4 == 0 && buffer.offset % 4 == 0 &&
+                     uint64_t(push_data.ud_regs[0]) * 4 + push_data.buf_offsets[i] <= buffer.range;
+        }
+        const auto& a = buffer_infos[0];
+        const auto& b = buffer_infos[1];
+        valid &= a.buffer != b.buffer || a.offset + a.range <= b.offset || b.offset + b.range <= a.offset;
+        if (valid) {
+            metal_checked = true;
+            std::fprintf(stderr, "Native Metal compute proof: exact SPIR-V module matched; shader %016llx.\n",
+                         static_cast<unsigned long long>(cs.pgm_hash));
+            metal_before = ReadComputeBuffers(instance, scheduler, buffer_infos);
+        }
+    }
+#endif
     pipeline->BindResources(set_writes, push_data);
 
     const vk::Pipeline handle = pipeline->Handle();
@@ -1313,6 +1383,16 @@ void Rasterizer::DispatchRecord(const ComputePipeline* pipeline) {
         cmdbuf.dispatch(dim_x, dim_y, dim_z);
     });
     DebugState.IncDispatch();
+
+#ifdef __APPLE__
+    if (!metal_before.empty()) {
+        const auto reference = ReadComputeBuffers(instance, scheduler, buffer_infos);
+        std::array<BbMetalFX::ComputeBuffer, 2> buffers;
+        for (size_t i = 0; i < buffers.size(); ++i) buffers[i] = {metal_before[i], reference[i]};
+        BbMetalFX::CheckCompute(buffers,
+            {reinterpret_cast<const u8*>(&push_data), sizeof(push_data)}, dim_x, 64);
+    }
+#endif
 
     ResetBindings(true);
     scheduler.KickRecording();

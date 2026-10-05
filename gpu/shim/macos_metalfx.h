@@ -1,9 +1,16 @@
 // Experimental Metal presentation and MetalFX. Vulkan shares dedicated GPU textures.
 #pragma once
 #include <memory>
+#include <span>
 #include <vulkan/vulkan_core.h>
 
 namespace BbMetalFX {
+struct ComputeBuffer {
+    std::span<const uint8_t> before, reference;
+};
+// One-shot shadow dispatch: clones buffers and leaves the live Vulkan resources untouched.
+bool CheckCompute(std::span<const ComputeBuffer> buffers, std::span<const uint8_t> push,
+                  uint32_t groups, uint32_t threads);
 struct Images {
     VkImage input{}, output{};
     uint32_t input_width{}, input_height{}, output_width{}, output_height{};

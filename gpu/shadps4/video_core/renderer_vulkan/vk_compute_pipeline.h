@@ -49,6 +49,9 @@ public:
                     ComputePipelineKey compute_key, const Shader::Info& info,
                     vk::ShaderModule module, SerializationSupport& sdata, bool preloading);
     ~ComputePipeline();
+#ifdef __APPLE__
+    bool metal_reference{};
+#endif
 
 private:
     ComputePipelineKey compute_key;

@@ -12,8 +12,79 @@
 #include <cstring>
 #include <array>
 #include <atomic>
+#include <vector>
 
 namespace BbMetalFX {
+bool CheckCompute(std::span<const ComputeBuffer> buffers, std::span<const uint8_t> push,
+                  uint32_t groups, uint32_t threads) {
+    @autoreleasepool {
+        const auto fail = [](NSString* error) {
+            std::fprintf(stderr, "Native Metal compute proof: FAILED: %s\n", error.UTF8String);
+            return false;
+        };
+        const char* path = std::getenv("BB_METAL_COMPUTE_MSL");
+        if (!path || buffers.empty() || buffers.size() > 2 || push.empty() || !groups || !threads)
+            return fail(@"missing source or invalid dispatch");
+        NSError* error = nil;
+        NSString* source = [NSString stringWithContentsOfFile:@(path)
+                            encoding:NSUTF8StringEncoding error:&error];
+        if (!source) return fail(error.localizedDescription);
+        id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+        if (!device) return fail(@"Metal device unavailable");
+        MTLCompileOptions* options = [MTLCompileOptions new];
+        options.fastMathEnabled = NO;
+        id<MTLLibrary> library = [device newLibraryWithSource:source options:options error:&error];
+        if (!library) return fail(error.localizedDescription);
+        id<MTLFunction> function = [library newFunctionWithName:@"main0"];
+        if (!function) return fail(@"main0 entry point unavailable");
+        id<MTLComputePipelineState> pipeline = [device newComputePipelineStateWithFunction:function error:&error];
+        if (!pipeline) return fail(error.localizedDescription);
+        if (threads > pipeline.maxTotalThreadsPerThreadgroup) return fail(@"threadgroup too large");
+        id<MTLArgumentEncoder> arguments = [function newArgumentEncoderWithBufferIndex:0];
+        if (!arguments) return fail(@"argument buffer unavailable");
+        id<MTLBuffer> argument_buffer = [device newBufferWithLength:arguments.encodedLength options:MTLResourceStorageModeShared];
+        if (!argument_buffer) return fail(@"argument allocation failed");
+        [arguments setArgumentBuffer:argument_buffer offset:0];
+        std::vector<id<MTLBuffer>> native;
+        for (size_t i = 0; i < buffers.size(); ++i) {
+            const auto& b = buffers[i];
+            if (b.before.empty() || b.before.size() != b.reference.size() || b.before.size() > 16 * 1024 * 1024)
+                return fail(@"invalid buffer snapshot");
+            id<MTLBuffer> buffer = [device newBufferWithBytes:b.before.data() length:b.before.size() options:MTLResourceStorageModeShared];
+            if (!buffer) return fail(@"buffer allocation failed");
+            native.push_back(buffer);
+            [arguments setBuffer:buffer offset:0 atIndex:i];
+        }
+        id<MTLCommandQueue> queue = [device newCommandQueue];
+        id<MTLCommandBuffer> command = [queue commandBuffer];
+        id<MTLComputeCommandEncoder> encoder = [command computeCommandEncoder];
+        if (!encoder) return fail(@"command encoder unavailable");
+        [encoder setComputePipelineState:pipeline];
+        [encoder setBuffer:argument_buffer offset:0 atIndex:0];
+        [encoder setBytes:push.data() length:push.size() atIndex:1];
+        for (id<MTLBuffer> buffer : native) [encoder useResource:buffer usage:MTLResourceUsageRead | MTLResourceUsageWrite];
+        [encoder dispatchThreadgroups:MTLSizeMake(groups, 1, 1) threadsPerThreadgroup:MTLSizeMake(threads, 1, 1)];
+        [encoder endEncoding];
+        [command commit];
+        [command waitUntilCompleted];
+        if (command.status != MTLCommandBufferStatusCompleted) return fail(command.error.localizedDescription ?: @"command failed");
+        size_t compared = 0, changed = 0, mismatches = 0;
+        for (size_t i = 0; i < buffers.size(); ++i) {
+            const auto* result = static_cast<const uint8_t*>(native[i].contents);
+            const auto& b = buffers[i];
+            for (size_t j = 0; j < b.reference.size(); ++j) {
+                changed += b.before[j] != b.reference[j];
+                mismatches += result[j] != b.reference[j];
+            }
+            compared += b.reference.size();
+        }
+        std::fprintf(stderr, "Native Metal compute proof: %s; %zu buffers, %zu bytes compared, %zu bytes changed, %zu mismatches; %ux1x1 groups, %ux1x1 threads; GPU %.3f ms.\n",
+                     mismatches ? "MISMATCH" : "PASS", buffers.size(), compared, changed, mismatches,
+                     groups, threads, (command.GPUEndTime - command.GPUStartTime) * 1000);
+        return mismatches == 0;
+    }
+}
+
 struct Presentation::Impl {
     struct Texture {
         VkImage image{};
