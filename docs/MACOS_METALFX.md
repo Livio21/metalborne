@@ -12,8 +12,8 @@ path, not a complete native Metal backend or an ARM64 game executable.
 
 The x86-64 macOS build links Apple's MetalFX framework and uses
 `MTLFXSpatialScaler`. GPU pixels remain on the GPU, using shared interop textures and a private MetalFX output. It does not read
-frames back to CPU memory. **The title screen has rendered with the path active; gameplay and a performance
-improvement are not established by that result.** The normal launcher leaves it off.
+frames back to CPU memory. **The title screen and Hunter's Dream gameplay have rendered with the path active.
+A performance improvement and long-run stability are not established.** The normal launcher leaves it off.
 
 The installed KosmicKrisp driver on this Apple M5 reports:
 
@@ -32,6 +32,14 @@ alone does not establish support for every handle type in that extension.
 On the Apple M5 with KosmicKrisp 0.19.0, the corrected shared-heap/private-output
 path prepared **1280x720 -> 1710x961 RGBA8** and logged the first completed GPU
 upscale. The title image, menu and credits displayed without obvious corruption.
+A subsequent offline load reached the Hunter's Dream, with the character and
+HUD visible. Two stationary windows reported **29.1-29.2 guest Flip FPS**, guest
+median 33.33 ms and p99 50.01 ms; host presentation-call p50 was 33.75-33.82 ms
+and p99 39.27-39.51 ms. There were zero shader/pipeline compiles in those windows.
+This is a different scene from the earlier room baseline and establishes no
+matched-scene speedup or actual display scanout cadence. The process closed
+through its window with exit status 0.
+
 Representative title windows reported roughly 2-6 ms per frame for the entire
 MetalFX stage after its initial warmup. These are CPU wall times including waits;
 they are neither a gameplay speedup nor pure GPU scaler timings.
@@ -142,7 +150,7 @@ wall times and the MetalFX bridge's copy/completion and encode/completion times.
 `BB_FRAME_STATS=1` includes these reports by default. They are CPU wall times,
 not GPU utilization, pure GPU pass duration or confirmed display scanout timing.
 
-Next steps are visual/runtime validation, matched-scene measurements and a GPU
+Next steps are broader visual/runtime validation, matched-scene measurements and a GPU
 synchronization bridge to replace these CPU waits. The installed driver exposes
 Vulkan external semaphore/fence FD support, but no public Metal shared-event
 export API has been established. Removing waits without another ordering

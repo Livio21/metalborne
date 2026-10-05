@@ -137,3 +137,20 @@ time. All instrumentation is opt-in.
 See [MetalFX integration](MACOS_METALFX.md) for the experimental spatial pass and
 its current CPU synchronization cost. It is disabled by default, and no new
 matched-scene performance result is claimed for these changes.
+
+## MetalFX gameplay check (2026-10-05)
+
+The experimental spatial path reached Hunter's Dream gameplay on the M5 with
+1280x720 input and 1710x961 output. Two stationary windows reported 29.1-29.2
+guest Flip FPS, median 33.33 ms and p99 50.01 ms. Host presentation-call p50 was
+33.75-33.82 ms, p99 39.27-39.51 ms; these are API timings, not screen scanout.
+There were no shader/pipeline compiles in those windows.
+
+The Vulkan copy/completion wait averaged 24.85-25.63 ms/frame and the Metal
+encode/completion stage 1.18-1.23 ms/frame. The former includes waiting for
+rendered input, so it is not the pure cost of the copy. The run closed through
+the window with exit status 0. This scene differs from the earlier starting-room
+baseline; a speedup and stable 30 FPS have not been established. MetalFX remains
+off by default. See [runtime evidence and allocation findings](MACOS_METALFX.md).
+
+Local evidence: `out/macos-metalfx-run/spatial-private-output.log`.

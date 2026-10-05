@@ -152,6 +152,6 @@ new graphics backend. The current branch uses the Vulkan-to-Metal route.
 
 The macOS launcher targets the unpatched 30 FPS game with FIFO presentation.
 Experimental MetalFX spatial upscaling is available through `BB_METALFX=spatial`;
-it has reached title-screen rendering and remains disabled by default while
-gameplay and performance validation are pending. See [MetalFX integration and launch options](MACOS_METALFX.md) and
+it has rendered the title and Hunter's Dream, and remains disabled by default
+while broader stability and matched-scene performance validation are pending. See [MetalFX integration and launch options](MACOS_METALFX.md) and
 [presentation diagnostics](MACOS_PERFORMANCE.md#presentation-diagnostics-and-30-fps-defaults-2026-10-05).
