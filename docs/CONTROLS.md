@@ -53,8 +53,15 @@ Set these environment variables before launching:
 For the current macOS workspace:
 
 ```bash
-BB_INPUT_MODE=kbm BB_MOUSE_SENSITIVITY=2.0 bash macos/run.sh
+bash macos/run.sh
 ```
+
+Connect a controller over USB or Bluetooth before or during play; `auto` switches
+to it when SDL detects it and falls back to KBM on disconnect. Set
+`BB_INPUT_MODE=kbm` explicitly to keep using keyboard/mouse with a controller connected.
+Back/Select acts as a left touchpad click on controllers without a touch surface;
+Tab and Backspace remain available for left/right touchpad clicks. L3 + R3 opens
+the host settings overlay.
 
 Mouse movement is converted to right-stick velocity. Bloodborne's own stick
 dead zone, acceleration and maximum turn speed still apply; this is not raw

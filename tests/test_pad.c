@@ -4,7 +4,9 @@
 #include "../src/runtime_pad.c"
 
 static int capture;
+static BbHostInput host={.focused=1};
 int bbgpu_overlay_captures_input(void) { return capture; }
+int bbgpu_read_host_input(BbHostInput *out) { *out=host; return 1; }
 uintptr_t runtime_lookup(const RuntimeExport *table, size_t count, const char *name) {
     (void)table; (void)count; (void)name;
     return 0;
@@ -24,6 +26,7 @@ int main(void) {
     assert(fd>=0);
     close(fd);
     setenv("BB_PAD_FILE",path,1);
+    setenv("BB_INPUT_MODE","auto",1);
     setenv("SDL_VIDEODRIVER","dummy",1);
     /* Only the virtual test controller is a gamepad, whatever is plugged in. */
     SDL_SetHint(SDL_HINT_GAMECONTROLLER_IGNORE_DEVICES_EXCEPT,"0x1d50/0x6189");
@@ -65,6 +68,19 @@ int main(void) {
     assert(gamepad && data.touch_count==2 && (data.buttons & BTN_TOUCHPAD));
     assert(data.touches[0].x==1439 && data.touches[0].y==471 && data.touches[0].id==0);
     assert(data.touches[1].x==480 && data.touches[1].y==942 && data.touches[1].id==1);
+    assert(SDL_SetJoystickVirtualButton(joystick,SDL_GAMEPAD_BUTTON_SOUTH,true));
+    assert(SDL_SetJoystickVirtualAxis(joystick,SDL_GAMEPAD_AXIS_LEFTX,32767));
+    assert(SDL_SetJoystickVirtualAxis(joystick,SDL_GAMEPAD_AXIS_RIGHTY,-32768));
+    assert(SDL_SetJoystickVirtualAxis(joystick,SDL_GAMEPAD_AXIS_LEFT_TRIGGER,32767));
+    SDL_UpdateJoysticks();
+    SDL_UpdateGamepads();
+    assert(pad_read_state(1,&data)==0 && (data.buttons & (BTN_CROSS|BTN_L2))==(BTN_CROSS|BTN_L2));
+    assert(data.left_x==255 && data.right_y==0 && data.l2==255);
+    host.keys[SDL_SCANCODE_SPACE]=1;
+    setenv("BB_INPUT_MODE","kbm",1);
+    assert(pad_read_state(1,&data)==0 && data.buttons==BTN_CIRCLE && data.left_x==128);
+    setenv("BB_INPUT_MODE","gamepad",1);
+    assert(pad_read_state(1,&data)==0 && (data.buttons & BTN_CROSS) && !(data.buttons & BTN_CIRCLE));
     capture=1;
     assert(pad_read_state(1,&data)==0 && data.touch_count==0 && data.buttons==0);
     capture=0;
@@ -74,10 +90,25 @@ int main(void) {
     SDL_UpdateGamepads();
     assert(pad_read_state(1,&data)==0 && data.touch_count==1 && data.touches[0].x==480);
     SDL_CloseJoystick(joystick);
-    if (gamepad) SDL_CloseGamepad(gamepad);
+    assert(SDL_DetachVirtualJoystick(id));
+    SDL_UpdateJoysticks();
+    SDL_UpdateGamepads();
+    assert(pad_read_state(1,&data)==0 && !gamepad && data.buttons==0);
+    setenv("BB_INPUT_MODE","auto",1);
+    assert(pad_read_state(1,&data)==0 && data.buttons==BTN_CIRCLE);
+    id=SDL_AttachVirtualJoystick(&desc);
+    assert(id!=0);
+    joystick=SDL_OpenJoystick(id);
+    assert(joystick && SDL_SetJoystickVirtualButton(joystick,SDL_GAMEPAD_BUTTON_EAST,true));
+    SDL_UpdateJoysticks();
+    SDL_UpdateGamepads();
+    host.keys[SDL_SCANCODE_E]=1;
+    assert(pad_read_state(1,&data)==0 && gamepad && data.buttons==BTN_CIRCLE);
+    SDL_CloseJoystick(joystick);
+    SDL_CloseGamepad(gamepad);
     gamepad=NULL;
     assert(SDL_DetachVirtualJoystick(id));
     SDL_Quit();
     unlink(path);
-    puts("PASS: pad ABI, debug camera chord, left/right clicks, SDL touch coordinates, overlay capture");
+    puts("PASS: pad ABI, buttons/sticks/triggers, touchpad, overlay capture, input modes, disconnect/reconnect");
 }

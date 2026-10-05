@@ -15,7 +15,7 @@ export BB_FPS=${BB_FPS:-30}
 # Vsync queue for the 30 FPS target. An explicit mode still overrides it.
 export BB_PRESENT_MODE=${BB_PRESENT_MODE:-Fifo}
 export BB_UPSCALER=${BB_UPSCALER:-off}
-export BB_INPUT_MODE=${BB_INPUT_MODE:-kbm}
+export BB_INPUT_MODE=${BB_INPUT_MODE:-auto}
 # Temporary workaround for PM4 stream assertions observed during map loading.
 # Keep the optimized paths available for profiling as the port matures.
 if [[ ${BB_MACOS_CONSERVATIVE_GPU:-1} == 1 ]]; then
