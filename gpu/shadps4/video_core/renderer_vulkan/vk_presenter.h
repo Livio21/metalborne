@@ -33,7 +33,8 @@ namespace Vulkan {
 struct Frame {
     u32 width;
     u32 height;
-    VmaAllocation allocation;
+    VmaAllocation allocation{};
+    bool external_image{false}; // Owned by Metal presentation rather than VMA.
     vk::Image image;
     vk::ImageView image_view;
     vk::Fence present_done;
@@ -126,6 +127,7 @@ private:
 
 private:
     float expected_ratio{1920.0 / 1080.0f};
+    vk::Format frame_format{};
     u32 expected_frame_width{1920};
     u32 expected_frame_height{1080};
 

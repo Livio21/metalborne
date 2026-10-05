@@ -10,7 +10,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <map>
+#include <array>
+#include <atomic>
 
 namespace BbMetalFX {
 struct Presentation::Impl {
@@ -43,8 +44,11 @@ struct Presentation::Impl {
     VkFormat format{VK_FORMAT_R8G8B8A8_UNORM};
     MTLPixelFormat metal_format{MTLPixelFormatRGBA8Unorm};
     const char* format_name{"RGBA8"};
-    std::map<uint32_t, Slot> slots;
-    bool available = true, announced = false, completed = false;
+    // Frame IDs are u8. Fixed slots allow draw/present threads to access distinct frames;
+    // the existing per-frame fence protects each slot's textures.
+    std::array<Slot, 256> slots;
+    std::atomic<bool> available{true};
+    bool announced = false, completed = false;
     bool spatial = true, presented = false;
 
     Impl(VkInstance instance, VkPhysicalDevice p, VkDevice d,
@@ -86,7 +90,7 @@ struct Presentation::Impl {
         Release(s.input); Release(s.output);
         s.images = {};
     }
-    ~Impl() { for (auto& [key, slot] : slots) Release(slot); }
+    ~Impl() { for (auto& slot : slots) Release(slot); }
 
     bool Allocate(Texture& t, uint32_t width, uint32_t height) {
         const auto fail = [&](const char* stage, VkResult result = VK_SUCCESS) {
@@ -191,32 +195,58 @@ void Presentation::SetNativeLayer(void* handle) {
     impl->spatial = mode && std::strcmp(mode, "spatial") == 0;
 }
 bool Presentation::NativePresentation() const { return impl->available && impl->layer; }
+VkFormat Presentation::InputFormat() const { return impl->format; }
+VkImage Presentation::CreateFrameImage(uint8_t key, uint32_t width, uint32_t height) {
+    @autoreleasepool {
+        if (!NativePresentation()) return {};
+        auto& s = impl->slots.at(key);
+        impl->Release(s);
+        if (!impl->Allocate(s.input, width, height)) {
+            impl->Release(s); impl->Disable("exportable frame allocation failed"); return {};
+        }
+        s.images = {s.input.image, {}, width, height, 0, 0, false};
+        std::fprintf(stderr, "Native Metal frame #%u: post-processing renders directly into shared %s %ux%u.\n",
+                     unsigned(key), impl->format_name, width, height);
+        return s.input.image;
+    }
+}
 const Images* Presentation::Find(uint32_t key) const {
-    const auto found = impl->slots.find(key);
-    return found == impl->slots.end() ? nullptr : &found->second.images;
+    const auto& s = impl->slots.at(key);
+    return s.images.input ? &s.images : nullptr;
 }
 Images* Presentation::Prepare(uint32_t key, uint32_t iw, uint32_t ih, uint32_t ow, uint32_t oh) {
     @autoreleasepool {
         if (!impl->available || !iw || !ih || !ow || !oh) return nullptr;
         const bool native = NativePresentation();
         if (!native && (ow < iw || oh < ih || (ow == iw && oh == ih))) return nullptr;
-        auto& s = impl->slots[key];
+        auto& s = impl->slots.at(key);
         if (s.images.input_width == iw && s.images.input_height == ih &&
             s.images.output_width == ow && s.images.output_height == oh) return &s.images;
-        impl->Release(s);
-        if (!impl->Allocate(s.input, iw, ih) || (!native && !impl->Allocate(s.output, ow, oh))) {
-            impl->Release(s); impl->Disable("exportable placement heap textures could not be allocated");
-            return nullptr;
+        // Window resize must retain the frame image/view used by Vulkan post-processing.
+        const bool keep_input = native && s.input.image &&
+            s.images.input_width == iw && s.images.input_height == ih;
+        s.scaler = nil; s.scaled = nil;
+        impl->Release(s.output);
+        if (!keep_input) impl->Release(s.input);
+        const auto fail = [&](const char* why) -> Images* {
+            // A native frame still owns a Vulkan view of the shared input on fallback.
+            if (!keep_input) impl->Release(s);
+            else { s.scaler = nil; s.scaled = nil; impl->Release(s.output); }
+            impl->Disable(why); return nullptr;
+        };
+        if ((!keep_input && !impl->Allocate(s.input, iw, ih)) ||
+            (!native && !impl->Allocate(s.output, ow, oh))) {
+            return fail("exportable placement heap textures could not be allocated");
         }
         id<MTLDevice> device = s.input.metal.device;
         const bool scale = impl->spatial && ow >= iw && oh >= ih && (ow != iw || oh != ih);
         if ((!native && s.output.metal.device != device) ||
             (scale && ![MTLFXSpatialScalerDescriptor supportsDevice:device])) {
-            impl->Release(s); impl->Disable("GPU does not support the spatial scaler"); return nullptr;
+            return fail("GPU does not support the spatial scaler");
         }
         if (!impl->queue) impl->queue = [device newCommandQueue];
         if (!impl->queue) {
-            impl->Release(s); impl->Disable("Metal command queue allocation failed"); return nullptr;
+            return fail("Metal command queue allocation failed");
         }
         if (scale) {
             MTLFXSpatialScalerDescriptor* desc = [MTLFXSpatialScalerDescriptor new];
@@ -233,18 +263,18 @@ Images* Presentation::Prepare(uint32_t key, uint32_t iw, uint32_t ih, uint32_t o
             if (!impl->queue || !s.scaler || !s.scaled ||
                 (s.input.metal.usage & s.scaler.colorTextureUsage) != s.scaler.colorTextureUsage ||
                 (s.scaled.usage & s.scaler.outputTextureUsage) != s.scaler.outputTextureUsage) {
-                impl->Release(s); impl->Disable("scaler creation or texture usage requirements failed");
-                return nullptr;
+                return fail("scaler creation or texture usage requirements failed");
             }
             // Supply MetalFX's fence for the driver's untracked heap resources.
             if (s.input.metal.hazardTrackingMode == MTLHazardTrackingModeUntracked) {
                 s.scaler.fence = [device newFence];
                 if (!s.scaler.fence) {
-                    impl->Release(s); impl->Disable("untracked-resource fence allocation failed"); return nullptr;
+                    return fail("untracked-resource fence allocation failed");
                 }
             }
         }
-        s.images = {s.input.image, s.output.image, iw, ih, ow, oh, false};
+        s.images = {s.input.image, s.output.image, iw, ih, ow, oh,
+                    keep_input && s.images.initialized};
         if (!impl->announced) {
             impl->announced = true;
             std::fprintf(stderr, "%s prepared: %ux%u -> %ux%u %s; GPU textures, CPU completion bridge (experimental).\n",
@@ -255,10 +285,12 @@ Images* Presentation::Prepare(uint32_t key, uint32_t iw, uint32_t ih, uint32_t o
 }
 bool Presentation::Encode(uint32_t key, uint32_t window_width, uint32_t window_height) {
     @autoreleasepool {
+        if (!impl->available) return false;
+        const bool native = impl->layer != nil;
         auto& s = impl->slots.at(key);
         id<MTLCommandBuffer> command = [impl->queue commandBuffer];
         if (!command) { impl->Disable("Metal command buffer allocation failed"); return false; }
-        command.label = NativePresentation() ? @"Metalborne native presentation" : @"bbport MetalFX spatial";
+        command.label = native ? @"Metalborne native presentation" : @"bbport MetalFX spatial";
         if (s.scaler) {
             s.scaler.colorTexture = s.input.metal; s.scaler.outputTexture = s.scaled;
             s.scaler.inputContentWidth = s.images.input_width;
@@ -271,7 +303,7 @@ bool Presentation::Encode(uint32_t key, uint32_t window_width, uint32_t window_h
             }
             [s.scaler encodeToCommandBuffer:command];
         }
-        if (NativePresentation()) {
+        if (native) {
             CAMetalLayer* layer = impl->layer;
             if (!window_width || !window_height) return false;
             if (layer.device && layer.device != s.input.metal.device) {

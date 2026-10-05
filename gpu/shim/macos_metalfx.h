@@ -17,6 +17,9 @@ public:
     bool Available() const;
     void SetNativeLayer(void* layer);
     bool NativePresentation() const;
+    VkFormat InputFormat() const;
+    // Frame fence must be complete and its old image view destroyed before replacement.
+    VkImage CreateFrameImage(uint8_t slot, uint32_t width, uint32_t height);
     const Images* Find(uint32_t slot) const;
     // Caller must complete earlier Vulkan reads before replacing these resources.
     Images* Prepare(uint32_t slot, uint32_t input_width, uint32_t input_height,

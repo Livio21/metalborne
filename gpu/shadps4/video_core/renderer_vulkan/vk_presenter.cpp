@@ -189,7 +189,11 @@ Presenter::Presenter(Frontend::WindowSDL& window_, AmdGpu::Liverpool* liverpool_
         static_cast<float>(EmulatorSettings.GetRcasAttenuation() / 1000.f);
 
     fsr_pass.Create(device, instance.GetAllocator(), num_images);
-    pp_pass.Create(device, swapchain.GetSurfaceFormat().format);
+    frame_format = swapchain.GetSurfaceFormat().format;
+#ifdef __APPLE__
+    if (metalfx && metalfx->NativePresentation()) frame_format = static_cast<vk::Format>(metalfx->InputFormat());
+#endif
+    pp_pass.Create(device, frame_format);
     BbOverlay::Init(instance, swapchain.GetSurfaceFormat().format, num_images);
 
 }
@@ -203,15 +207,15 @@ Presenter::~Presenter() {
     Check(present_scheduler.CommandBuffer().reset());
     Check(flip_scheduler.CommandBuffer().reset());
 
-#ifdef __APPLE__
-    metalfx.reset(); // Vulkan schedulers finished; exported textures can now be released.
-#endif
     const vk::Device device = instance.GetDevice();
     for (auto& frame : present_frames) {
-        vmaDestroyImage(instance.GetAllocator(), frame.image, frame.allocation);
         device.destroyImageView(frame.image_view);
+        if (!frame.external_image) vmaDestroyImage(instance.GetAllocator(), frame.image, frame.allocation);
         device.destroyFence(frame.present_done);
     }
+#ifdef __APPLE__
+    metalfx.reset(); // Frame views and scheduled reads finished before releasing exported images.
+#endif
 }
 
 bool Presenter::IsVideoOutSurface(const AmdGpu::ColorBuffer& color_buffer) const {
@@ -223,11 +227,12 @@ void Presenter::RecreateFrame(Frame* frame, u32 width, u32 height) {
     if (frame->image_view) {
         device.destroyImageView(frame->image_view);
     }
-    if (frame->image) {
+    if (frame->image && !frame->external_image) {
         vmaDestroyImage(instance.GetAllocator(), frame->image, frame->allocation);
     }
+    frame->image = nullptr; frame->allocation = {}; frame->external_image = false;
 
-    const vk::Format format = swapchain.GetSurfaceFormat().format;
+    const vk::Format format = frame_format;
     const vk::ImageCreateInfo image_info = {
         .flags = vk::ImageCreateFlagBits::eMutableFormat,
         .imageType = vk::ImageType::e2D,
@@ -249,17 +254,24 @@ void Presenter::RecreateFrame(Frame* frame, u32 width, u32 height) {
         .pUserData = nullptr,
     };
 
-    VkImage unsafe_image{};
-    VkImageCreateInfo unsafe_image_info = static_cast<VkImageCreateInfo>(image_info);
-
-    VkResult result = vmaCreateImage(instance.GetAllocator(), &unsafe_image_info, &alloc_info,
-                                     &unsafe_image, &frame->allocation, nullptr);
-    if (result != VK_SUCCESS) [[unlikely]] {
-        LOG_CRITICAL(Render_Vulkan, "Failed allocating texture with error {}",
-                     vk::to_string(vk::Result{result}));
-        UNREACHABLE();
+#ifdef __APPLE__
+    if (metalfx && metalfx->NativePresentation()) {
+        frame->image = vk::Image{metalfx->CreateFrameImage(frame->id, width, height)};
+        frame->external_image = bool(frame->image);
     }
-    frame->image = vk::Image{unsafe_image};
+#endif
+    if (!frame->image) {
+        VkImage unsafe_image{};
+        VkImageCreateInfo unsafe_image_info = static_cast<VkImageCreateInfo>(image_info);
+        VkResult result = vmaCreateImage(instance.GetAllocator(), &unsafe_image_info, &alloc_info,
+                                         &unsafe_image, &frame->allocation, nullptr);
+        if (result != VK_SUCCESS) [[unlikely]] {
+            LOG_CRITICAL(Render_Vulkan, "Failed allocating texture with error {}",
+                         vk::to_string(vk::Result{result}));
+            UNREACHABLE();
+        }
+        frame->image = vk::Image{unsafe_image};
+    }
     SetObjectName(device, frame->image, "Frame image #{}", frame->id);
 
     const vk::ImageViewCreateInfo view_info = {
@@ -319,7 +331,7 @@ Frame* Presenter::PrepareLastFrame() {
                                 .srcAccessMask = vk::AccessFlagBits2::eColorAttachmentRead,
                                 .dstStageMask = vk::PipelineStageFlagBits2::eColorAttachmentOutput,
                                 .dstAccessMask = vk::AccessFlagBits2::eColorAttachmentWrite,
-                                .oldLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
+                                .oldLayout = vk::ImageLayout::eGeneral,
                                 .newLayout = vk::ImageLayout::eGeneral,
                                 .image = frame->image,
                                 .subresourceRange{frame_subresources}};
@@ -576,50 +588,53 @@ void Presenter::ApplyMetalFX(Frame* frame, vk::Image& source, u32& width, u32& h
     const auto family = instance.GetGraphicsQueueFamilyIndex();
     const vk::Image input{images->input}, output{images->output};
     const vk::ImageSubresourceRange range{vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
-    const std::array to_copy{
-        vk::ImageMemoryBarrier{
-            .srcAccessMask = vk::AccessFlagBits::eMemoryWrite,
-            .dstAccessMask = vk::AccessFlagBits::eTransferRead,
-            .oldLayout = vk::ImageLayout::eGeneral, .newLayout = vk::ImageLayout::eTransferSrcOptimal,
-            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-            .image = frame->image, .subresourceRange = range},
-        vk::ImageMemoryBarrier{
-            .srcAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite,
-            .dstAccessMask = vk::AccessFlagBits::eTransferWrite,
-            .oldLayout = images->initialized ? vk::ImageLayout::eGeneral : vk::ImageLayout::eUndefined,
-            .newLayout = vk::ImageLayout::eTransferDstOptimal,
-            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-            .image = input, .subresourceRange = range},
-    };
-    command.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands, vk::PipelineStageFlagBits::eTransfer,
-                            {}, {}, {}, to_copy);
-    command.blitImage(frame->image, vk::ImageLayout::eTransferSrcOptimal, input,
-                      vk::ImageLayout::eTransferDstOptimal,
-                      MakeImageBlitStretch(frame->width, frame->height, frame->width, frame->height),
-                      vk::Filter::eNearest);
-    const std::array release{
-        vk::ImageMemoryBarrier{
-            .srcAccessMask = vk::AccessFlagBits::eTransferRead,
-            .dstAccessMask = vk::AccessFlagBits::eColorAttachmentWrite,
-            .oldLayout = vk::ImageLayout::eTransferSrcOptimal, .newLayout = vk::ImageLayout::eGeneral,
-            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-            .image = frame->image, .subresourceRange = range},
-        vk::ImageMemoryBarrier{
-            .srcAccessMask = vk::AccessFlagBits::eTransferWrite,
-            .dstAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite,
-            .oldLayout = vk::ImageLayout::eTransferDstOptimal, .newLayout = vk::ImageLayout::eGeneral,
-            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-            .image = input, .subresourceRange = range},
-        vk::ImageMemoryBarrier{
-            .srcAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite,
-            .dstAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite,
-            .oldLayout = images->initialized ? vk::ImageLayout::eGeneral : vk::ImageLayout::eUndefined,
-            .newLayout = vk::ImageLayout::eGeneral,
-            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-            .image = output, .subresourceRange = range},
-    };
-    command.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands, vk::PipelineStageFlagBits::eAllCommands,
-                            {}, {}, {}, vk::ArrayProxy<const vk::ImageMemoryBarrier>{output ? 3u : 2u, release.data()});
+    const bool direct = frame->image == input;
+    if (!direct) {
+        const std::array to_copy{
+            vk::ImageMemoryBarrier{
+                .srcAccessMask = vk::AccessFlagBits::eMemoryWrite,
+                .dstAccessMask = vk::AccessFlagBits::eTransferRead,
+                .oldLayout = vk::ImageLayout::eGeneral, .newLayout = vk::ImageLayout::eTransferSrcOptimal,
+                .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                .image = frame->image, .subresourceRange = range},
+            vk::ImageMemoryBarrier{
+                .srcAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite,
+                .dstAccessMask = vk::AccessFlagBits::eTransferWrite,
+                .oldLayout = images->initialized ? vk::ImageLayout::eGeneral : vk::ImageLayout::eUndefined,
+                .newLayout = vk::ImageLayout::eTransferDstOptimal,
+                .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                .image = input, .subresourceRange = range},
+        };
+        command.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands, vk::PipelineStageFlagBits::eTransfer,
+                                {}, {}, {}, to_copy);
+        command.blitImage(frame->image, vk::ImageLayout::eTransferSrcOptimal, input,
+                          vk::ImageLayout::eTransferDstOptimal,
+                          MakeImageBlitStretch(frame->width, frame->height, frame->width, frame->height),
+                          vk::Filter::eNearest);
+        const std::array release{
+            vk::ImageMemoryBarrier{
+                .srcAccessMask = vk::AccessFlagBits::eTransferRead,
+                .dstAccessMask = vk::AccessFlagBits::eColorAttachmentWrite,
+                .oldLayout = vk::ImageLayout::eTransferSrcOptimal, .newLayout = vk::ImageLayout::eGeneral,
+                .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                .image = frame->image, .subresourceRange = range},
+            vk::ImageMemoryBarrier{
+                .srcAccessMask = vk::AccessFlagBits::eTransferWrite,
+                .dstAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite,
+                .oldLayout = vk::ImageLayout::eTransferDstOptimal, .newLayout = vk::ImageLayout::eGeneral,
+                .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                .image = input, .subresourceRange = range},
+            vk::ImageMemoryBarrier{
+                .srcAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite,
+                .dstAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite,
+                .oldLayout = images->initialized ? vk::ImageLayout::eGeneral : vk::ImageLayout::eUndefined,
+                .newLayout = vk::ImageLayout::eGeneral,
+                .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                .image = output, .subresourceRange = range},
+        };
+        command.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands, vk::PipelineStageFlagBits::eAllCommands,
+                                {}, {}, {}, vk::ArrayProxy<const vk::ImageMemoryBarrier>{output ? 3u : 2u, release.data()});
+    }
     // Keep layout transitions within Vulkan; external handoffs use GENERAL on
     // both sides, so release/acquire barriers describe the same layout pair.
     const std::array external_release{
@@ -642,7 +657,7 @@ void Presenter::ApplyMetalFX(Frame* frame, vk::Image& source, u32& width, u32& h
     SubmitInfo ready{};
     ready.AddWait(frame->ready_semaphore, frame->ready_tick);
     scheduler.Flush(ready);
-    // KosmicKrisp exposes textures but not a public MTLSharedEvent bridge. Keep both
+    // ponytail: KosmicKrisp has no public MTLSharedEvent bridge. Keep both
     // APIs' ownership and completion explicit until GPU-side synchronization is available.
     scheduler.Wait(tick);
     const auto copied = std::chrono::steady_clock::now();
@@ -650,7 +665,9 @@ void Presenter::ApplyMetalFX(Frame* frame, vk::Image& source, u32& width, u32& h
     const auto scaled = std::chrono::steady_clock::now();
     const std::array acquire{
         vk::ImageMemoryBarrier{
-            .srcAccessMask = {}, .dstAccessMask = vk::AccessFlagBits::eTransferWrite,
+            .srcAccessMask = {}, .dstAccessMask = direct
+                ? vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite
+                : vk::AccessFlagBits::eTransferWrite,
             .oldLayout = vk::ImageLayout::eGeneral, .newLayout = vk::ImageLayout::eGeneral,
             .srcQueueFamilyIndex = VK_QUEUE_FAMILY_EXTERNAL, .dstQueueFamilyIndex = family,
             .image = input, .subresourceRange = range},
@@ -678,9 +695,10 @@ void Presenter::ApplyMetalFX(Frame* frame, vk::Image& source, u32& width, u32& h
         scale_ms += std::chrono::duration<double, std::milli>(scaled - copied).count();
         ++count;
         if (scaled - window >= std::chrono::seconds(5)) {
-            std::printf("%s bridge: %u frames; Vulkan copy/completion %.2f ms/frame; "
+            std::printf("%s bridge: %u frames; Vulkan %s/completion %.2f ms/frame; "
                         "Metal encode/completion %.2f ms/frame (CPU wall time)\n",
-                        native ? "Native Metal" : "MetalFX", count, copy_ms / count, scale_ms / count);
+                        native ? "Native Metal" : "MetalFX", count,
+                        direct ? "render (no input copy)" : "copy", copy_ms / count, scale_ms / count);
             count = 0; copy_ms = scale_ms = 0; window = scaled;
         }
     }

@@ -249,6 +249,7 @@ gameplay through a Metal render pass and drawable, including the settings
 overlay and optional MetalFX spatial scaling. It removes the hybrid path's
 shared-output copy and final Vulkan swapchain blit. The game shader/compute
 backend and host post-processing still use Vulkan; a full native graphics
-backend and a measured performance advantage remain unproven. The next focused
-step is to render the host frame directly into exportable storage, then execute
-a representative captured game workload through native Metal.
+backend and a measured performance advantage remain unproven. The host
+post-process now renders directly into the exported frame, removing the
+remaining input-copy blit and duplicate frame storage. The next focused step
+is executing a representative captured game workload through native Metal.
