@@ -199,7 +199,27 @@ union Regs {
 struct RegDirty {
     static constexpr u32 BlockWords = 32;
     static constexpr u32 NumBlocks = Regs::NumRegs / BlockWords;
+#ifdef __APPLE__
+    // libc++ lacks GNU bitset's sparse scans; keep word scans for the draw hot path.
+    struct BlockBits {
+        std::array<u64, (NumBlocks+63)/64> words{};
+        void set(size_t bit) { words[bit/64] |= u64{1} << (bit%64); }
+        bool test(size_t bit) const { return (words[bit/64] >> (bit%64)) & 1; }
+        void reset() { words.fill(0); }
+        constexpr size_t size() const { return NumBlocks; }
+        size_t _Find_first() const { return Find(0); }
+        size_t _Find_next(size_t bit) const { return Find(bit+1); }
+        size_t Find(size_t bit) const {
+            if (bit>=NumBlocks) return NumBlocks;
+            size_t word=bit/64;
+            u64 value=words[word] & (~u64{0} << (bit%64));
+            while (!value && ++word<words.size()) value=words[word];
+            return value ? word*64+__builtin_ctzll(value) : NumBlocks;
+        }
+    } blocks;
+#else
     std::bitset<NumBlocks> blocks;
+#endif
     bool reset = false; ///< ClearState: defaults, then only the blocks marked after it
 
     void Mark(u32 word, u32 count) {

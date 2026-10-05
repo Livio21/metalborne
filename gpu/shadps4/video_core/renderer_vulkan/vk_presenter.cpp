@@ -134,6 +134,34 @@ Presenter::Presenter(Frontend::WindowSDL& window_, AmdGpu::Liverpool* liverpool_
     const u32 num_images = swapchain.GetImageCount();
     const vk::Device device = instance.GetDevice();
 
+#ifdef __APPLE__
+    if (const char* mode = std::getenv("BB_METALFX"); mode && std::strcmp(mode, "off") != 0) {
+        if (std::strcmp(mode, "spatial") != 0) {
+            std::fprintf(stderr, "MetalFX: unsupported mode '%s'; use spatial or off.\n", mode);
+        } else if (!instance.HasExternalMemoryMetal()) {
+            std::fprintf(stderr, "MetalFX: driver lacks VK_EXT_external_memory_metal; using Vulkan.\n");
+        } else {
+            metalfx = std::make_unique<BbMetalFX::Spatial>(instance.GetInstance(),
+                instance.GetPhysicalDevice(), device, VULKAN_HPP_DEFAULT_DISPATCHER.vkGetInstanceProcAddr,
+                VULKAN_HPP_DEFAULT_DISPATCHER.vkGetDeviceProcAddr);
+            if (!metalfx->Available()) {
+                std::fprintf(stderr, "MetalFX: texture export entry points unavailable; using Vulkan.\n");
+                metalfx.reset();
+            } else {
+                const char* resolution = std::getenv("BB_METALFX_INPUT_RES");
+                if (!resolution) resolution = std::getenv("BB_RENDER_RES");
+                unsigned w = 0, h = 0; char extra = 0;
+                if (resolution && std::sscanf(resolution, "%ux%u%c", &w, &h, &extra) == 2 &&
+                    w >= 320 && h >= 180 && w <= 7680 && h <= 4320) {
+                    metalfx_input_width = w; metalfx_input_height = h;
+                }
+                expected_frame_width = metalfx_input_width;
+                expected_frame_height = metalfx_input_height;
+                std::fprintf(stderr, "MetalFX spatial requested; activates when the window exceeds the input size.\n");
+            }
+        }
+    }
+#endif
     // Create presentation frames.
     present_frames.resize(num_images);
     for (u32 i = 0; i < num_images; i++) {
@@ -165,6 +193,9 @@ Presenter::~Presenter() {
     Check(present_scheduler.CommandBuffer().reset());
     Check(flip_scheduler.CommandBuffer().reset());
 
+#ifdef __APPLE__
+    metalfx.reset(); // Vulkan schedulers finished; exported textures can now be released.
+#endif
     const vk::Device device = instance.GetDevice();
     for (auto& frame : present_frames) {
         vmaDestroyImage(instance.GetAllocator(), frame.image, frame.allocation);
@@ -420,6 +451,9 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
         const char* env = std::getenv("BB_FRAMES_AHEAD");
         return env ? u32(std::max(0, std::atoi(env))) : 1u;
     }();
+    static const bool timing = EmulatorSettingsImpl::Flag("BB_PRESENT_STATS",
+        EmulatorSettingsImpl::Flag("BB_FRAME_STATS", false));
+    const auto wait_start = timing ? BbPresentStats::Clock::now() : BbPresentStats::Clock::time_point{};
     if (frames_ahead) {
         recent_frame_ticks.push_back(frame->ready_tick);
         while (recent_frame_ticks.size() > frames_ahead) {
@@ -430,6 +464,7 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
             }
         }
     }
+    if (timing) backpressure_stats.Observe({BbPresentStats::Milliseconds(BbPresentStats::Clock::now() - wait_start)});
     return frame;
 }
 
@@ -506,7 +541,141 @@ Frame* Presenter::PrepareBlankFrame(bool present_thread) {
     return frame;
 }
 
+#ifdef __APPLE__
+void Presenter::ApplyMetalFX(Frame* frame, vk::Image& source, u32& width, u32& height) {
+    const auto fit = FitImage(frame->width, frame->height, swapchain.GetWidth(), swapchain.GetHeight());
+    if (fit.extent.width < frame->width || fit.extent.height < frame->height ||
+        (fit.extent.width == frame->width && fit.extent.height == frame->height)) return;
+    if (const auto* previous = metalfx->Find(frame->id); previous && previous->input &&
+        (previous->input_width != frame->width || previous->input_height != frame->height ||
+         previous->output_width != fit.extent.width || previous->output_height != fit.extent.height)) {
+        // Idle redraws may still reference a cached output. Finish those reads before
+        // destroying a slot's images during resize.
+        present_scheduler.Finish();
+    }
+    auto* images = metalfx->Prepare(frame->id, frame->width, frame->height,
+                                    fit.extent.width, fit.extent.height);
+    if (!images) return;
+    const auto begin = std::chrono::steady_clock::now();
+    auto& scheduler = present_scheduler;
+    const auto command = scheduler.CommandBuffer();
+    const auto family = instance.GetGraphicsQueueFamilyIndex();
+    const vk::Image input{images->input}, output{images->output};
+    const vk::ImageSubresourceRange range{vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
+    const std::array to_copy{
+        vk::ImageMemoryBarrier{
+            .srcAccessMask = vk::AccessFlagBits::eMemoryWrite,
+            .dstAccessMask = vk::AccessFlagBits::eTransferRead,
+            .oldLayout = vk::ImageLayout::eGeneral, .newLayout = vk::ImageLayout::eTransferSrcOptimal,
+            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .image = frame->image, .subresourceRange = range},
+        vk::ImageMemoryBarrier{
+            .srcAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite,
+            .dstAccessMask = vk::AccessFlagBits::eTransferWrite,
+            .oldLayout = images->initialized ? vk::ImageLayout::eGeneral : vk::ImageLayout::eUndefined,
+            .newLayout = vk::ImageLayout::eTransferDstOptimal,
+            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .image = input, .subresourceRange = range},
+    };
+    command.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands, vk::PipelineStageFlagBits::eTransfer,
+                            {}, {}, {}, to_copy);
+    command.blitImage(frame->image, vk::ImageLayout::eTransferSrcOptimal, input,
+                      vk::ImageLayout::eTransferDstOptimal,
+                      MakeImageBlitStretch(frame->width, frame->height, frame->width, frame->height),
+                      vk::Filter::eNearest);
+    const std::array release{
+        vk::ImageMemoryBarrier{
+            .srcAccessMask = vk::AccessFlagBits::eTransferRead,
+            .dstAccessMask = vk::AccessFlagBits::eColorAttachmentWrite,
+            .oldLayout = vk::ImageLayout::eTransferSrcOptimal, .newLayout = vk::ImageLayout::eGeneral,
+            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .image = frame->image, .subresourceRange = range},
+        vk::ImageMemoryBarrier{
+            .srcAccessMask = vk::AccessFlagBits::eTransferWrite,
+            .dstAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite,
+            .oldLayout = vk::ImageLayout::eTransferDstOptimal, .newLayout = vk::ImageLayout::eGeneral,
+            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .image = input, .subresourceRange = range},
+        vk::ImageMemoryBarrier{
+            .srcAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite,
+            .dstAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite,
+            .oldLayout = images->initialized ? vk::ImageLayout::eGeneral : vk::ImageLayout::eUndefined,
+            .newLayout = vk::ImageLayout::eGeneral,
+            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .image = output, .subresourceRange = range},
+    };
+    command.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands, vk::PipelineStageFlagBits::eAllCommands,
+                            {}, {}, {}, release);
+    // Keep layout transitions within Vulkan; external handoffs use GENERAL on
+    // both sides, so release/acquire barriers describe the same layout pair.
+    const std::array external_release{
+        vk::ImageMemoryBarrier{
+            .srcAccessMask = vk::AccessFlagBits::eMemoryWrite, .dstAccessMask = {},
+            .oldLayout = vk::ImageLayout::eGeneral, .newLayout = vk::ImageLayout::eGeneral,
+            .srcQueueFamilyIndex = family, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_EXTERNAL,
+            .image = input, .subresourceRange = range},
+        vk::ImageMemoryBarrier{
+            .srcAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite,
+            .dstAccessMask = {},
+            .oldLayout = vk::ImageLayout::eGeneral, .newLayout = vk::ImageLayout::eGeneral,
+            .srcQueueFamilyIndex = family, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_EXTERNAL,
+            .image = output, .subresourceRange = range},
+    };
+    command.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+        vk::PipelineStageFlagBits::eAllCommands, {}, {}, {}, external_release);
+    const auto tick = scheduler.CurrentTick();
+    SubmitInfo ready{};
+    ready.AddWait(frame->ready_semaphore, frame->ready_tick);
+    scheduler.Flush(ready);
+    // KosmicKrisp exposes textures but not a public MTLSharedEvent bridge. Keep both
+    // APIs' ownership and completion explicit until GPU-side synchronization is available.
+    scheduler.Wait(tick);
+    const auto copied = std::chrono::steady_clock::now();
+    const bool success = metalfx->Encode(frame->id);
+    const auto scaled = std::chrono::steady_clock::now();
+    const std::array acquire{
+        vk::ImageMemoryBarrier{
+            .srcAccessMask = {}, .dstAccessMask = vk::AccessFlagBits::eTransferWrite,
+            .oldLayout = vk::ImageLayout::eGeneral, .newLayout = vk::ImageLayout::eGeneral,
+            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_EXTERNAL, .dstQueueFamilyIndex = family,
+            .image = input, .subresourceRange = range},
+        vk::ImageMemoryBarrier{
+            .srcAccessMask = {}, .dstAccessMask = vk::AccessFlagBits::eTransferRead,
+            .oldLayout = vk::ImageLayout::eGeneral, .newLayout = vk::ImageLayout::eGeneral,
+            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_EXTERNAL, .dstQueueFamilyIndex = family,
+            .image = output, .subresourceRange = range},
+    };
+    scheduler.CommandBuffer().pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+        vk::PipelineStageFlagBits::eAllCommands, {}, {}, {}, acquire);
+    images->initialized = true;
+    if (success) {
+        source = output; width = images->output_width; height = images->output_height;
+        last_metalfx_frame = frame; last_metalfx_image = output;
+        last_metalfx_width = width; last_metalfx_height = height;
+    }
+    static const bool stats = EmulatorSettingsImpl::Flag("BB_PRESENT_STATS",
+        EmulatorSettingsImpl::Flag("BB_FRAME_STATS", false));
+    if (stats) {
+        static auto window = begin;
+        static double copy_ms = 0, scale_ms = 0; static u32 count = 0;
+        copy_ms += std::chrono::duration<double, std::milli>(copied - begin).count();
+        scale_ms += std::chrono::duration<double, std::milli>(scaled - copied).count();
+        ++count;
+        if (scaled - window >= std::chrono::seconds(5)) {
+            std::printf("MetalFX bridge: %u frames; Vulkan copy/completion %.2f ms/frame; "
+                        "Metal encode/completion %.2f ms/frame (CPU wall time)\n",
+                        count, copy_ms / count, scale_ms / count);
+            count = 0; copy_ms = scale_ms = 0; window = scaled;
+        }
+    }
+}
+#endif
+
 void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame) {
+    static const bool timing = EmulatorSettingsImpl::Flag("BB_PRESENT_STATS",
+        EmulatorSettingsImpl::Flag("BB_FRAME_STATS", false));
+    const auto clock = [&] { return timing ? BbPresentStats::Clock::now() : BbPresentStats::Clock::time_point{}; };
+    const auto started = clock();
     // Free the frame for reuse
     const auto free_frame = [&] {
         if (!is_reusing_frame) {
@@ -532,6 +701,22 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
         }
     }
 
+    const auto acquired = clock();
+    vk::Image source_image = frame->image;
+    u32 source_width = frame->width, source_height = frame->height;
+#ifdef __APPLE__
+    if (is_reusing_frame && last_metalfx_frame == frame && last_metalfx_image && !frame->is_hdr) {
+        source_image = last_metalfx_image;
+        source_width = last_metalfx_width; source_height = last_metalfx_height;
+    } else if (!is_reusing_frame) {
+        last_metalfx_image = nullptr;
+        last_metalfx_frame = nullptr;
+        if (metalfx && metalfx->Available() && !frame->is_hdr && is_game_frame) {
+            ApplyMetalFX(frame, source_image, source_width, source_height);
+        }
+    }
+#endif
+    const auto upscaled = clock();
     // Reset fence for queue submission. Do it here instead of GetRenderFrame() because we may
     // skip frame because of slow swapchain recreation. If a frame skip occurs, we skip signal
     // the frame's present fence and future GetRenderFrame() call will hang waiting for this frame.
@@ -572,13 +757,13 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
                 .subresourceRange = color_range,
             },
             vk::ImageMemoryBarrier{
-                .srcAccessMask = vk::AccessFlagBits::eColorAttachmentWrite,
+                .srcAccessMask = vk::AccessFlagBits::eMemoryWrite,
                 .dstAccessMask = vk::AccessFlagBits::eTransferRead,
                 .oldLayout = vk::ImageLayout::eGeneral,
                 .newLayout = vk::ImageLayout::eTransferSrcOptimal,
                 .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
                 .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-                .image = frame->image,
+                .image = source_image,
                 .subresourceRange = color_range,
             },
         };
@@ -593,9 +778,9 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
         };
         cmdbuf.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eTransfer,
                                vk::DependencyFlagBits::eByRegion, clear_done, {}, {});
-        cmdbuf.blitImage(frame->image, vk::ImageLayout::eTransferSrcOptimal, swapchain_image,
+        cmdbuf.blitImage(source_image, vk::ImageLayout::eTransferSrcOptimal, swapchain_image,
                          vk::ImageLayout::eTransferDstOptimal,
-                         MakeImageBlitFit(frame->width, frame->height, extent.width, extent.height),
+                         MakeImageBlitFit(source_width, source_height, extent.width, extent.height),
                          vk::Filter::eLinear);
         // bbport: the settings menu / FPS counter over the frame, at display resolution.
         const bool overlay = BbOverlay::Visible();
@@ -620,7 +805,7 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
                 .newLayout = vk::ImageLayout::eGeneral,
                 .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
                 .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-                .image = frame->image,
+                .image = source_image,
                 .subresourceRange = color_range,
             },
         };
@@ -657,6 +842,7 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
     info.AddSignal(frame->present_done);
     scheduler.Flush(info);
 
+    const auto submitted = clock();
     // Present to swapchain.
     {
         std::scoped_lock submit_lock{Scheduler::submit_mutex};
@@ -665,6 +851,12 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
         }
     }
 
+    if (timing && !is_reusing_frame && is_game_frame) {
+        api_stats.Observe({BbPresentStats::Milliseconds(acquired - started),
+            BbPresentStats::Milliseconds(upscaled - acquired),
+            BbPresentStats::Milliseconds(submitted - upscaled),
+            BbPresentStats::Milliseconds(clock() - submitted)});
+    }
     free_frame();
     if (!is_reusing_frame && is_game_frame) {
         DebugState.IncFlipFrameNum();
@@ -711,6 +903,13 @@ Frame* Presenter::GetRenderFrame() {
 }
 
 void Presenter::SetExpectedGameSize(s32 width, s32 height) {
+#ifdef __APPLE__
+    if (metalfx && metalfx->Available()) {
+        expected_frame_width = metalfx_input_width;
+        expected_frame_height = metalfx_input_height;
+        return;
+    }
+#endif
     const float ratio = (float)width / (float)height;
 
     expected_frame_height = height;

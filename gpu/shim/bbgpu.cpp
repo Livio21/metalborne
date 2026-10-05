@@ -215,6 +215,9 @@ extern "C" int bbgpu_init(const BbGpuConfig* config) {
     Core::Emulator::FillElfInfo(*config);
     const std::string title = config->title ? config->title : "Bloodborne";
     const s32 width = config->width, height = config->height;
+#ifdef __APPLE__
+    g_window = new Frontend::WindowSDL(width, height, title.c_str());
+#else
     g_window_thread = std::thread([title, width, height] {
         Common::SetCurrentThreadName("bb:window");
         auto* window = new Frontend::WindowSDL(width, height, title.c_str());
@@ -236,11 +239,20 @@ extern "C" int bbgpu_init(const BbGpuConfig* config) {
         std::unique_lock lock{g_window_mutex};
         g_window_cv.wait(lock, [] { return g_window_ready; });
     }
+#endif
     Core::Loader::SymbolsResolver resolver;
     // GnmDriver creates the presenter that the VideoOut present thread uses.
     Libraries::GnmDriver::RegisterLib(&resolver);
     Libraries::VideoOut::RegisterLib(&resolver);
     return 0;
+}
+
+extern "C" int bbgpu_poll_events(void) {
+    return g_window && g_window->PollEvents();
+}
+
+extern "C" int bbgpu_read_host_input(BbHostInput* out) {
+    return out && g_window && g_window->ReadHostInput(*out);
 }
 
 namespace Libraries::Kernel { void StartKernelService(); }

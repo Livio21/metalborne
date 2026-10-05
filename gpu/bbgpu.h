@@ -18,6 +18,17 @@ typedef struct {
 void bbgpu_register_kernel(void);
 /* Creates window, Vulkan device, presenter and GPU command processor. */
 int bbgpu_init(const BbGpuConfig *config);
+/* macOS keeps Cocoa window events on the process main thread. */
+int bbgpu_poll_events(void);
+/* SDL input is collected on the window thread and sampled by guest pad calls. */
+typedef struct {
+    uint8_t keys[512];
+    uint32_t mouse_buttons;
+    float mouse_x, mouse_y;
+    int32_t wheel;
+    int focused, mouse_captured;
+} BbHostInput;
+int bbgpu_read_host_input(BbHostInput *out);
 /* Function for an imported NID ("NID#lib#mod"), or 0 when the GPU library does not provide it. */
 uintptr_t bbgpu_resolve(const char *scoped_nid);
 /* Called first by the loader's SIGSEGV handler: 1 when a GPU page-tracking fault was handled. */

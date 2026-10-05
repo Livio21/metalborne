@@ -3,6 +3,7 @@
 The original boot.bin remains usable. Symbols are matched by library/module
 identity, versions and NID, not by dump-local suffix or NID alone.
 """
+from guest_tls import guest_tls_segment
 import collections
 import hashlib
 import json
@@ -162,6 +163,7 @@ def link(game, out):
     # runtime points GS at each guest thread's TCB. Only executable eboot
     # segments are scanned, and only this exact 9-byte instruction.
     fs_load = bytes.fromhex('64488b042500000000')
+    tls_segment = guest_tls_segment()
     patched = 0
     for p in main['ph']:
         if p['type'] != 1 or not p['flags'] & 1:
@@ -169,8 +171,9 @@ def link(game, out):
         start, end = p['vaddr'], p['vaddr'] + p['filesz']
         at = image.find(fs_load, start, end)
         while at >= 0:
-            image[at] = 0x65
-            patched += 1
+            if tls_segment == 'gs':
+                image[at] = 0x65
+                patched += 1
             at = image.find(fs_load, at + len(fs_load), end)
     main_tls = next((p for p in main['ph'] if p['type']==7), None)
     main_tls_values = (main_tls['vaddr'], main_tls['filesz'], main_tls['memsz'], main_tls['align']) if main_tls else (0,0,0,0)
@@ -194,14 +197,14 @@ def link(game, out):
         for relocation in relocs: f.write(struct.pack('<QQqq',*relocation))
         f.write(image)
     report = dict(base=hex(base),size=libsize,sha256=libc['sha256'],init=hex(metadata[2]),
-                  bindings=len(bindings),tls_module_id=2,fs_loads_patched=patched,
+                  bindings=len(bindings),tls_module_id=2,fs_loads_patched=patched,tls_segment=tls_segment,
                   main_tls=dict(zip(('vaddr','filesz','memsz','align'),main_tls_values)),tls_relocations=tls_count,
                   tls_template_bytes=tls['filesz'],tls_memory_bytes=tls['memsz'],
                   imports=names,relocation_counts=dict(collections.Counter(r[1] for r in libc['relocs'])),
                   symbol_bindings=[dict(import_name=names[i],address=hex(a),kind=k) for i,a,k in bindings])
     (out/'libc-link.json').write_text(json.dumps(report,indent=2)+'\n')
     print(f'Linked native libc: base={base:#x}, {len(bindings)} fallback exports, TLS={tls["memsz"]} bytes; '
-          f'eboot TLS={main_tls_values[2]} bytes, fs->gs patched={patched}')
+          f'eboot TLS={main_tls_values[2]} bytes, guest TLS={tls_segment.upper()}, fs->gs patched={patched}')
 
 
 if __name__=='__main__':

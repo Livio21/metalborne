@@ -14,14 +14,22 @@
 #include <windows.h>
 #else
 #include <sys/mman.h>
+#ifndef __APPLE__
 #include <malloc.h>
+#endif
 #include <unistd.h>
 #include <signal.h>
-#include <ucontext.h>
+#include <sys/ucontext.h>
+#include <pthread.h>
 #include <fcntl.h>
 #include <dlfcn.h>
 #include <execinfo.h>
+#ifdef __APPLE__
+#include <mach/mach.h>
+#include <mach/mach_vm.h>
+#else
 #include <sys/syscall.h>
+#endif
 #include <sys/uio.h>
 #endif
 
@@ -46,7 +54,7 @@ static uint64_t read64(FILE *f) {
     for (int i = 7; i >= 0; --i) n = (n << 8) | b[i];
     return n;
 }
-static size_t round_page(size_t size) { return (size + page_size - 1) & ~(page_size - 1); }
+static size_t probe_round_page(size_t size) { return (size + page_size - 1) & ~(page_size - 1); }
 static void *allocate(size_t size) {
 #ifndef _WIN32
     void *low=runtime_low_map(size,PROT_READ|PROT_WRITE);
@@ -83,7 +91,7 @@ static ABI __attribute__((noreturn)) void unresolved(uint32_t id, uintptr_t argu
     uintptr_t caller=(uintptr_t)__builtin_return_address(0)-(uintptr_t)image;
     for (uint64_t m=0;m<module_count;++m)
         if (caller>=modules[m].base && caller-modules[m].base<modules[m].size)
-            printf("Caller in linked module %" PRIu64 " (%s): +0x%" PRIxPTR "\n",m,m==0 ? "libc.prx" : "system module",caller-modules[m].base);
+            printf("Caller in linked module %" PRIu64 " (%s): +0x%" PRIxPTR "\n",m,m==0 ? "libc.prx" : "system module",(uintptr_t)(caller-modules[m].base));
     runtime_report();
     puts(entered_game ? "Original guest entry instructions executed; game initialization is incomplete." :
                         "Native libc initialization is incomplete; game entry has not run.");
@@ -93,7 +101,12 @@ static ABI __attribute__((noreturn)) void unresolved(uint32_t id, uintptr_t argu
 #ifndef _WIN32
 /* enter_on_stack(entry, arg0, arg1, stack_top): call entry(arg0,arg1) on a new stack. */
 void enter_on_stack(void *entry, void *arg0, void *arg1, void *top);
-__asm__(".text\n.globl enter_on_stack\nenter_on_stack:\n"
+#ifdef __APPLE__
+#define BB_STACK_SYMBOL "_enter_on_stack"
+#else
+#define BB_STACK_SYMBOL "enter_on_stack"
+#endif
+__asm__(".text\n.globl " BB_STACK_SYMBOL "\n" BB_STACK_SYMBOL ":\n"
         " push %rbp\n mov %rsp,%rbp\n and $-16,%rcx\n mov %rcx,%rsp\n"
         " mov %rdi,%rax\n mov %rsi,%rdi\n mov %rdx,%rsi\n call *%rax\n"
         " mov %rbp,%rsp\n pop %rbp\n ret\n");
@@ -102,7 +115,11 @@ static ABI void guest_exit(void) { puts("Runtime: process finalizer callback rea
 #ifndef _WIN32
 static void fault(int sig, siginfo_t *info, void *context) {
     /* GPU page tracking (write-protected guest pages) is resolved first. */
-    if (gpu_enabled && sig == SIGSEGV && bbgpu_handle_fault(context, info->si_addr)) return;
+    if (gpu_enabled && (sig == SIGSEGV
+#ifdef __APPLE__
+                        || sig == SIGBUS
+#endif
+                       ) && bbgpu_handle_fault(context, info->si_addr)) return;
     /* A speculative guest memory read (runtime_memory.c) failed: resume its recovery point. */
     if ((sig == SIGSEGV || sig == SIGBUS) && runtime_fault_recover) {
         sigjmp_buf *recover = runtime_fault_recover;
@@ -115,7 +132,7 @@ static void fault(int sig, siginfo_t *info, void *context) {
     }
     /* The process is terminating: dladdr/snprintf are acceptable here. */
     ucontext_t *uc = context;
-    uintptr_t rip = (uintptr_t)uc->uc_mcontext.gregs[REG_RIP];
+    uintptr_t rip = (uintptr_t)BB_CONTEXT_REG(uc, RIP);
     char line[512];
     Dl_info where;
     if (rip - (uintptr_t)image < 0x10000000)
@@ -151,18 +168,27 @@ static void write_hex(char *out, uint64_t v) {
 }
 static void dump_frames(ucontext_t *uc) {
     char line[] = "  tid=0000000000000000 rip=0000000000000000 image-relative=0000000000000000 host-relative=0000000000000000\n";
-    uintptr_t rip=(uintptr_t)uc->uc_mcontext.gregs[REG_RIP], rbp=(uintptr_t)uc->uc_mcontext.gregs[REG_RBP];
+    uintptr_t rip=(uintptr_t)BB_CONTEXT_REG(uc, RIP), rbp=(uintptr_t)BB_CONTEXT_REG(uc, RBP);
+#ifdef __APPLE__
+    uint64_t tid=0; pthread_threadid_np(NULL,&tid);
+#else
     uint64_t tid=(uint64_t)gettid();
+#endif
     /* First argument register: the lock address when a thread waits on a futex. */
     char arg[]="  tid=0000000000000000 rdi=0000000000000000\n";
-    write_hex(arg+6,tid); write_hex(arg+27,(uint64_t)uc->uc_mcontext.gregs[REG_RDI]);
+    write_hex(arg+6,tid); write_hex(arg+27,(uint64_t)BB_CONTEXT_REG(uc, RDI));
     { ssize_t written_=write(2,arg,sizeof(arg)-1); (void)written_; }
     for (int depth=0; depth<24; ++depth) {
         write_hex(line+6,tid); write_hex(line+27,rip); write_hex(line+59,rip-(uintptr_t)image); write_hex(line+90,rip-exe_base);
         { ssize_t written_=write(2,line,sizeof(line)-1); (void)written_; }
         uintptr_t frame[2];
+#ifdef __APPLE__
+        mach_vm_size_t read=0;
+        if (!rbp || mach_vm_read_overwrite(mach_task_self(),rbp,sizeof(frame),(mach_vm_address_t)frame,&read)!=KERN_SUCCESS || read!=sizeof(frame)) break;
+#else
         struct iovec local={frame,sizeof(frame)}, remote={(void *)rbp,sizeof(frame)};
         if (!rbp || process_vm_readv(getpid(),&local,1,&remote,1,0)!=(ssize_t)sizeof(frame)) break;
+#endif
         if (frame[0]<=rbp) break;
         rbp=frame[0]; rip=frame[1];
     }
@@ -173,6 +199,17 @@ static void watchdog(int sig, siginfo_t *info, void *context) {
     const char head[]="STOP: watchdog timeout; thread stacks:\n";
     { ssize_t written_=write(2,head,sizeof(head)-1); (void)written_; }
     dump_frames(context);
+#ifdef __APPLE__
+    thread_act_array_t threads; mach_msg_type_number_t count=0;
+    if (task_threads(mach_task_self(),&threads,&count)==KERN_SUCCESS) {
+        for (mach_msg_type_number_t i=0;i<count;++i) {
+            pthread_t thread=pthread_from_mach_thread_np(threads[i]);
+            if (thread && !pthread_equal(thread,pthread_self())) { pthread_kill(thread,SIGUSR2); usleep(20000); }
+            mach_port_deallocate(mach_task_self(),threads[i]);
+        }
+        mach_vm_deallocate(mach_task_self(),(mach_vm_address_t)threads,count*sizeof(*threads));
+    }
+#else
     int dir=open("/proc/self/task",O_RDONLY|O_DIRECTORY);
     char buffer[4096];
     long n;
@@ -184,6 +221,7 @@ static void watchdog(int sig, siginfo_t *info, void *context) {
             if (tid>0 && tid!=self) { syscall(SYS_tgkill,getpid(),tid,SIGUSR2); usleep(20000); }
             at+=d->reclen;
         }
+#endif
     usleep(100000);
     _exit(128 + sig);
 }
@@ -259,11 +297,57 @@ void runtime_restart(void) {
     fflush(NULL);
     puts("Runtime: restarting through run.sh");
 #ifndef _WIN32
+#ifdef __APPLE__
+    for (int fd=3,limit=getdtablesize();fd<limit;++fd) close(fd);
+#else
     syscall(SYS_close_range, 3u, ~0u, 0u);
+#endif
     execlp("bash", "bash", "run.sh", (char *)NULL);
     perror("runtime_restart: exec");
     _exit(1);
 #endif
+}
+
+typedef struct { int native_libc; uint64_t main_tls[4], procparam, entry, bindings, ns; Segment *segments; } GuestStart;
+static void *run_guest(void *raw) {
+    GuestStart *start=raw;
+    uint64_t ns=start->ns; Segment *segments=start->segments;
+    if (start->native_libc) {
+        for (uint64_t m=0;m<module_count;++m) {
+            int init_executable=0;
+            for (uint64_t i=0;i<ns;++i)
+                if ((segments[i].flags&1) && modules[m].init>=segments[i].address && modules[m].init-segments[i].address<segments[i].size) init_executable=1;
+            if (!init_executable) fail("module init is not executable");
+            if (modules[m].tls_module)
+                runtime_set_module_tls(modules[m].tls_module,image+modules[m].tls_address,modules[m].tls_filesz,modules[m].tls_memsz);
+        }
+        runtime_set_main_tls(image+start->main_tls[0],start->main_tls[1],start->main_tls[2],start->main_tls[3]);
+        runtime_thread_attach_main();
+        runtime_set_procparam(image+start->procparam);
+        /* Dependencies start in link order (libc first), as the PS4 dynamic linker does. */
+        for (uint64_t m=0;m<module_count;++m) {
+            printf("Starting linked module %" PRIu64 " at image offset 0x%" PRIx64 "; native bindings=%" PRIu64 "\n",m,modules[m].init,start->bindings);
+            typedef int (ABI *ModuleInit)(uint64_t,void *,void *);
+            int result=((ModuleInit)(image+modules[m].init))(0,NULL,NULL);
+            printf("Module %" PRIu64 " initializer returned %d\n",m,result);
+            if (result) fail("module initializer failed");
+        }
+    }
+    printf("Entering original x86-64 code at guest offset 0x%" PRIx64 "\n", start->entry);
+    entered_game=1;
+    struct { uint64_t argc; const char *argv[2]; } params = {1, {"/app0/eboot.bin", NULL}};
+#ifdef _WIN32
+    typedef void (ABI *Entry)(void *, void (ABI *)(void));
+    ((Entry)(image + start->entry))(&params, guest_exit);
+#else
+    /* The guest main thread runs on a stack below 1 TiB like PS4 stacks. */
+    enum { MAIN_STACK=8*1024*1024 };
+    unsigned char *stack=runtime_low_map(MAIN_STACK,PROT_READ|PROT_WRITE);
+    if (!stack) fail("cannot allocate guest main stack");
+    enter_on_stack(image+start->entry,&params,(void *)guest_exit,stack+MAIN_STACK-64);
+#endif
+    fail("entry unexpectedly returned");
+    return NULL;
 }
 
 int main(int argc, char **argv) {
@@ -271,8 +355,10 @@ int main(int argc, char **argv) {
 #ifndef _WIN32
     /* Keep host heap objects handed to the guest (thread handles, TLS) in the
        non-PIE brk heap, i.e. below 1 TiB: the guest packs pointers into 40 bits. */
+#ifndef __APPLE__
     mallopt(M_ARENA_MAX,1);
     mallopt(M_MMAP_THRESHOLD,32*1024*1024);
+#endif
 #endif
     if (argc == 2 && !strcmp(argv[1], "--vulkan-only")) return vulkan_smoke();
     int cpu_only = 0, strict_imports = 0;
@@ -426,7 +512,7 @@ int main(int argc, char **argv) {
             if (!executable) fail("native function is not executable");
         }
     }
-    image = allocate(round_page(size));
+    image = allocate(probe_round_page(size));
     if (fread(image, 1, size, f) != size || fgetc(f) != EOF) fail("incorrect memory image size");
     fclose(f);
     if (!cpu_only) {
@@ -443,7 +529,7 @@ int main(int argc, char **argv) {
         if (bbgpu_init(&gpu)) fail("GPU initialization failed");
         printf("GPU: window and Vulkan presenter ready; SDK 0x%08x, %u HLE symbols\n",(unsigned)sdk,bbgpu_symbol_count());
     }
-    unsigned char *traps = allocate(round_page((import_count + 1) * 32));
+    unsigned char *traps = allocate(probe_round_page((import_count + 1) * 32));
     unsigned char *data_traps = allocate((import_count + 1) * page_size);
     protect(data_traps, (import_count + 1) * page_size, 0);
     for (uint64_t i = 0; i < import_count; ++i) {
@@ -472,49 +558,27 @@ int main(int argc, char **argv) {
         memcpy(image + relocs[i].target, &value, 8);
     }
     if (patch_file) apply_patches(patch_file, segments, ns, relocs, nr);
-    protect(traps, round_page((import_count + 1) * 32), 5);
-    protect(image, round_page(size), 0);
+    protect(traps, probe_round_page((import_count + 1) * 32), 5);
+    protect(image, probe_round_page(size), 0);
     int executable_entry = 0;
     for (uint64_t i = 0; i < ns; ++i) {
-        protect(image + segments[i].address, round_page(segments[i].size), (unsigned)segments[i].flags);
+        protect(image + segments[i].address, probe_round_page(segments[i].size), (unsigned)segments[i].flags);
         if ((segments[i].flags & 1) && entry >= segments[i].address && entry - segments[i].address < segments[i].size)
             executable_entry = 1;
     }
     if (!executable_entry) fail("entry is not executable");
     printf("Mapped %" PRIu64 " bytes, %" PRIu64 " segments; applied %" PRIu64 " relocations\n", size, ns, nr);
-    if (native_libc) {
-        for (uint64_t m=0;m<module_count;++m) {
-            int init_executable=0;
-            for (uint64_t i=0;i<ns;++i)
-                if ((segments[i].flags&1) && modules[m].init>=segments[i].address && modules[m].init-segments[i].address<segments[i].size) init_executable=1;
-            if (!init_executable) fail("module init is not executable");
-            if (modules[m].tls_module)
-                runtime_set_module_tls(modules[m].tls_module,image+modules[m].tls_address,modules[m].tls_filesz,modules[m].tls_memsz);
-        }
-        runtime_set_main_tls(image+main_tls[0],main_tls[1],main_tls[2],main_tls[3]);
-        runtime_thread_attach_main();
-        runtime_set_procparam(image+procparam);
-        /* Dependencies start in link order (libc first), as the PS4 dynamic linker does. */
-        for (uint64_t m=0;m<module_count;++m) {
-            printf("Starting linked module %" PRIu64 " at image offset 0x%" PRIx64 "; native bindings=%" PRIu64 "\n",m,modules[m].init,nb);
-            typedef int (ABI *ModuleInit)(uint64_t,void *,void *);
-            int result=((ModuleInit)(image+modules[m].init))(0,NULL,NULL);
-            printf("Module %" PRIu64 " initializer returned %d\n",m,result);
-            if (result) fail("module initializer failed");
-        }
+    GuestStart start={.native_libc=native_libc,.procparam=procparam,.entry=entry,.bindings=nb,.ns=ns,.segments=segments};
+    memcpy(start.main_tls,main_tls,sizeof(main_tls));
+#ifdef __APPLE__
+    if (gpu_enabled) {
+        pthread_t guest;
+        if (pthread_create(&guest,NULL,run_guest,&start)) fail("cannot start guest main thread");
+        while (bbgpu_poll_events()) usleep(2000);
+        fflush(NULL);
+        _exit(0);
     }
-    printf("Entering original x86-64 code at guest offset 0x%" PRIx64 "\n", entry);
-    entered_game=1;
-    struct { uint64_t argc; const char *argv[2]; } params = {1, {"/app0/eboot.bin", NULL}};
-#ifdef _WIN32
-    typedef void (ABI *Entry)(void *, void (ABI *)(void));
-    ((Entry)(image + entry))(&params, guest_exit);
-#else
-    /* The guest main thread runs on a stack below 1 TiB like PS4 stacks. */
-    enum { MAIN_STACK=8*1024*1024 };
-    unsigned char *stack=runtime_low_map(MAIN_STACK,PROT_READ|PROT_WRITE);
-    if (!stack) fail("cannot allocate guest main stack");
-    enter_on_stack(image+entry,&params,(void *)guest_exit,stack+MAIN_STACK-64);
 #endif
-    fail("entry unexpectedly returned");
+    run_guest(&start);
+    return 1;
 }

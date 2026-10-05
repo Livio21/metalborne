@@ -3,12 +3,18 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #define CHECK(call) do { VkResult r = (call); if (r != VK_SUCCESS) { \
     fprintf(stderr, "Vulkan: %s returned %d\n", #call, r); exit(1); } } while (0)
 
 int vulkan_smoke(void) {
     VkApplicationInfo app = {.sType=VK_STRUCTURE_TYPE_APPLICATION_INFO, .pApplicationName="Bloodborne native probe", .apiVersion=VK_API_VERSION_1_0};
     VkInstanceCreateInfo ici = {.sType=VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO, .pApplicationInfo=&app};
+#ifdef __APPLE__
+    const char *extensions[]={VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME};
+    ici.enabledExtensionCount=1; ici.ppEnabledExtensionNames=extensions;
+    ici.flags=VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR;
+#endif
     VkInstance instance; CHECK(vkCreateInstance(&ici, NULL, &instance));
     uint32_t count = 0; CHECK(vkEnumeratePhysicalDevices(instance, &count, NULL));
     if (!count) { fprintf(stderr, "Vulkan: no physical devices\n"); vkDestroyInstance(instance, NULL); return 1; }
@@ -28,6 +34,16 @@ int vulkan_smoke(void) {
     float priority = 1;
     VkDeviceQueueCreateInfo qci = {.sType=VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, .queueFamilyIndex=family, .queueCount=1, .pQueuePriorities=&priority};
     VkDeviceCreateInfo dci = {.sType=VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, .queueCreateInfoCount=1, .pQueueCreateInfos=&qci};
+#ifdef __APPLE__
+    uint32_t extension_count=0;
+    CHECK(vkEnumerateDeviceExtensionProperties(physical,NULL,&extension_count,NULL));
+    VkExtensionProperties *device_extensions=calloc(extension_count,sizeof(*device_extensions));
+    if (!device_extensions) exit(1);
+    CHECK(vkEnumerateDeviceExtensionProperties(physical,NULL,&extension_count,device_extensions));
+    const char *portability="VK_KHR_portability_subset";
+    for (uint32_t i=0;i<extension_count;++i) if (!strcmp(device_extensions[i].extensionName,portability)) { dci.enabledExtensionCount=1; dci.ppEnabledExtensionNames=&portability; }
+    free(device_extensions);
+#endif
     VkDevice device; CHECK(vkCreateDevice(physical, &dci, NULL, &device));
     VkQueue queue; vkGetDeviceQueue(device, family, 0, &queue);
     VkBufferCreateInfo bci = {.sType=VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size=4096, .usage=VK_BUFFER_USAGE_TRANSFER_DST_BIT, .sharingMode=VK_SHARING_MODE_EXCLUSIVE};

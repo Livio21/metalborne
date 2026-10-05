@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
+if [[ $(uname -s) == Darwin ]]; then
+    exec bash "$(dirname -- "$0")/scripts/build_macos.sh" "$@"
+fi
 cd -- "$(dirname -- "$0")"
 mkdir -p out
 if [[ -z ${CC:-} ]]; then

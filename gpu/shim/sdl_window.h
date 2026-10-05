@@ -5,6 +5,7 @@
 #include <mutex>
 #include <string>
 #include "common/types.h"
+#include "../bbgpu.h"
 
 struct SDL_Window;
 
@@ -30,12 +31,20 @@ public:
     bool IsOpen() const { return is_open.load(std::memory_order_relaxed); }
     /// Processes pending window events. Returns false once the user closed the window.
     bool PollEvents();
+    bool ReadHostInput(BbHostInput& input);
     /// Keyboard text entry for the system IME dialog; typed text shows in the title bar.
     void BeginTextInput(const std::string& initial, const std::string& prompt);
     /// 0 while typing, 1 confirmed (Enter), 2 cancelled (Escape); text is UTF-8.
     int PollTextInput(std::string& text);
 
 private:
+    std::mutex input_mutex;
+    BbHostInput host_input{};
+    bool mouse_requested{true}, mouse_captured{};
+    bool keyboard_mouse{true}, force_keyboard_mouse{};
+#ifdef __APPLE__
+    void* metal_view = nullptr;
+#endif
     std::atomic<s32> width, height;
     std::atomic<bool> is_open{true};
     std::mutex text_mutex;

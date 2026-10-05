@@ -53,7 +53,11 @@ static size_t buffers_out, ports_opened;
 static uint64_t now_ns(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t); return (uint64_t)t.tv_sec*1000000000u+(uint64_t)t.tv_nsec; }
 static void sleep_until(uint64_t deadline) {
     struct timespec t={(time_t)(deadline/1000000000u),(long)(deadline%1000000000u)};
+#ifdef __APPLE__
+    if (bb_macos_sleep_until(&t)) { fputs("STOP: audio clock sleep failed\n",stderr); exit(21); }
+#else
     while (clock_nanosleep(CLOCK_MONOTONIC,TIMER_ABSTIME,&t,NULL)) {}
+#endif
 }
 static int sdl_audio(void) {
     if (sdl_ready<0) {

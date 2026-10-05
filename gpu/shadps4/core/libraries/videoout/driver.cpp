@@ -68,8 +68,22 @@ VideoOutDriver::VideoOutDriver(u32 width, u32 height) {
     present_thread = std::jthread([&](std::stop_token token) { PresentThread(token); });
 }
 
-void VideoOutDriver::RunPresenter(std::function<void()> work, bool if_idle) {
+void VideoOutDriver::RunPresenter(std::function<void()> work, bool if_idle, bool game_flip) {
+    static const bool timing = EmulatorSettingsImpl::Flag(
+        "BB_PRESENT_STATS", EmulatorSettingsImpl::Flag("BB_FRAME_STATS", false));
+    const auto wrap = [&](size_t depth) {
+        if (!timing || !game_flip) return;
+        const auto enqueued = BbPresentStats::Clock::now();
+        work = [this, work = std::move(work), enqueued, depth] {
+            const auto begin = BbPresentStats::Clock::now();
+            work();
+            const auto end = BbPresentStats::Clock::now();
+            present_stats.Observe(end, BbPresentStats::Milliseconds(begin - enqueued),
+                                  BbPresentStats::Milliseconds(end - begin), depth);
+        };
+    };
     if (!separate_swap) {
+        wrap(0);
         work();
         return;
     }
@@ -78,6 +92,7 @@ void VideoOutDriver::RunPresenter(std::function<void()> work, bool if_idle) {
         if (if_idle && (swap_busy || !swap_queue.empty())) {
             return; // a redraw of the last frame is pointless while frames are queued
         }
+        wrap(swap_queue.size() + 1);
         swap_queue.push_back(std::move(work));
     }
     swap_cv.notify_one();
@@ -292,7 +307,7 @@ void VideoOutDriver::Flip(const Request& req) {
     RunPresenter([this, frame = req.frame, hdr = req.port->is_hdr] {
         presenter->SetHDR(hdr);
         presenter->Present(frame);
-    });
+    }, false, true);
     Vulkan::FrameCapture::OnFlip(req.index >= 0 ? req.port->buffer_slots[req.index].address_left
                                                 : 0);
 
@@ -432,7 +447,7 @@ void VideoOutDriver::Flip(const Request& req) {
             const double draws_per_frame = frames ? double(all_draws - window_draws) / frames : 0.0;
             window_draws = all_draws;
             window_gpu_us = gpu_us;
-            std::printf("Frame stats: %.1f FPS, worst frame %.1f ms (vblank %u Hz); "
+            std::printf("Guest flip stats: %.1f FPS, worst interval %.1f ms (vblank %u Hz); "
                         "%u shader/pipeline compiles, %.1f ms; %llu recorder syncs; "
                         "%.0f write faults/s, %lld hot pages; GPU thread %.2f us/draw, "
                         "%.0f draws/frame, idle %.1f%%; blocked: recorder %.1f%%, host copies "

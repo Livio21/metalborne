@@ -166,7 +166,10 @@ std::vector<const char*> GetInstanceExtensions(Frontend::WindowSystemType window
 
     // Add the windowing system specific extension
     std::vector<const char*> extensions;
-    extensions.reserve(7);
+    extensions.reserve(8);
+#ifdef __APPLE__
+    extensions.push_back(VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME);
+#endif
 
     switch (window_type) {
     case Frontend::WindowSystemType::Headless:
@@ -267,10 +270,21 @@ vk::UniqueInstance CreateInstance(Frontend::WindowSystemType window_type, bool e
         _NSGetExecutablePath(path, &length);
         return std::filesystem::path(path).parent_path();
     }();
-    setenv("VK_DRIVER_FILES", icd_path.c_str(), true);
+    if (!std::getenv("VK_DRIVER_FILES") && !std::getenv("VK_ICD_FILENAMES")) {
+        for (const char* name : {"kosmickrisp_mesa_icd.json", "MoltenVK_icd.json"}) {
+            const auto candidate = icd_path / name;
+            if (std::filesystem::exists(candidate)) { setenv("VK_DRIVER_FILES", candidate.c_str(), false); break; }
+        }
+    }
 #endif
 
+#ifdef __APPLE__
+    static vk::detail::DynamicLoader dl(std::getenv("BB_VULKAN_LOADER")
+                                          ? std::getenv("BB_VULKAN_LOADER")
+                                          : BB_VULKAN_LOADER_DEFAULT);
+#else
     static vk::detail::DynamicLoader dl;
+#endif
     VULKAN_HPP_DEFAULT_DISPATCHER.init(
         dl.getProcAddress<PFN_vkGetInstanceProcAddr>("vkGetInstanceProcAddr"));
 
@@ -401,6 +415,10 @@ vk::UniqueInstance CreateInstance(Frontend::WindowSystemType window_type, bool e
 
     vk::StructureChain<vk::InstanceCreateInfo, vk::LayerSettingsCreateInfoEXT> instance_ci_chain = {
         vk::InstanceCreateInfo{
+#ifdef __APPLE__
+            .flags = std::ranges::any_of(extensions, [](const char* extension) { return std::strcmp(extension, VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME) == 0; })
+                         ? vk::InstanceCreateFlagBits::eEnumeratePortabilityKHR : vk::InstanceCreateFlags{},
+#endif
             .pApplicationInfo = &application_info,
             .enabledLayerCount = static_cast<u32>(layers.size()),
             .ppEnabledLayerNames = layers.data(),

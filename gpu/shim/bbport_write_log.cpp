@@ -6,8 +6,15 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#ifdef __APPLE__
+#include <sys/ucontext.h>
+#else
 #include <ucontext.h>
+#endif
 #include <unistd.h>
+#ifdef __APPLE__
+#include <pthread.h>
+#endif
 #include <x86intrin.h>
 
 namespace BbWriteLog {
@@ -56,7 +63,11 @@ void Note(std::uint64_t address, const void* data, std::uint64_t size, Source so
 }
 
 void Record(std::uint64_t address, const void* data, std::uint64_t size, Source source) {
+#ifdef __APPLE__
+    static thread_local const std::uint32_t tid = [] { std::uint64_t id; pthread_threadid_np(nullptr, &id); return static_cast<std::uint32_t>(id); }();
+#else
     static thread_local const std::uint32_t tid = static_cast<std::uint32_t>(gettid());
+#endif
     Entry e{address, size, 0, __rdtsc(), source, tid};
     std::memcpy(&e.first, data, size < 8 ? size : 8);
     Push(ring, head, e);
@@ -85,11 +96,16 @@ extern "C" void bbgpu_dump_guest_writes(void* ucontext) {
         return;
     }
     const auto* uc = static_cast<const ucontext_t*>(ucontext);
+#ifdef __APPLE__
+    const auto& g = uc->uc_mcontext->__ss;
+    const std::uint64_t regs[] = {g.__rax, g.__rbx, g.__rcx, g.__rdx, g.__rsi, g.__rdi, g.__r14, g.__r15};
+#else
     const auto* g = uc->uc_mcontext.gregs;
     const std::uint64_t regs[] = {std::uint64_t(g[REG_RAX]), std::uint64_t(g[REG_RBX]),
                                   std::uint64_t(g[REG_RCX]), std::uint64_t(g[REG_RDX]),
                                   std::uint64_t(g[REG_RSI]), std::uint64_t(g[REG_RDI]),
                                   std::uint64_t(g[REG_R14]), std::uint64_t(g[REG_R15])};
+#endif
     const char* names[] = {"rax", "rbx", "rcx", "rdx", "rsi", "rdi", "r14", "r15"};
     for (int i = 0; i < 8; ++i) {
         std::fprintf(stderr, "Write log: %s=%#llx\n", names[i], (unsigned long long)regs[i]);

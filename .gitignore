@@ -23,3 +23,6 @@ perf.data
 /bloodborne_upscalers_*.md
 mods.json
 patches.json
+
+# macOS filesystem metadata
+.DS_Store

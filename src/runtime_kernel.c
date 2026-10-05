@@ -12,7 +12,11 @@
 #include <sched.h>
 #include <time.h>
 #include <unistd.h>
+#ifdef __APPLE__
+#include <mach/mach.h>
+#else
 #include <sys/random.h>
+#endif
 #include <sys/resource.h>
 #include <sys/time.h>
 #include <x86intrin.h>
@@ -47,7 +51,11 @@ static int host_clock(uint32_t id,clockid_t *out) {
     switch (id) {
     case 0: case 9: case 10: *out=CLOCK_REALTIME; return 1;            /* REALTIME(_PRECISE/_FAST) */
     case 4: case 11: case 12: case 5: case 7: case 8: *out=CLOCK_MONOTONIC; return 1; /* MONOTONIC/UPTIME */
-    case 13: *out=CLOCK_REALTIME_COARSE; return 1;                    /* SECOND */
+    #ifdef __APPLE__
+    case 13: *out=CLOCK_REALTIME; return 1;
+#else
+    case 13: *out=CLOCK_REALTIME_COARSE; return 1;
+#endif                    /* SECOND */
     case 14: *out=CLOCK_THREAD_CPUTIME_ID; return 1;
     case 2: case 15: *out=CLOCK_PROCESS_CPUTIME_ID; return 1;         /* PROF/PROCTIME */
     case 16: case 17: case 18: case 19: *out=CLOCK_MONOTONIC; return 1; /* PS4 network clocks */
@@ -183,7 +191,21 @@ typedef struct { GuestTimeval utime, stime; int64_t rest[14]; } GuestRusage;
 static ABI int32_t guest_getrusage(int who,GuestRusage *out) {
     struct rusage r;
     if (!out || (who!=0 && who!=1)) return fail_posix(EINVAL);
-    getrusage(who==0 ? RUSAGE_SELF : RUSAGE_THREAD,&r);
+#ifdef __APPLE__
+    if (who==1) {
+        thread_basic_info_data_t info;
+        mach_msg_type_number_t count=THREAD_BASIC_INFO_COUNT;
+        thread_t thread=mach_thread_self();
+        kern_return_t result=thread_info(thread,THREAD_BASIC_INFO,(thread_info_t)&info,&count);
+        mach_port_deallocate(mach_task_self(),thread);
+        if (result!=KERN_SUCCESS) return fail_posix(EIO);
+        memset(&r,0,sizeof(r));
+        r.ru_utime=(struct timeval){info.user_time.seconds,info.user_time.microseconds};
+        r.ru_stime=(struct timeval){info.system_time.seconds,info.system_time.microseconds};
+    } else if (getrusage(RUSAGE_SELF,&r)) return fail_posix(errno);
+#else
+    if (getrusage(who==0 ? RUSAGE_SELF : RUSAGE_THREAD,&r)) return fail_posix(errno);
+#endif
     memset(out,0,sizeof(*out));
     out->utime=(GuestTimeval){r.ru_utime.tv_sec,r.ru_utime.tv_usec};
     out->stime=(GuestTimeval){r.ru_stime.tv_sec,r.ru_stime.tv_usec};
@@ -194,7 +216,11 @@ static ABI int32_t guest_sysctl(const int32_t *name,uint32_t namelen,void *old,u
     if (!name || namelen<2 || new_value) return fail_posix(EINVAL);
     if (name[0]==1 && name[1]==37) { /* kern.arandom */
         if (!old || !oldlen) return fail_posix(EINVAL);
+#ifdef __APPLE__
+        arc4random_buf(old,(size_t)*oldlen);
+#else
         if (getrandom(old,(size_t)*oldlen,0)<0) return fail_posix(errno);
+#endif
         return 0;
     }
     if (name[0]==6 && (name[1]==7 || name[1]==3)) { /* hw.pagesize / hw.ncpu */

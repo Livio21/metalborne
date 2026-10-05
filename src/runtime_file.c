@@ -146,9 +146,9 @@ static void convert_stat(const struct stat *s,GuestStat *g) {
     g->dev=(uint32_t)s->st_dev; g->ino=(uint32_t)s->st_ino;
     g->mode=(uint16_t)s->st_mode; g->nlink=(uint16_t)s->st_nlink;
     g->size=s->st_size; g->blocks=s->st_blocks; g->blksize=(uint32_t)s->st_blksize;
-    g->atime=(GuestTimespec){s->st_atim.tv_sec,s->st_atim.tv_nsec};
-    g->mtime=(GuestTimespec){s->st_mtim.tv_sec,s->st_mtim.tv_nsec};
-    g->ctime=(GuestTimespec){s->st_ctim.tv_sec,s->st_ctim.tv_nsec};
+    g->atime=(GuestTimespec){BB_STAT_ATIME(*s).tv_sec,BB_STAT_ATIME(*s).tv_nsec};
+    g->mtime=(GuestTimespec){BB_STAT_MTIME(*s).tv_sec,BB_STAT_MTIME(*s).tv_nsec};
+    g->ctime=(GuestTimespec){BB_STAT_CTIME(*s).tv_sec,BB_STAT_CTIME(*s).tv_nsec};
     g->birthtime=g->ctime;
 }
 static File *get(int fd) {

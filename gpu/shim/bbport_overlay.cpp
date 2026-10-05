@@ -16,6 +16,18 @@
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 
 // DejaVu Sans (Cyrillic), embedded (third_party/fonts, Bitstream Vera license).
+#ifdef __APPLE__
+asm(".section __TEXT,__const\n"
+    ".balign 16\n"
+    ".private_extern _bb_font_ttf\n"
+    ".global _bb_font_ttf\n"
+    "_bb_font_ttf:\n"
+    ".incbin \"" BB_FONT_PATH "\"\n"
+    ".private_extern _bb_font_ttf_end\n"
+    ".global _bb_font_ttf_end\n"
+    "_bb_font_ttf_end:\n"
+    ".text\n");
+#else
 asm(".section .rodata\n"
     ".balign 16\n"
     ".hidden bb_font_ttf\n"
@@ -26,6 +38,7 @@ asm(".section .rodata\n"
     ".global bb_font_ttf_end\n"
     "bb_font_ttf_end:\n"
     ".previous\n");
+#endif
 extern "C" const unsigned char bb_font_ttf[];
 extern "C" const unsigned char bb_font_ttf_end[];
 

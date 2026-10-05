@@ -10,6 +10,7 @@ libSceLibcInternal are served by libc.prx's same-NID exports: the internal
 library is not shipped with the game and exposes the same functions.
 Output: out/boot-linked.bin (format BBPROBE5) and out/link.json.
 """
+from guest_tls import guest_tls_segment
 import collections
 import hashlib
 import json
@@ -76,6 +77,8 @@ def module(path):
 
 def patch_fs_loads(image, ph, base):
     """Rewrite initial-exec `mov rax, fs:[0]` to GS: glibc owns FS on Linux."""
+    if guest_tls_segment() == 'fs':
+        return 0
     patched = 0
     for p in ph:
         if p['type'] != 1 or not p['flags'] & 1:

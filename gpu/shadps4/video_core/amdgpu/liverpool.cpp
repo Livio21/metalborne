@@ -4,6 +4,9 @@
 #include <chrono>
 #include <pthread.h>
 #include <sys/resource.h>
+#ifdef __APPLE__
+#include <mach/mach.h>
+#endif
 #include <time.h>
 #include "bbport_copy.h"
 #include "bbport_toggles.h"
@@ -102,13 +105,13 @@ void Liverpool::ProcessCommands() {
 
 void Liverpool::Process(std::stop_token stoken) {
     Common::SetCurrentThreadName("shadPS4:GpuCommandProcessor");
+#ifndef __APPLE__
     if (clockid_t clock; pthread_getcpuclockid(pthread_self(), &clock) == 0) {
         BbStats::gpu_thread_clock.store(static_cast<int>(clock));
     }
-    gpu_id = std::this_thread::get_id();
-#ifdef __linux__
-    gpu_tid = gettid();
 #endif
+    gpu_id = std::this_thread::get_id();
+    gpu_tid = BbThreads::Tid();
 
     while (!stoken.stop_requested()) {
         {
@@ -1326,6 +1329,17 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
     }
     if (seq != NoSeq && BbStats::enabled) {
         BbStats::submissions.fetch_add(1, std::memory_order_relaxed);
+#ifdef __APPLE__
+        thread_basic_info_data_t usage{};
+        mach_msg_type_number_t count=THREAD_BASIC_INFO_COUNT;
+        if (thread_info(pthread_mach_thread_np(pthread_self()), THREAD_BASIC_INFO,
+                        reinterpret_cast<thread_info_t>(&usage), &count)==KERN_SUCCESS) {
+            BbStats::gpu_user_us.store(u64(usage.user_time.seconds)*1000000+usage.user_time.microseconds,
+                                      std::memory_order_relaxed);
+            BbStats::gpu_sys_us.store(u64(usage.system_time.seconds)*1000000+usage.system_time.microseconds,
+                                     std::memory_order_relaxed);
+        }
+#else
         if (rusage usage{}; getrusage(RUSAGE_THREAD, &usage) == 0) {
             BbStats::gpu_user_us.store(u64(usage.ru_utime.tv_sec) * 1000000 + usage.ru_utime.tv_usec,
                                        std::memory_order_relaxed);
@@ -1335,6 +1349,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             BbStats::gpu_vol_switches.store(usage.ru_nvcsw, std::memory_order_relaxed);
             BbStats::gpu_minor_faults.store(usage.ru_minflt, std::memory_order_relaxed);
         }
+#endif
     }
 
     FIBER_EXIT;

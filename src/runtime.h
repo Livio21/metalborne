@@ -10,6 +10,14 @@ extern __thread sigjmp_buf *runtime_fault_recover;
 void runtime_restart(void);
 #endif
 #define ABI __attribute__((sysv_abi))
+#ifdef __APPLE__
+#include "platform_macos.h"
+#else
+#define BB_CONTEXT_REG(uc, name) ((uc)->uc_mcontext.gregs[REG_##name])
+#define BB_STAT_ATIME(st) ((st).st_atim)
+#define BB_STAT_MTIME(st) ((st).st_mtim)
+#define BB_STAT_CTIME(st) ((st).st_ctim)
+#endif
 typedef void (ABI *GuestCallback)(void);
 void runtime_start(uint64_t capabilities);
 uintptr_t runtime_resolve(const char *name, int is_data);

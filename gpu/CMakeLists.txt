@@ -1,7 +1,11 @@
 # bbport GPU library: shadPS4 video core + shader recompiler + Gnm/VideoOut
 # drivers, adapted to the native_probe runtime through shims in shim/.
 cmake_minimum_required(VERSION 3.24)
-project(bbgpu LANGUAGES C CXX)
+if(APPLE)
+    project(bbgpu LANGUAGES C CXX OBJCXX)
+else()
+    project(bbgpu LANGUAGES C CXX)
+endif()
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
@@ -40,6 +44,7 @@ elseif (BB_PGO STREQUAL "use")
                         -fprofile-correction -Wno-missing-profile -Wno-coverage-mismatch)
 endif()
 
+if(NOT APPLE)
 find_package(Vulkan REQUIRED)
 find_package(fmt REQUIRED)
 find_package(Boost REQUIRED)
@@ -53,6 +58,13 @@ pkg_check_modules(X11 REQUIRED IMPORTED_TARGET x11)
 find_package(miniz REQUIRED)
 find_package(Zydis REQUIRED)
 find_program(GLSLANG_COMPILER NAMES glslang glslangValidator REQUIRED)
+
+    set(BB_PLATFORM_LIBRARIES PkgConfig::XXHASH PkgConfig::SDL3 PkgConfig::X11 PkgConfig::FFMPEG)
+else()
+    if(NOT BB_PLATFORM_LIBRARIES)
+        message(FATAL_ERROR "Build macOS from scripts/build_macos.sh to configure x86-64 dependencies.")
+    endif()
+endif()
 
 set(SIRIT_USE_SYSTEM_SPIRV_HEADERS OFF CACHE BOOL "" FORCE)
 add_subdirectory(third_party/sirit EXCLUDE_FROM_ALL)
@@ -103,6 +115,9 @@ foreach(BPP IN ITEMS 8 16 32 64 96 128)
     add_host_shader(tiling.comp tiling_macro_${BPP}_comp BITS_PER_PIXEL=${BPP} IS_MACRO_TILED=1)
 endforeach()
 add_custom_target(host_shaders DEPENDS ${SHADER_HEADERS})
+if(TARGET glslang-standalone)
+    add_dependencies(host_shaders glslang-standalone)
+endif()
 
 file(GLOB_RECURSE VIDEO_CORE CONFIGURE_DEPENDS shadps4/video_core/*.cpp)
 file(GLOB_RECURSE RECOMPILER CONFIGURE_DEPENDS shadps4/shader_recompiler/*.cpp)
@@ -114,7 +129,9 @@ set(COMMON
     shadps4/common/string_util.cpp shadps4/common/thread.cpp shadps4/common/signal_context.cpp
     shim/common/logging/log.cpp)
 file(GLOB AVPLAYER CONFIGURE_DEPENDS shadps4/core/libraries/avplayer/*.cpp)
-pkg_check_modules(FFMPEG REQUIRED IMPORTED_TARGET libavformat libavcodec libavutil libswscale libswresample)
+if(NOT APPLE)
+    pkg_check_modules(FFMPEG REQUIRED IMPORTED_TARGET libavformat libavcodec libavutil libswscale libswresample)
+endif()
 file(GLOB SHIM_SOURCES CONFIGURE_DEPENDS shim/*.cpp shim/*/*.cpp)
 add_library(bbgpu SHARED ${VIDEO_CORE} ${RECOMPILER} ${COMMON} ${SHIM_SOURCES}
     shadps4/core/libraries/gnmdriver/gnmdriver.cpp
@@ -136,10 +153,21 @@ target_include_directories(bbgpu PRIVATE shim shadps4 ${SHADER_INCLUDE} third_pa
 target_compile_definitions(bbgpu PRIVATE BOOST_ASIO_STANDALONE NDEBUG)
 target_compile_options(bbgpu PRIVATE -Wno-deprecated-declarations -Wno-missing-field-initializers)
 # Runtime symbols (runtime_memory_*, runtime_process_*) resolve against bb-probe.
-target_link_options(bbgpu PRIVATE -Wl,--allow-shlib-undefined)
+if(APPLE)
+    target_sources(bbgpu PRIVATE shim/macos_metalfx.mm)
+    set_source_files_properties(shim/macos_metalfx.mm PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
+    target_link_libraries(bbgpu PRIVATE "-framework MetalFX")
+    target_link_options(bbgpu PRIVATE -Wl,-undefined,dynamic_lookup)
+    target_link_libraries(bbgpu PRIVATE "-framework Metal" "-framework QuartzCore" "-framework Cocoa")
+    target_link_libraries(bbgpu PRIVATE xbyak::xbyak)
+    set_property(SOURCE shadps4/video_core/renderer_vulkan/vk_platform.cpp APPEND
+        PROPERTY COMPILE_DEFINITIONS BB_VULKAN_LOADER_DEFAULT="${Vulkan_LIBRARY}")
+else()
+    target_link_options(bbgpu PRIVATE -Wl,--allow-shlib-undefined)
+endif()
 target_link_libraries(bbgpu PRIVATE ffx-vulkan::portable ffx-vulkan::fsr4-v07-vulkan)
 target_link_libraries(bbgpu PUBLIC Vulkan::Headers fmt::fmt Boost::headers magic_enum::magic_enum
-    tsl::robin_map GPUOpen::VulkanMemoryAllocator PkgConfig::XXHASH PkgConfig::SDL3 PkgConfig::X11 PkgConfig::FFMPEG miniz::miniz Zydis::Zydis sirit)
+    tsl::robin_map GPUOpen::VulkanMemoryAllocator ${BB_PLATFORM_LIBRARIES} miniz::miniz Zydis::Zydis sirit)
 
 # Explicit test targets; neither launches the game nor needs a Vulkan device.
 add_executable(motion-history-test EXCLUDE_FROM_ALL ../tests/test_motion_history.cpp)

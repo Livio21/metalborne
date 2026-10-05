@@ -32,7 +32,12 @@ static uint64_t pool_size_bytes(void) {
 #define POOL_SIZE pool_size_bytes()
 #define FLEXIBLE_SIZE (UINT64_C(448) * 1024 * 1024)
 #define PAGE UINT64_C(16384)
+#ifdef __APPLE__
+/* Rosetta reserves the lower part of PS4's normal user allocation range. */
+#define USER_MIN UINT64_C(0x7000000000)
+#else
 #define USER_MIN UINT64_C(0x1000000000)
+#endif
 #define USER_MAX UINT64_C(0xfc00000000)
 #define LIMIT 4096
 #define INVALID ((int32_t)UINT32_C(0x80020016))
@@ -93,10 +98,14 @@ static int host_prot(int prot) {
 /* Direct memory occupies [0,POOL_SIZE) of the memfd, flexible memory [POOL_SIZE,+FLEX_SPAN). */
 static int pool(void) {
     if (pool_fd>=0) return 0;
+    #ifdef __APPLE__
+    pool_fd=bb_macos_memory_fd();
+#else
     pool_fd=memfd_create("bb-guest-memory", MFD_CLOEXEC);
-    if (pool_fd<0 || ftruncate(pool_fd,(off_t)(POOL_SIZE+FLEX_SPAN))) return -1;
+#endif
+    if (pool_fd<0 || ftruncate(pool_fd,(off_t)(POOL_SIZE+FLEX_SPAN))) { perror("guest memory backing"); return -1; }
     void *view=mmap(NULL,POOL_SIZE+FLEX_SPAN,PROT_READ|PROT_WRITE,MAP_SHARED|MAP_NORESERVE,pool_fd,0);
-    if (view==MAP_FAILED) return -1;
+    if (view==MAP_FAILED) { perror("guest memory shared view"); return -1; }
     backing_base=view;
     return 0;
 }
@@ -134,7 +143,11 @@ static uint64_t flex_alloc(uint64_t size) {
 }
 static void flex_free(uint64_t phys, uint64_t size) {
     flex_set((phys-POOL_SIZE)/PAGE,size/PAGE,0);
+#ifdef __APPLE__
+    memset(backing_base+phys,0,(size_t)size);
+#else
     fallocate(pool_fd,FALLOC_FL_PUNCH_HOLE|FALLOC_FL_KEEP_SIZE,(off_t)phys,(off_t)size);
+#endif
 }
 static size_t vma_index(uintptr_t a) { /* first VMA with end > a */
     size_t lo=0, hi=vma_count;
@@ -215,7 +228,7 @@ static int32_t place(void **inout, uint64_t size, int prot, int flags, uint64_t 
     void *mapped = kind!=KIND_RESERVED
         ? mmap((void *)address,size,host_prot(prot),MAP_SHARED|MAP_FIXED,pool_fd,(off_t)phys)
         : mmap((void *)address,size,PROT_NONE,MAP_PRIVATE|MAP_ANONYMOUS|MAP_NORESERVE|MAP_FIXED,-1,0);
-    if (mapped==MAP_FAILED) return NO_MEMORY;
+    if (mapped==MAP_FAILED) { perror("guest mapping"); return NO_MEMORY; }
     drop_range(address,address+size);
     if (vma_insert(vma_index(address),(Vma){address,address+size,kind,prot,type,phys})) return NO_MEMORY;
     if (kind==KIND_FLEXIBLE) flexible_bytes+=size;
@@ -343,7 +356,11 @@ static ABI int32_t direct_release(uint64_t start, uint64_t size) {
         if (right.size) for (int j=0;j<LIMIT;++j) if (!blocks[j].used) { blocks[j]=right; break; }
         live_bytes-=e-a;
     }
+#ifdef __APPLE__
+    memset(backing_base+start,0,(size_t)size);
+#else
     fallocate(pool_fd,FALLOC_FL_PUNCH_HOLE|FALLOC_FL_KEEP_SIZE,(off_t)start,(off_t)size); /* zero on reuse */
+#endif
     write_unlock();
     flush_hooks();
     return 0;
@@ -498,7 +515,11 @@ void *runtime_low_map(size_t size, int prot) {
     write_lock();
     void *p=MAP_FAILED;
     while (low_next+size<=USER_MIN) {
+        #ifdef __APPLE__
+        p=bb_macos_map_no_replace(low_next,size,prot);
+#else
         p=mmap((void *)low_next,size,prot,MAP_PRIVATE|MAP_ANONYMOUS|MAP_FIXED_NOREPLACE,-1,0);
+#endif
         low_next+=size+PAGE; /* unmapped gap catches overruns */
         if (p!=MAP_FAILED) break;
     }

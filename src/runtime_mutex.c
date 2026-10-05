@@ -119,7 +119,11 @@ static ABI int32_t mutex_timedlock(GuestMutex **mutex, uint32_t usec) {
     if (e) return e;
     struct timespec end;
     if (deadline_after(&end, usec)) return orbis_error(EINVAL);
+#ifdef __APPLE__
+    e = timed_error(bb_macos_timed_lock(&(*mutex)->native, &end, 0));
+#else
     e = timed_error(pthread_mutex_timedlock(&(*mutex)->native, &end));
+#endif
     if (!e) ++locks;
     return e;
 }

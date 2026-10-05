@@ -4,6 +4,7 @@
 #pragma once
 
 #include <deque>
+#include "bb_present_stats.h"
 
 #include <condition_variable>
 
@@ -15,6 +16,9 @@
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_swapchain.h"
 #include "video_core/texture_cache/texture_cache.h"
+#ifdef __APPLE__
+#include "macos_metalfx.h"
+#endif
 
 namespace Frontend {
 class WindowSDL;
@@ -37,6 +41,7 @@ struct Frame {
     u64 ready_tick;
     bool is_hdr{false};
     u8 id{};
+
 
 };
 
@@ -102,6 +107,14 @@ public:
     Frame* PrepareLastFrame();
 
 private:
+#ifdef __APPLE__
+    void ApplyMetalFX(Frame* frame, vk::Image& source, u32& width, u32& height);
+    std::unique_ptr<BbMetalFX::Spatial> metalfx;
+    u32 metalfx_input_width{1920}, metalfx_input_height{1080};
+    Frame* last_metalfx_frame{}; // Presentation thread owns this cached result.
+    vk::Image last_metalfx_image{};
+    u32 last_metalfx_width{}, last_metalfx_height{};
+#endif
     Frame* GetRenderFrame();
 
     void RecreateFrame(Frame* frame, u32 width, u32 height);
@@ -121,6 +134,8 @@ private:
     HostPasses::PostProcessingPass pp_pass;
     AmdGpu::Liverpool* liverpool;
     Scheduler draw_scheduler;
+    BbStageStats<1> backpressure_stats{"Frame preparation", {"frames-ahead wait"}};
+    BbStageStats<4> api_stats{"Host presentation stages", {"acquire/resize", "MetalFX", "record/submit", "queue-present"}};
     std::deque<u64> recent_frame_ticks; ///< bbport: BB_FRAMES_AHEAD bound (PrepareFrame)
     Scheduler present_scheduler;
     Scheduler flip_scheduler;

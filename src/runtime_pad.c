@@ -1,7 +1,9 @@
 /* libScePad on SDL3 gamepads, with a keyboard fallback. SDL events are pumped
  * by the window thread (gpu/shim/window.cpp); here state is only sampled.
  *
- * Keyboard layout (when no gamepad is connected):
+ * BB_INPUT_MODE=kbm forces keyboard/mouse even with a gamepad connected.
+ * Modern controls are documented in docs/CONTROLS.md. BB_INPUT_MODE=legacy
+ * restores the original keyboard layout (when no gamepad is connected):
  *   WASD left stick, arrow keys right stick, Space Cross, LShift Circle,
  *   E Square, Q Triangle, 1 L1, 3 R1, R L2, F R2, Z L3, C R3,
  *   Enter Options, Tab left touchpad, Backspace right touchpad,
@@ -73,6 +75,80 @@ static void touch_click(PadData *d, int right) {
     d->touches[0]=(PadTouch){.x=right ? 1440 : 480,.y=471,.id=0};
 }
 
+static uint8_t mouse_axis(float value) {
+    int result=128+(int)value;
+    return (uint8_t)(result<0 ? 0 : result>255 ? 255 : result);
+}
+static float pending_mouse_x, pending_mouse_y;
+static uint64_t last_mouse;
+static uint8_t mouse_x=128, mouse_y=128;
+static void reset_mouse(void) {
+    pending_mouse_x=pending_mouse_y=0;
+    mouse_x=mouse_y=128;
+    last_mouse=now_us();
+}
+static void sample_keyboard_mouse(PadData *d,const BbHostInput *input) {
+    const uint8_t *k=input->keys;
+    static const struct { SDL_Scancode key; uint32_t ps; } keys[]={
+        {SDL_SCANCODE_SPACE,BTN_CIRCLE}, {SDL_SCANCODE_E,BTN_CROSS},
+        {SDL_SCANCODE_RETURN,BTN_CROSS}, {SDL_SCANCODE_ESCAPE,BTN_OPTIONS},
+        {SDL_SCANCODE_Q,BTN_L1}, {SDL_SCANCODE_R,BTN_TRIANGLE}, {SDL_SCANCODE_F,BTN_SQUARE},
+        {SDL_SCANCODE_Z,BTN_L3}, {SDL_SCANCODE_C,BTN_R3},
+        {SDL_SCANCODE_1,BTN_UP}, {SDL_SCANCODE_2,BTN_RIGHT},
+        {SDL_SCANCODE_3,BTN_DOWN}, {SDL_SCANCODE_4,BTN_LEFT},
+        {SDL_SCANCODE_UP,BTN_UP}, {SDL_SCANCODE_RIGHT,BTN_RIGHT},
+        {SDL_SCANCODE_DOWN,BTN_DOWN}, {SDL_SCANCODE_LEFT,BTN_LEFT},
+        {SDL_SCANCODE_I,BTN_UP}, {SDL_SCANCODE_K,BTN_DOWN},
+        {SDL_SCANCODE_J,BTN_LEFT}, {SDL_SCANCODE_L,BTN_RIGHT},
+    };
+    for (size_t i=0;i<sizeof(keys)/sizeof(*keys);++i) if (k[keys[i].key]) d->buttons|=keys[i].ps;
+    if (k[SDL_SCANCODE_TAB]) touch_click(d,0);
+    if (k[SDL_SCANCODE_BACKSPACE]) touch_click(d,1);
+    int x=(int)k[SDL_SCANCODE_D]-(int)k[SDL_SCANCODE_A];
+    int y=(int)k[SDL_SCANCODE_S]-(int)k[SDL_SCANCODE_W];
+    int strength=x && y ? 90 : 127;
+    if (k[SDL_SCANCODE_LALT] || k[SDL_SCANCODE_RALT]) strength/=2;
+    d->left_x=(uint8_t)(128+x*strength); d->left_y=(uint8_t)(128+y*strength);
+    if (input->mouse_buttons & SDL_BUTTON_LMASK)
+        d->buttons|=(k[SDL_SCANCODE_LSHIFT] || k[SDL_SCANCODE_RSHIFT]) ? BTN_R2 : BTN_R1;
+    if (input->mouse_buttons & SDL_BUTTON_RMASK) d->buttons|=BTN_L2;
+    if (input->mouse_buttons & SDL_BUTTON_MMASK) d->buttons|=BTN_R3;
+    if (input->mouse_buttons & SDL_BUTTON_X1MASK) d->buttons|=BTN_L1;
+    if (input->mouse_buttons & SDL_BUTTON_X2MASK) d->buttons|=BTN_TRIANGLE;
+    if (input->wheel>0) d->buttons|=BTN_RIGHT;
+    if (input->wheel<0) d->buttons|=BTN_DOWN;
+    d->l2=(d->buttons & BTN_L2) ? 255 : 0;
+    d->r2=(d->buttons & BTN_R2) ? 255 : 0;
+
+    /* Convert mouse velocity to a stick, holding it for one short sampling
+     * interval so extra scePad reads do not immediately cancel camera input. */
+    static int configured, invert;
+    static float sensitivity=2.0f;
+    if (!configured) {
+        const char *value=getenv("BB_MOUSE_SENSITIVITY");
+        if (value) {
+            char *end; float parsed=strtof(value,&end);
+            if (*value && !*end && parsed>0 && parsed<=20) sensitivity=parsed;
+        }
+        value=getenv("BB_MOUSE_INVERT_Y"); invert=value && !strcmp(value,"1");
+        configured=1;
+    }
+    uint64_t now=now_us();
+    if (!input->mouse_captured) {
+        reset_mouse();
+    } else {
+        pending_mouse_x+=input->mouse_x; pending_mouse_y+=input->mouse_y;
+        uint64_t elapsed=last_mouse ? now-last_mouse : 16667;
+        if (elapsed>=8000) {
+            float scale=sensitivity*16667.0f/(float)elapsed;
+            mouse_x=mouse_axis(pending_mouse_x*scale);
+            mouse_y=mouse_axis(pending_mouse_y*scale*(invert ? -1 : 1));
+            pending_mouse_x=pending_mouse_y=0; last_mouse=now;
+        }
+    }
+    d->right_x=mouse_x; d->right_y=mouse_y;
+}
+
 /* Opens the first gamepad SDL knows about; called under lock. */
 static SDL_Gamepad *current_gamepad(void) {
     if (!sdl_ready) sdl_ready = SDL_WasInit(SDL_INIT_GAMEPAD) ? 1 : SDL_InitSubSystem(SDL_INIT_GAMEPAD) ? 1 : -1;
@@ -96,8 +172,16 @@ static void sample_host(PadData *d) {
     d->connected=1; d->connected_count=connected_count ? connected_count : 1;
     d->timestamp=now_us();
     SDL_Gamepad *g=current_gamepad();
-    if (bbgpu_overlay_captures_input()) return; /* settings menu open: neutral input */
-    const bool *k=SDL_WasInit(SDL_INIT_VIDEO) ? SDL_GetKeyboardState(NULL) : NULL;
+    if (bbgpu_overlay_captures_input()) { reset_mouse(); return; }
+    BbHostInput input={0};
+    int host_input=bbgpu_read_host_input(&input);
+    if (host_input && !input.focused) { reset_mouse(); return; }
+    const uint8_t *k=host_input ? input.keys : SDL_WasInit(SDL_INIT_VIDEO) ? (const uint8_t *)SDL_GetKeyboardState(NULL) : NULL;
+    const char *mode=getenv("BB_INPUT_MODE");
+    int force_kbm=mode && !strcmp(mode,"kbm");
+    int legacy=mode && !strcmp(mode,"legacy");
+    if (mode && !strcmp(mode,"gamepad") && !g) return;
+    if (host_input && !legacy && (!g || force_kbm)) { sample_keyboard_mouse(d,&input); return; }
     if (g) {
         static const struct { SDL_GamepadButton sdl; uint32_t ps; } map[]={
             {SDL_GAMEPAD_BUTTON_SOUTH,BTN_CROSS}, {SDL_GAMEPAD_BUTTON_EAST,BTN_CIRCLE},
@@ -168,8 +252,8 @@ static void read_inject(void) {
     last_check=now;
     struct stat st;
     if (stat(path,&st)!=0) return;
-    if (st.st_mtim.tv_sec==mtime.tv_sec && st.st_mtim.tv_nsec==mtime.tv_nsec) return;
-    mtime=st.st_mtim;
+    if (BB_STAT_MTIME(st).tv_sec==mtime.tv_sec && BB_STAT_MTIME(st).tv_nsec==mtime.tv_nsec) return;
+    mtime=BB_STAT_MTIME(st);
     FILE *f=fopen(path,"r");
     if (!f) return;
     static const struct { const char *name; uint32_t ps; } names[]={

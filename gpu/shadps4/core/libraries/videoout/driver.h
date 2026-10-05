@@ -4,6 +4,7 @@
 #pragma once
 
 #include <deque>
+#include "bb_present_stats.h"
 #include <functional>
 
 #include "common/debug.h"
@@ -118,7 +119,8 @@ private:
     /// on the vblank thread that delayed the guest's vblank events and its frame timing jumped.
     /// The presenter's frame pool still bounds how far the GPU command thread runs ahead.
     void SwapThread(std::stop_token token);
-    void RunPresenter(std::function<void()> work, bool if_idle = false);
+    void RunPresenter(std::function<void()> work, bool if_idle = false, bool game_flip = false);
+    BbPresentStats present_stats;
 
     std::mutex swap_mutex;
     std::condition_variable_any swap_cv;

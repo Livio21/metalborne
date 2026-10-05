@@ -1,7 +1,8 @@
 /* Guest threads on host pthreads. Each guest thread owns a FreeBSD-style TCB
  * (variant II: static TLS below the TCB). The loader rewrites the eboot's
  * `mov rax, fs:[0]` into `mov rax, gs:[0]`, so GS base = guest TCB while glibc
- * keeps FS. Priorities/affinity are recorded, not enforced by a PS4 scheduler. */
+ * keeps FS. macOS leaves those instructions intact and uses FS while Darwin
+ * retains GS. Priorities/affinity are recorded, not enforced by a PS4 scheduler. */
 #define _GNU_SOURCE
 #include "runtime.h"
 #include <stdio.h>
@@ -13,9 +14,11 @@
 #include <setjmp.h>
 #include <errno.h>
 #include <unistd.h>
-#include <sys/syscall.h>
 #include <sys/mman.h>
+#ifndef __APPLE__
+#include <sys/syscall.h>
 #include <asm/prctl.h>
+#endif
 #define ERR(n) ((int32_t)(UINT32_C(0x80020000)|(n)))
 #define ATTR_MAGIC UINT32_C(0x41545452)
 #define STACK_MARGIN (256*1024)
@@ -57,8 +60,12 @@ void runtime_set_main_tls(const void *data,uint64_t filesz,uint64_t memsz,uint64
     tls_template=data; tls_filesz=filesz; tls_memsz=memsz; tls_align=align ? align : 16;
 }
 static uint64_t tls_offset(void) { return (tls_memsz+tls_align-1)&~(tls_align-1); }
-static void set_gs(void *base) {
+static void set_guest_tcb(void *base) {
+#ifdef __APPLE__
+    bb_macos_set_tcb(base);
+#else
     if (syscall(SYS_arch_prctl,ARCH_SET_GS,(unsigned long)base)) { perror("STOP: arch_prctl(ARCH_SET_GS)"); exit(21); }
+#endif
 }
 /* Build TCB/static TLS for the calling host thread and point GS at it. */
 static void attach(GuestThread *t) {
@@ -74,7 +81,7 @@ static void attach(GuestThread *t) {
     tcb[1]=(uint64_t)(uintptr_t)dtv;         /* tcb_dtv (static module only) */
     tcb[2]=(uint64_t)(uintptr_t)t;           /* tcb_thread */
     t->tls_block=block; t->tcb=tcb;
-    set_gs(tcb);
+    set_guest_tcb(tcb);
     current=t;
 }
 static GuestThread *new_thread(void) {
@@ -215,7 +222,11 @@ static ABI int32_t attr_set_guard(ThreadAttr **slot,uint64_t size) {
 static void set_host_name(const char *name) {
     char host[16]={0};
     memcpy(host,name,strnlen(name,sizeof(host)-1));
+    #ifdef __APPLE__
+    pthread_setname_np(host);
+#else
     pthread_setname_np(pthread_self(),host);
+#endif
 }
 static void *host_start(void *p) {
     GuestThread *t=p;

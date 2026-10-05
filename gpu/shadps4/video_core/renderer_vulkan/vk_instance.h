@@ -62,6 +62,8 @@ public:
         return *device;
     }
 
+    bool HasExternalMemoryMetal() const { return external_memory_metal; }
+
     /// Returns the VMA allocator handle
     VmaAllocator GetAllocator() const {
         return allocator;
@@ -529,6 +531,7 @@ private:
     vk::DriverIdKHR driver_id;
     vk::UniqueDebugUtilsMessengerEXT debug_callback{};
     std::string vendor_name;
+    bool external_memory_metal = false;
     VmaAllocator allocator{};
     vk::Queue present_queue;
     vk::Queue graphics_queue;
