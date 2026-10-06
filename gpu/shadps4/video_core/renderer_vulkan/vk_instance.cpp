@@ -260,9 +260,11 @@ bool Instance::CreateDevice() {
     const char* metalfx = std::getenv("BB_METALFX");
     const char* presentation = std::getenv("BB_PRESENT_BACKEND");
     const char* native_buffers = std::getenv("BB_METAL_BUFFER_CACHE");
+    const char* native_images = std::getenv("BB_METAL_IMAGE_CACHE");
     if ((metalfx && std::strcmp(metalfx, "spatial") == 0) ||
         (presentation && std::strcmp(presentation, "metal") == 0) ||
-        (native_buffers && std::strcmp(native_buffers, "1") == 0)) {
+        (native_buffers && std::strcmp(native_buffers, "1") == 0) ||
+        (native_images && std::strcmp(native_images, "1") == 0)) {
         external_memory_metal = add_extension("VK_EXT_external_memory_metal");
     }
 #endif

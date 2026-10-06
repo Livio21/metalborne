@@ -435,7 +435,7 @@ bool TemporalUpscaler::EnsureResources(u32 w, u32 h, u32 ow, u32 oh, bool hdr) {
         .tiling = vk::ImageTiling::eOptimal,
         .usage = vk::ImageUsageFlagBits::eStorage | vk::ImageUsageFlagBits::eSampled,
         .initialLayout = vk::ImageLayout::eUndefined,
-    });
+    }, &instance);
     output_image = VideoCore::UniqueImage(device, allocator);
     output_image.Create(vk::ImageCreateInfo{
         .imageType = vk::ImageType::e2D,
@@ -448,7 +448,7 @@ bool TemporalUpscaler::EnsureResources(u32 w, u32 h, u32 ow, u32 oh, bool hdr) {
         .usage = vk::ImageUsageFlagBits::eStorage | vk::ImageUsageFlagBits::eSampled |
                  vk::ImageUsageFlagBits::eTransferSrc,
         .initialLayout = vk::ImageLayout::eUndefined,
-    });
+    }, &instance);
     output_view = Check(device.createImageViewUnique({
         .image = vk::Image(output_image),
         .viewType = vk::ImageViewType::e2D,
@@ -479,7 +479,7 @@ bool TemporalUpscaler::EnsureResources(u32 w, u32 h, u32 ow, u32 oh, bool hdr) {
             .tiling = vk::ImageTiling::eOptimal,
             .usage = usage,
             .initialLayout = vk::ImageLayout::eUndefined,
-        });
+        }, &instance);
         view = Check(device.createImageViewUnique({
             .image = vk::Image(image),
             .viewType = vk::ImageViewType::e2D,
@@ -740,7 +740,7 @@ void TemporalUpscaler::ExtraSharpen(vk::CommandBuffer cmdbuf, vk::Image target, 
             .tiling = vk::ImageTiling::eOptimal,
             .usage = vk::ImageUsageFlagBits::eStorage | vk::ImageUsageFlagBits::eTransferDst,
             .initialLayout = vk::ImageLayout::eUndefined,
-        });
+        }, &instance);
         extra_sharpen_view = Check(device.createImageViewUnique({
             .image = vk::Image(extra_sharpen_image), .viewType = vk::ImageViewType::e2D,
             .format = vk::Format::eR32G32B32A32Sfloat,
@@ -1356,7 +1356,7 @@ void TemporalUpscaler::EnsureUiResources(u32 w, u32 h, vk::Format color, vk::For
                      vk::ImageUsageFlagBits::eColorAttachment | vk::ImageUsageFlagBits::eTransferDst |
                      vk::ImageUsageFlagBits::eTransferSrc,
             .initialLayout = vk::ImageLayout::eUndefined,
-        });
+        }, &instance);
         ui_format = color;
     }
     if (new_depth) {
@@ -1371,7 +1371,7 @@ void TemporalUpscaler::EnsureUiResources(u32 w, u32 h, vk::Format color, vk::For
             .usage = vk::ImageUsageFlagBits::eDepthStencilAttachment |
                      vk::ImageUsageFlagBits::eTransferDst,
             .initialLayout = vk::ImageLayout::eUndefined,
-        });
+        }, &instance);
         const auto aspect = vk::ImageAspectFlagBits::eDepth |
             (depth == vk::Format::eD32SfloatS8Uint ? vk::ImageAspectFlagBits::eStencil
                                                 : vk::ImageAspectFlags{});
@@ -1808,7 +1808,7 @@ bool TemporalUpscaler::RedirectColor(VideoCore::ImageId color,
             .usage = vk::ImageUsageFlagBits::eColorAttachment | vk::ImageUsageFlagBits::eSampled |
                      vk::ImageUsageFlagBits::eTransferSrc,
             .initialLayout = vk::ImageLayout::eUndefined,
-        });
+        }, &instance);
         display.views.clear();
     }
     scheduler.EndRendering();

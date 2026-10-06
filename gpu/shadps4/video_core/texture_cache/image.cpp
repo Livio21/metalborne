@@ -3,6 +3,10 @@
 
 #include "bbport_toggles.h"
 #include <ranges>
+#include <atomic>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include "common/assert.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
@@ -86,22 +90,47 @@ static vk::FormatFeatureFlags2 FormatFeatureFlags(const vk::ImageUsageFlags usag
 }
 
 UniqueImage::~UniqueImage() {
-    if (image) {
-        vmaDestroyImage(allocator, image, allocation);
-    }
+    Destroy();
 }
 
 void UniqueImage::Destroy() {
+#ifdef __APPLE__
+    if (metal) metal.reset();
+    else
+#endif
     if (image) {
         vmaDestroyImage(allocator, image, allocation);
-        image = vk::Image{};
-        allocation = {};
     }
+    image = vk::Image{};
+    allocation = {};
+    size_bytes = 0;
 }
 
-void UniqueImage::Create(const vk::ImageCreateInfo& image_ci) {
+void UniqueImage::Create(const vk::ImageCreateInfo& image_ci, const Vulkan::Instance* instance) {
     this->image_ci = image_ci;
     ASSERT(!image);
+#ifdef __APPLE__
+    static const char* native_cache = std::getenv("BB_METAL_IMAGE_CACHE");
+    if (instance && native_cache && std::strcmp(native_cache, "1") == 0 && instance->HasExternalMemoryMetal()) {
+        metal = std::make_unique<BbMetalFX::SharedImage>(
+            instance->GetInstance(), instance->GetPhysicalDevice(), instance->GetDevice(),
+            static_cast<VkImageCreateInfo>(image_ci),
+            VULKAN_HPP_DEFAULT_DISPATCHER.vkGetInstanceProcAddr,
+            VULKAN_HPP_DEFAULT_DISPATCHER.vkGetDeviceProcAddr);
+        if (metal->Handle()) {
+            image = metal->Handle();
+            size_bytes = metal->SizeBytes();
+            static std::atomic<unsigned> allocated{0};
+            const auto count = allocated.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (count <= 8)
+                std::fprintf(stderr, "Native Metal image cache: shared allocation #%u (%ux%u, %u mips, %u layers, format %u).\n",
+                    count, image_ci.extent.width, image_ci.extent.height, image_ci.mipLevels,
+                    image_ci.arrayLayers, unsigned(image_ci.format));
+            return;
+        }
+        metal.reset();
+    }
+#endif
     const VmaAllocationCreateInfo alloc_ci = {
         .flags = VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT,
         .usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
@@ -194,7 +223,7 @@ Image::Image(const Vulkan::Instance& instance, Vulkan::Runtime& runtime_,
     backing = &backing_images.emplace_back();
     backing->num_samples = info.num_samples;
     backing->image = UniqueImage{instance.GetDevice(), instance.GetAllocator()};
-    backing->image.Create(image_ci);
+    backing->image.Create(image_ci, &instance);
 
     Vulkan::SetObjectName(instance.GetDevice(), GetImage(),
                           "Image {}x{}x{} {} {} {:#x}:{:#x} L:{} M:{} S:{}", info.size.width,

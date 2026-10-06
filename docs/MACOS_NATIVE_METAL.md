@@ -2,9 +2,10 @@
 
 Updated 2026-10-06. This is the first native Metal presentation stage of the
 renderer transition. The game and host CPU code still run under Rosetta;
-PS4 draw/compute commands, shader recompilation, textures and host
+PS4 draw/compute commands, shader recompilation and host
 post-processing still use bbport's Vulkan renderer through KosmicKrisp.
-Ordinary buffer-cache storage and copies now have an opt-in native Metal path
+Ordinary buffer storage/copies and selected color textures/copies now have
+opt-in native Metal paths
 described below; sparse guest arenas retain Vulkan ownership.
 
 ## Enable it
@@ -143,9 +144,11 @@ MetalFX or a speedup from removing the blit.
 
 The host frame renders directly into exportable storage, and the real game
 buffer-copy workload below passes on native Metal, including shared GPU buffers.
-Ordinary cache buffers now have the opt-in shared ownership path below. Guest
+Ordinary cache buffers and selected color images now have the opt-in shared
+ownership paths below. Guest
 sparse arenas still require a different allocation/binding contract before
-their shader bindings can move directly to Metal, followed by texture workloads.
+their shader bindings can move directly to Metal. Texture uploads, downloads,
+depth, compressed, volume and multisample workloads still use Vulkan.
 The full backend still needs native resource/cache management, bindings,
 graphics/compute pipelines and command submission. Geometry/tessellation and
 guest completion semantics require their own proofs; presentation alone does
@@ -339,3 +342,58 @@ about 42 ms/frame spent completing Vulkan render work and 0.6 ms/frame in Metal
 encode/completion. These are single-run CPU wall timings, not a matched baseline
 or proof of a speedup. Stable 30 FPS remains unproven. The local run log is
 `out/macos-native-metal/shared-cache-input-game.log`.
+
+## Shared color-image cache and native copies (2026-10-06)
+
+`BB_METAL_IMAGE_CACHE=1` gives eligible cache images one dedicated exported
+placement heap with both Vulkan and Metal texture handles. The allocator is
+also used by native presentation/MetalFX, so their memory/lifetime code is
+shared. Vulkan views, rendering, uploads and downloads continue to use the same
+image storage. Move construction/assignment transfers its sole owner and size;
+retirement releases the Metal texture before destroying the Vulkan image and
+freeing the allocation. Unsupported images retain the existing VMA path.
+
+The initial scope is optimal, single-sample 2D color images, including mipmaps
+and arrays: R8/RG8 UNORM, RGBA8/BGRA8 UNORM or sRGB, and R16/RG16/RGBA16 float.
+The external format query and Metal/Vulkan size/alignment checks must pass.
+The descriptor follows the driver's usage, mutable-format and compression
+rules. Depth, compressed, 1D/3D, multisample and sparse images remain Vulkan.
+
+`BB_METAL_IMAGE_COPY=1` uses a Metal blit for eligible cache image copies with
+the same pixel format. Vulkan releases both images to external ownership in
+GENERAL layout and completes a partial fenced submission. Metal completes the
+copy before Vulkan reacquires their transfer layouts. The existing scheduler
+tick is preserved, keeping unrelated staging allocations/callbacks live.
+Invalid regions, overlapping destinations, format mismatches or Metal failure
+use the original Vulkan copy. The command queue and completion helper are
+shared with native buffer copies; neither path stages texture pixels on the CPU.
+Both new settings default to off. Native texture uploads/downloads and batched
+Metal command submission are still unfinished.
+
+```bash
+BB_METAL_IMAGE_CACHE=1 BB_METAL_IMAGE_COPY=1 \
+  BB_PRESENT_BACKEND=metal BB_METALFX=spatial bash macos/run.sh
+```
+
+The existing `metal-buffer-test` check now also covers all nine color formats,
+move ownership, three mips/two array layers, partially covered destination
+images and every untouched pixel. It preserves a pending staging tick and
+callback across native copies, rejects invalid/overlapping copies, and checks
+Vulkan format-copy fallback after external reacquire plus depth allocation
+fallback. Direct, threaded and all-Vulkan modes passed on Apple M5; logs are
+`out/macos-native-metal/shared-image-{check,threaded-check,fallback-check}.log`.
+
+Live Central Yharnam rendered the character, scene and HUD with all four shared
+cache/copy settings, native presentation and MetalFX spatial enabled. The run
+selected `BB_FPS=30` and recorded at least 5,400 native image copies before
+exiting with status 0. Its roughly 1,270-draw view ran around 16–18 FPS. This
+proves live use of the path, not a performance gain or stable 30 FPS. Logs are
+local under `out/macos-native-metal/shared-image-game.log`.
+
+A short follow-up with shared images retained but `BB_METAL_IMAGE_COPY=0`
+initially ran around 20–21 FPS from the same saved view. The camera later changed,
+so this is not a controlled benchmark or proof of a speedup. It does suggest
+that synchronous release/Metal-completion waits are too costly for this scene.
+Native image copies remain off by default; batch submission and dependency
+handling are the next performance work. The comparison log is
+`out/macos-native-metal/shared-image-vulkan-copy-game.log`.

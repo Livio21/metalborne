@@ -12,6 +12,9 @@
 
 #include <deque>
 #include <optional>
+#ifdef __APPLE__
+#include "macos_metalfx.h"
+#endif
 #include <boost/container/small_vector.hpp>
 #include <boost/container/static_vector.hpp>
 
@@ -47,9 +50,14 @@ struct UniqueImage {
     UniqueImage& operator=(const UniqueImage&) = delete;
 
     UniqueImage(UniqueImage&& other)
-        : allocator{std::exchange(other.allocator, VK_NULL_HANDLE)},
+        : device{other.device}, allocator{std::exchange(other.allocator, VK_NULL_HANDLE)},
           allocation{std::exchange(other.allocation, VK_NULL_HANDLE)},
-          image{std::exchange(other.image, VK_NULL_HANDLE)}, image_ci{std::move(other.image_ci)} {}
+          image{std::exchange(other.image, VK_NULL_HANDLE)}, image_ci{std::move(other.image_ci)},
+          size_bytes{std::exchange(other.size_bytes, 0)}
+#ifdef __APPLE__
+          , metal{std::move(other.metal)}
+#endif
+          {}
     UniqueImage& operator=(UniqueImage&& other) {
         if (this == &other) return *this;
         Destroy();
@@ -58,10 +66,14 @@ struct UniqueImage {
         allocator = std::exchange(other.allocator, VK_NULL_HANDLE);
         allocation = std::exchange(other.allocation, VK_NULL_HANDLE);
         image_ci = std::move(other.image_ci);
+        size_bytes = std::exchange(other.size_bytes, 0);
+#ifdef __APPLE__
+        metal = std::move(other.metal);
+#endif
         return *this;
     }
 
-    void Create(const vk::ImageCreateInfo& image_ci);
+    void Create(const vk::ImageCreateInfo& image_ci, const Vulkan::Instance* instance = nullptr);
 
     void Destroy();
 
@@ -80,6 +92,9 @@ public:
     vk::Image image{};
     vk::ImageCreateInfo image_ci{};
     vk::DeviceSize size_bytes{};
+#ifdef __APPLE__
+    std::unique_ptr<BbMetalFX::SharedImage> metal;
+#endif
 };
 
 struct Image {

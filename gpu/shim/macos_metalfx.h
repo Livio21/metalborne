@@ -1,4 +1,4 @@
-// Experimental Metal presentation and MetalFX. Vulkan shares dedicated GPU textures.
+// Experimental shared Metal resources, presentation and MetalFX.
 #pragma once
 #include <memory>
 #include <span>
@@ -26,6 +26,21 @@ private:
 };
 // Caller completes Vulkan release before entering, then acquires after completion.
 bool CopyBuffers(void* source, void* destination, std::span<const VkBufferCopy> copies);
+class SharedImage {
+public:
+    SharedImage(VkInstance instance, VkPhysicalDevice physical, VkDevice device,
+                const VkImageCreateInfo& info, PFN_vkGetInstanceProcAddr instance_proc,
+                PFN_vkGetDeviceProcAddr device_proc);
+    ~SharedImage();
+    VkImage Handle() const;
+    void* NativeHandle() const;
+    uint64_t SizeBytes() const;
+private:
+    struct Impl;
+    std::unique_ptr<Impl> impl;
+};
+// Same release/completion/acquire contract as CopyBuffers; no format conversion.
+bool CopyImages(void* source, void* destination, std::span<const VkImageCopy> copies);
 // One-shot shadow dispatch: clones buffers and leaves the live Vulkan resources untouched.
 bool CheckCompute(std::span<const ComputeBuffer> buffers, std::span<const uint8_t> push,
                   uint32_t groups, uint32_t threads);

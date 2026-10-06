@@ -418,6 +418,52 @@ void Runtime::CopyImage(VideoCore::Image* src, VideoCore::Image* dst) {
         FlushBarriers();
     }
 
+#ifdef __APPLE__
+    bool native_copied = false;
+    static const char* native_copy = std::getenv("BB_METAL_IMAGE_COPY");
+    if (native_copy && std::strcmp(native_copy, "1") == 0 && src != dst &&
+        src->backing->image.metal && dst->backing->image.metal && !regions.empty()) {
+        const std::array<vk::Image, 2> handles{src->GetImage(), dst->GetImage()};
+        const std::array<vk::ImageLayout, 2> layouts{vk::ImageLayout::eTransferSrcOptimal, vk::ImageLayout::eTransferDstOptimal};
+        const std::array<vk::ImageSubresourceRange, 2> ranges{{
+            {vk::ImageAspectFlagBits::eColor, 0, src->info.resources.levels, 0, src->info.resources.layers},
+            {vk::ImageAspectFlagBits::eColor, 0, dst->info.resources.levels, 0, dst->info.resources.layers}}};
+        const u32 family = instance.GetGraphicsQueueFamilyIndex();
+        const auto ownership = [&](bool release) {
+            scheduler.Record([handles, layouts, ranges, family, release](vk::CommandBuffer command) {
+                std::array<vk::ImageMemoryBarrier2, 2> barriers;
+                for (size_t i = 0; i < handles.size(); ++i) barriers[i] = {
+                    .srcStageMask = release ? vk::PipelineStageFlagBits2::eAllCommands : vk::PipelineStageFlagBits2::eNone,
+                    .srcAccessMask = release ? vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite : vk::AccessFlags2{},
+                    .dstStageMask = release ? vk::PipelineStageFlagBits2::eNone : vk::PipelineStageFlagBits2::eAllCommands,
+                    .dstAccessMask = release ? vk::AccessFlags2{} : vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
+                    .oldLayout = release ? layouts[i] : vk::ImageLayout::eGeneral,
+                    .newLayout = release ? vk::ImageLayout::eGeneral : layouts[i],
+                    .srcQueueFamilyIndex = release ? family : VK_QUEUE_FAMILY_EXTERNAL,
+                    .dstQueueFamilyIndex = release ? VK_QUEUE_FAMILY_EXTERNAL : family,
+                    .image = handles[i], .subresourceRange = ranges[i],
+                };
+                command.pipelineBarrier2(vk::DependencyInfo{
+                    .imageMemoryBarrierCount = 2, .pImageMemoryBarriers = barriers.data()});
+            });
+        };
+        ownership(true);
+        scheduler.FinishForExternal(); // Keep all current staging reservations and callbacks live.
+        std::vector<VkImageCopy> native_regions;
+        for (const auto& region : regions) native_regions.push_back(static_cast<VkImageCopy>(region));
+        native_copied = BbMetalFX::CopyImages(src->backing->image.metal->NativeHandle(),
+                                            dst->backing->image.metal->NativeHandle(), native_regions);
+        ownership(false);
+        if (native_copied) {
+            static std::atomic<u64> native_copies{0};
+            const auto count = native_copies.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (count <= 3 || count % 300 == 0)
+                std::fprintf(stderr, "Native Metal image copy #%llu: %zu mip regions; shared cache storage, no bridge copies.\n",
+                    static_cast<unsigned long long>(count), regions.size());
+        }
+    }
+    if (!native_copied)
+#endif
     scheduler.Record([src_image = src->GetImage(), dst_image = dst->GetImage(),
                       regions](vk::CommandBuffer cmdbuf) {
         cmdbuf.copyImage(src_image, vk::ImageLayout::eTransferSrcOptimal, dst_image,
@@ -738,7 +784,7 @@ void Runtime::SetBackingSamples(VideoCore::Image* image, u32 num_samples, bool c
         new_backing = &backing_images.emplace_back();
         new_backing->num_samples = num_samples;
         new_backing->image = VideoCore::UniqueImage{instance.GetDevice(), instance.GetAllocator()};
-        new_backing->image.Create(new_image_ci);
+        new_backing->image.Create(new_image_ci, &instance);
 
         Vulkan::SetObjectName(instance.GetDevice(), new_backing->image.image,
                               "Image {}x{}x{} {} {} {:#x}:{:#x} L:{} M:{} S:{} (backing)",

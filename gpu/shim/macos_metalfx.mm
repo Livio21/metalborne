@@ -14,6 +14,8 @@
 #include <atomic>
 #include <vector>
 #include <mutex>
+#include <functional>
+#include <algorithm>
 
 namespace BbMetalFX {
 struct SharedBuffer::Impl {
@@ -107,6 +109,35 @@ void* SharedBuffer::NativeHandle() const { return (__bridge void*)impl->metal; }
 uint8_t* SharedBuffer::MappedData() const { return static_cast<uint8_t*>(impl->metal.contents); }
 uint64_t SharedBuffer::DeviceAddress() const { return impl->address; }
 
+static bool RunBlit(id<MTLDevice> device, const std::function<void(id<MTLBlitCommandEncoder>)>& encode) {
+    @autoreleasepool {
+        // ponytail: one device/queue and synchronous completion; batch with guest submissions later.
+        static std::mutex mutex;
+        std::lock_guard lock{mutex};
+        static id<MTLCommandQueue> queue;
+        if (!queue || queue.device != device) queue = [device newCommandQueue];
+        id<MTLCommandBuffer> command = [queue commandBuffer];
+        id<MTLFence> fence = [device newFence];
+        id<MTLBlitCommandEncoder> release = [command blitCommandEncoder];
+        if (!command || !fence || !release) return false;
+        [release updateFence:fence];
+        [release endEncoding];
+        id<MTLBlitCommandEncoder> encoder = [command blitCommandEncoder];
+        if (!encoder) return false;
+        [encoder waitForFence:fence];
+        encode(encoder);
+        [encoder endEncoding];
+        [command commit];
+        [command waitUntilCompleted];
+        if (command.status != MTLCommandBufferStatusCompleted) {
+            std::fprintf(stderr, "Native Metal blit failed: %s; falling back to Vulkan.\n",
+                         (command.error.localizedDescription ?: @"command failed").UTF8String);
+            return false;
+        }
+        return true;
+    }
+}
+
 bool CopyBuffers(void* source, void* destination, std::span<const VkBufferCopy> copies) {
     @autoreleasepool {
         id<MTLBuffer> src = (__bridge id<MTLBuffer>)source, dst = (__bridge id<MTLBuffer>)destination;
@@ -120,32 +151,189 @@ bool CopyBuffers(void* source, void* destination, std::span<const VkBufferCopy> 
                 if (c.dstOffset < copies[j].dstOffset + copies[j].size &&
                     copies[j].dstOffset < c.dstOffset + c.size) return false;
         }
-        // ponytail: one device/queue and synchronous completion; batch with guest submissions later.
-        static std::mutex mutex;
-        std::lock_guard lock{mutex};
-        static id<MTLCommandQueue> queue;
-        if (!queue || queue.device != src.device) queue = [src.device newCommandQueue];
-        id<MTLCommandBuffer> command = [queue commandBuffer];
-        id<MTLFence> fence = [src.device newFence];
-        id<MTLBlitCommandEncoder> release = [command blitCommandEncoder];
-        if (!command || !fence || !release) return false;
-        [release updateFence:fence];
-        [release endEncoding];
-        id<MTLBlitCommandEncoder> encoder = [command blitCommandEncoder];
-        if (!encoder) return false;
-        [encoder waitForFence:fence];
-        for (const auto& c : copies)
-            [encoder copyFromBuffer:src sourceOffset:c.srcOffset toBuffer:dst
-                    destinationOffset:c.dstOffset size:c.size];
-        [encoder endEncoding];
-        [command commit];
-        [command waitUntilCompleted];
-        if (command.status != MTLCommandBufferStatusCompleted) {
-            std::fprintf(stderr, "Native Metal buffer copy failed: %s; falling back to Vulkan.\n",
-                         (command.error.localizedDescription ?: @"command failed").UTF8String);
-            return false;
+        return RunBlit(src.device, [&](id<MTLBlitCommandEncoder> encoder) {
+            for (const auto& c : copies)
+                [encoder copyFromBuffer:src sourceOffset:c.srcOffset toBuffer:dst
+                        destinationOffset:c.dstOffset size:c.size];
+        });
+    }
+}
+
+static MTLPixelFormat ImageFormat(VkFormat format) {
+    switch (format) {
+    case VK_FORMAT_R8_UNORM: return MTLPixelFormatR8Unorm;
+    case VK_FORMAT_R8G8_UNORM: return MTLPixelFormatRG8Unorm;
+    case VK_FORMAT_R8G8B8A8_UNORM: return MTLPixelFormatRGBA8Unorm;
+    case VK_FORMAT_R8G8B8A8_SRGB: return MTLPixelFormatRGBA8Unorm_sRGB;
+    case VK_FORMAT_B8G8R8A8_UNORM: return MTLPixelFormatBGRA8Unorm;
+    case VK_FORMAT_B8G8R8A8_SRGB: return MTLPixelFormatBGRA8Unorm_sRGB;
+    case VK_FORMAT_R16_SFLOAT: return MTLPixelFormatR16Float;
+    case VK_FORMAT_R16G16_SFLOAT: return MTLPixelFormatRG16Float;
+    case VK_FORMAT_R16G16B16A16_SFLOAT: return MTLPixelFormatRGBA16Float;
+    default: return MTLPixelFormatInvalid;
+    }
+}
+
+struct SharedImage::Impl {
+    VkDevice device;
+    VkImage image{};
+    VkDeviceMemory memory{};
+    uint64_t size{};
+    id<MTLTexture> metal;
+    id<MTLHeap> heap;
+    PFN_vkDestroyImage destroy;
+    PFN_vkFreeMemory free;
+    Impl(VkInstance instance, VkPhysicalDevice physical, VkDevice d, const VkImageCreateInfo& info,
+         PFN_vkGetInstanceProcAddr ip, PFN_vkGetDeviceProcAddr dp) : device(d) {
+#define IMAGE_PROC(name) auto name = reinterpret_cast<PFN_##name>(dp(d, #name))
+        IMAGE_PROC(vkCreateImage); IMAGE_PROC(vkGetImageMemoryRequirements);
+        IMAGE_PROC(vkAllocateMemory); IMAGE_PROC(vkBindImageMemory); IMAGE_PROC(vkGetMemoryMetalHandleEXT);
+#undef IMAGE_PROC
+        destroy = reinterpret_cast<PFN_vkDestroyImage>(dp(d, "vkDestroyImage"));
+        free = reinterpret_cast<PFN_vkFreeMemory>(dp(d, "vkFreeMemory"));
+        auto format_props = reinterpret_cast<PFN_vkGetPhysicalDeviceImageFormatProperties2>(
+            ip(instance, "vkGetPhysicalDeviceImageFormatProperties2"));
+        auto get_memory = reinterpret_cast<PFN_vkGetPhysicalDeviceMemoryProperties>(
+            ip(instance, "vkGetPhysicalDeviceMemoryProperties"));
+        const auto format = ImageFormat(info.format);
+        constexpr VkImageCreateFlags allowed = VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT | VK_IMAGE_CREATE_EXTENDED_USAGE_BIT;
+        constexpr VkImageUsageFlags allowed_usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+            VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+            VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT | VK_IMAGE_USAGE_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT;
+        if (!vkGetMemoryMetalHandleEXT || !format_props || !get_memory || format == MTLPixelFormatInvalid ||
+            info.pNext || info.imageType != VK_IMAGE_TYPE_2D || info.tiling != VK_IMAGE_TILING_OPTIMAL ||
+            info.samples != VK_SAMPLE_COUNT_1_BIT || info.extent.depth != 1 || (info.flags & ~allowed) ||
+            (info.usage & ~allowed_usage) ||
+            info.sharingMode != VK_SHARING_MODE_EXCLUSIVE) return;
+        const auto fail = [&](const char* stage, VkResult result = VK_ERROR_FEATURE_NOT_PRESENT) {
+            static std::atomic<unsigned> failures{0};
+            if (failures.fetch_add(1, std::memory_order_relaxed) < 8)
+                std::fprintf(stderr, "Native Metal shared image unavailable: format %u, %ux%u; %s (VkResult=%d).\n",
+                    unsigned(info.format), info.extent.width, info.extent.height, stage, int(result));
+        };
+        VkPhysicalDeviceExternalImageFormatInfo external_query{
+            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_IMAGE_FORMAT_INFO,
+            .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_MTLHEAP_BIT_EXT};
+        VkPhysicalDeviceImageFormatInfo2 query{.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_FORMAT_INFO_2,
+            .pNext = &external_query, .format = info.format, .type = info.imageType,
+            .tiling = info.tiling, .usage = info.usage, .flags = info.flags};
+        VkExternalImageFormatProperties external_props{.sType = VK_STRUCTURE_TYPE_EXTERNAL_IMAGE_FORMAT_PROPERTIES};
+        VkImageFormatProperties2 props{.sType = VK_STRUCTURE_TYPE_IMAGE_FORMAT_PROPERTIES_2, .pNext = &external_props};
+        VkResult result = format_props(physical, &query, &props);
+        const auto& limits = props.imageFormatProperties;
+        if (result != VK_SUCCESS || !(external_props.externalMemoryProperties.externalMemoryFeatures &
+                VK_EXTERNAL_MEMORY_FEATURE_EXPORTABLE_BIT) || info.extent.width > limits.maxExtent.width ||
+            info.extent.height > limits.maxExtent.height || info.mipLevels > limits.maxMipLevels ||
+            info.arrayLayers > limits.maxArrayLayers) { fail("external image format query/limits", result); return; }
+        VkExternalMemoryImageCreateInfo external{.sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO,
+            .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_MTLHEAP_BIT_EXT};
+        auto image_info = info;
+        image_info.pNext = &external;
+        result = vkCreateImage(d, &image_info, nullptr, &image);
+        if (result != VK_SUCCESS) { fail("vkCreateImage", result); return; }
+        VkMemoryRequirements req{};
+        vkGetImageMemoryRequirements(d, image, &req);
+        VkPhysicalDeviceMemoryProperties properties{};
+        get_memory(physical, &properties);
+        uint32_t type = properties.memoryTypeCount;
+        for (uint32_t i = 0; i < properties.memoryTypeCount; ++i)
+            if ((req.memoryTypeBits & (1u << i)) && (properties.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) {
+                type = i; break;
+            }
+        if (type == properties.memoryTypeCount) { fail("no device-local memory type"); return; }
+        VkExportMemoryAllocateInfo exported{.sType = VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO,
+            .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_MTLHEAP_BIT_EXT};
+        VkMemoryDedicatedAllocateInfo dedicated{.sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO,
+            .pNext = &exported, .image = image};
+        VkMemoryAllocateInfo allocation{.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+            .pNext = &dedicated, .allocationSize = req.size, .memoryTypeIndex = type};
+        result = vkAllocateMemory(d, &allocation, nullptr, &memory);
+        if (result != VK_SUCCESS) { fail("vkAllocateMemory", result); return; }
+        result = vkBindImageMemory(d, image, memory, 0);
+        if (result != VK_SUCCESS) { fail("vkBindImageMemory", result); return; }
+        VkMemoryGetMetalHandleInfoEXT export_query{.sType = VK_STRUCTURE_TYPE_MEMORY_GET_METAL_HANDLE_INFO_EXT,
+            .memory = memory, .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_MTLHEAP_BIT_EXT};
+        void* handle = nullptr;
+        result = vkGetMemoryMetalHandleEXT(d, &export_query, &handle);
+        if (result != VK_SUCCESS || !handle) { fail("vkGetMemoryMetalHandleEXT", result); return; }
+        heap = (__bridge id<MTLHeap>)handle;
+        if (heap.type != MTLHeapTypePlacement) { fail("requires a placement heap"); return; }
+        MTLTextureDescriptor* desc = [MTLTextureDescriptor new];
+        desc.textureType = info.arrayLayers > 1 || (info.usage & VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT) ?
+            MTLTextureType2DArray : MTLTextureType2D;
+        desc.pixelFormat = format;
+        desc.width = info.extent.width; desc.height = info.extent.height;
+        desc.depth = 1; desc.mipmapLevelCount = info.mipLevels; desc.arrayLength = info.arrayLayers;
+        desc.storageMode = heap.storageMode; desc.cpuCacheMode = heap.cpuCacheMode;
+        desc.hazardTrackingMode = heap.hazardTrackingMode;
+        desc.usage = MTLTextureUsageUnknown;
+        // Match KosmicKrisp's color image descriptor, including compression eligibility.
+        desc.allowGPUOptimizedContents = !(info.usage & VK_IMAGE_USAGE_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT);
+        if (info.usage & (VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT))
+            desc.usage |= MTLTextureUsageShaderRead;
+        if (info.usage & (VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_STORAGE_BIT)) desc.usage |= MTLTextureUsageShaderWrite;
+        if (info.usage & (VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT)) desc.usage |= MTLTextureUsageRenderTarget;
+        if (info.flags & VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT) desc.usage |= MTLTextureUsagePixelFormatView;
+        const auto layout = [heap.device heapTextureSizeAndAlignWithDescriptor:desc];
+        if (!layout.size || layout.size > req.size || layout.size > heap.size || layout.align > req.alignment)
+            { fail("Metal/Vulkan texture layout requirements differ"); return; }
+        metal = [heap newTextureWithDescriptor:desc offset:0];
+        if (!metal) { fail("newTextureWithDescriptor:offset:", VK_ERROR_OUT_OF_DEVICE_MEMORY); return; }
+        size = req.size;
+    }
+    ~Impl() {
+        metal = nil;
+        if (image) destroy(device, image, nullptr);
+        if (memory) free(device, memory, nullptr);
+        heap = nil;
+    }
+};
+SharedImage::SharedImage(VkInstance instance, VkPhysicalDevice physical, VkDevice device,
+                         const VkImageCreateInfo& info, PFN_vkGetInstanceProcAddr ip, PFN_vkGetDeviceProcAddr dp)
+    : impl(std::make_unique<Impl>(instance, physical, device, info, ip, dp)) {}
+SharedImage::~SharedImage() = default;
+VkImage SharedImage::Handle() const { return impl->metal ? impl->image : VK_NULL_HANDLE; }
+void* SharedImage::NativeHandle() const { return (__bridge void*)impl->metal; }
+uint64_t SharedImage::SizeBytes() const { return impl->size; }
+
+bool CopyImages(void* source, void* destination, std::span<const VkImageCopy> copies) {
+    @autoreleasepool {
+        id<MTLTexture> src = (__bridge id<MTLTexture>)source, dst = (__bridge id<MTLTexture>)destination;
+        const auto is_2d = [](id<MTLTexture> t) { return t.textureType == MTLTextureType2D || t.textureType == MTLTextureType2DArray; };
+        if (!src || !dst || src == dst || src.device != dst.device || src.pixelFormat != dst.pixelFormat ||
+            !is_2d(src) || !is_2d(dst) || src.sampleCount != 1 || dst.sampleCount != 1 || copies.empty()) return false;
+        const auto valid = [](id<MTLTexture> t, const VkImageSubresourceLayers& sub, const VkOffset3D& o, const VkExtent3D& e) {
+            if (sub.aspectMask != VK_IMAGE_ASPECT_COLOR_BIT || sub.mipLevel >= t.mipmapLevelCount || !sub.layerCount ||
+                sub.baseArrayLayer >= t.arrayLength || sub.layerCount > t.arrayLength - sub.baseArrayLayer ||
+                o.x < 0 || o.y < 0 || o.z || !e.width || !e.height || e.depth != 1) return false;
+            const auto width = std::max<NSUInteger>(t.width >> sub.mipLevel, 1);
+            const auto height = std::max<NSUInteger>(t.height >> sub.mipLevel, 1);
+            return NSUInteger(o.x) < width && e.width <= width - o.x && NSUInteger(o.y) < height && e.height <= height - o.y;
+        };
+        for (size_t i = 0; i < copies.size(); ++i) {
+            const auto& c = copies[i];
+            if (c.srcSubresource.layerCount != c.dstSubresource.layerCount ||
+                !valid(src, c.srcSubresource, c.srcOffset, c.extent) || !valid(dst, c.dstSubresource, c.dstOffset, c.extent)) return false;
+            for (size_t j = 0; j < i; ++j) {
+                const auto& p = copies[j];
+                if (c.dstSubresource.mipLevel == p.dstSubresource.mipLevel &&
+                    c.dstSubresource.baseArrayLayer < p.dstSubresource.baseArrayLayer + p.dstSubresource.layerCount &&
+                    p.dstSubresource.baseArrayLayer < c.dstSubresource.baseArrayLayer + c.dstSubresource.layerCount &&
+                    uint64_t(c.dstOffset.x) < uint64_t(p.dstOffset.x) + p.extent.width &&
+                    uint64_t(p.dstOffset.x) < uint64_t(c.dstOffset.x) + c.extent.width &&
+                    uint64_t(c.dstOffset.y) < uint64_t(p.dstOffset.y) + p.extent.height &&
+                    uint64_t(p.dstOffset.y) < uint64_t(c.dstOffset.y) + c.extent.height) return false;
+            }
         }
-        return true;
+        return RunBlit(src.device, [&](id<MTLBlitCommandEncoder> encoder) {
+            for (const auto& c : copies)
+                for (uint32_t layer = 0; layer < c.srcSubresource.layerCount; ++layer)
+                    [encoder copyFromTexture:src sourceSlice:c.srcSubresource.baseArrayLayer + layer
+                        sourceLevel:c.srcSubresource.mipLevel sourceOrigin:MTLOriginMake(c.srcOffset.x, c.srcOffset.y, 0)
+                        sourceSize:MTLSizeMake(c.extent.width, c.extent.height, 1) toTexture:dst
+                        destinationSlice:c.dstSubresource.baseArrayLayer + layer destinationLevel:c.dstSubresource.mipLevel
+                        destinationOrigin:MTLOriginMake(c.dstOffset.x, c.dstOffset.y, 0)];
+        });
     }
 }
 
@@ -238,9 +426,8 @@ bool CheckCompute(std::span<const ComputeBuffer> buffers, std::span<const uint8_
 struct Presentation::Impl {
     struct Texture {
         VkImage image{};
-        VkDeviceMemory memory{};
+        std::unique_ptr<SharedImage> shared;
         id<MTLTexture> metal;
-        id<MTLHeap> heap;
     };
     struct Slot {
         Images images;
@@ -248,22 +435,15 @@ struct Presentation::Impl {
         id<MTLFXSpatialScaler> scaler;
         id<MTLTexture> scaled;
     };
+    VkInstance instance;
     VkPhysicalDevice physical;
     VkDevice device;
-    VkPhysicalDeviceMemoryProperties memory_props{};
-    PFN_vkGetPhysicalDeviceImageFormatProperties2 format_props;
-    PFN_vkCreateImage create_image;
-    PFN_vkDestroyImage destroy_image;
-    PFN_vkGetImageMemoryRequirements memory_requirements;
-    PFN_vkAllocateMemory allocate_memory;
-    PFN_vkFreeMemory free_memory;
-    PFN_vkBindImageMemory bind_memory;
-    PFN_vkGetMemoryMetalHandleEXT export_texture;
+    PFN_vkGetInstanceProcAddr instance_proc;
+    PFN_vkGetDeviceProcAddr device_proc;
     id<MTLCommandQueue> queue;
     CAMetalLayer* layer;
     id<MTLRenderPipelineState> present_pipeline;
     VkFormat format{VK_FORMAT_R8G8B8A8_UNORM};
-    MTLPixelFormat metal_format{MTLPixelFormatRGBA8Unorm};
     const char* format_name{"RGBA8"};
     // Frame IDs are u8. Fixed slots allow draw/present threads to access distinct frames;
     // the existing per-frame fence protects each slot's textures.
@@ -272,39 +452,25 @@ struct Presentation::Impl {
     bool announced = false, completed = false;
     bool spatial = true, presented = false;
 
-    Impl(VkInstance instance, VkPhysicalDevice p, VkDevice d,
-         PFN_vkGetInstanceProcAddr ip, PFN_vkGetDeviceProcAddr dp) : physical(p), device(d) {
+    Impl(VkInstance i, VkPhysicalDevice p, VkDevice d,
+         PFN_vkGetInstanceProcAddr ip, PFN_vkGetDeviceProcAddr dp)
+        : instance(i), physical(p), device(d), instance_proc(ip), device_proc(dp) {
         if (const char* choice = std::getenv("BB_METALFX_FORMAT")) {
             if (std::strcmp(choice, "rgba16f") == 0) {
                 format = VK_FORMAT_R16G16B16A16_SFLOAT;
-                metal_format = MTLPixelFormatRGBA16Float; format_name = "RGBA16F";
+                format_name = "RGBA16F";
             } else if (std::strcmp(choice, "rgba8") != 0) {
                 std::fprintf(stderr, "MetalFX: unknown scratch format '%s'; using RGBA8.\n", choice);
             }
         }
-#define DEVICE_PROC(member, name) member = reinterpret_cast<PFN_##name>(dp(d, #name))
-        DEVICE_PROC(create_image, vkCreateImage);
-        DEVICE_PROC(destroy_image, vkDestroyImage);
-        DEVICE_PROC(memory_requirements, vkGetImageMemoryRequirements);
-        DEVICE_PROC(allocate_memory, vkAllocateMemory);
-        DEVICE_PROC(free_memory, vkFreeMemory);
-        DEVICE_PROC(bind_memory, vkBindImageMemory);
-        DEVICE_PROC(export_texture, vkGetMemoryMetalHandleEXT);
-#undef DEVICE_PROC
-        format_props = reinterpret_cast<PFN_vkGetPhysicalDeviceImageFormatProperties2>(
-            ip(instance, "vkGetPhysicalDeviceImageFormatProperties2"));
-        auto get_memory = reinterpret_cast<PFN_vkGetPhysicalDeviceMemoryProperties>(
-            ip(instance, "vkGetPhysicalDeviceMemoryProperties"));
-        available = create_image && destroy_image && memory_requirements && allocate_memory &&
-                    free_memory && bind_memory && export_texture && format_props && get_memory;
-        if (available) get_memory(p, &memory_props);
+        available = dp(d, "vkGetMemoryMetalHandleEXT") &&
+                    ip(i, "vkGetPhysicalDeviceImageFormatProperties2") &&
+                    ip(i, "vkGetPhysicalDeviceMemoryProperties");
     }
     void Release(Texture& t) {
         t.metal = nil;
-        if (t.image) destroy_image(device, t.image, nullptr);
-        if (t.memory) free_memory(device, t.memory, nullptr);
-        t.heap = nil;
-        t.image = {}; t.memory = {};
+        t.shared.reset();
+        t.image = {};
     }
     void Release(Slot& s) {
         s.scaler = nil; s.scaled = nil;
@@ -314,89 +480,18 @@ struct Presentation::Impl {
     ~Impl() { for (auto& slot : slots) Release(slot); }
 
     bool Allocate(Texture& t, uint32_t width, uint32_t height) {
-        const auto fail = [&](const char* stage, VkResult result = VK_SUCCESS) {
-            std::fprintf(stderr, "MetalFX allocation failed: %s %ux%u; %s (VkResult=%d).\n",
-                         format_name, width, height, stage, int(result));
-            return false;
-        };
-        // The presenter stores SDR pixels in an UNORM frame after its sRGB encode.
-        // Preserve that encoding in the scratch texture and use MetalFX perceptual processing.
-        constexpr VkImageUsageFlags usage = VK_IMAGE_USAGE_SAMPLED_BIT |
-            VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
-            VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
-        VkPhysicalDeviceExternalImageFormatInfo external_query{
-            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_IMAGE_FORMAT_INFO,
-            .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_MTLHEAP_BIT_EXT};
-        VkPhysicalDeviceImageFormatInfo2 query{
-            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_FORMAT_INFO_2,
-            .pNext = &external_query, .format = format,
-            .type = VK_IMAGE_TYPE_2D, .tiling = VK_IMAGE_TILING_OPTIMAL, .usage = usage};
-        VkExternalImageFormatProperties external_props{
-            .sType = VK_STRUCTURE_TYPE_EXTERNAL_IMAGE_FORMAT_PROPERTIES};
-        VkImageFormatProperties2 props{.sType = VK_STRUCTURE_TYPE_IMAGE_FORMAT_PROPERTIES_2,
-                                      .pNext = &external_props};
-        VkResult result = format_props(physical, &query, &props);
-        if (result != VK_SUCCESS) return fail("external image format query", result);
-        if (!(external_props.externalMemoryProperties.externalMemoryFeatures &
-              VK_EXTERNAL_MEMORY_FEATURE_EXPORTABLE_BIT)) return fail("image memory is not exportable");
-        if (width > props.imageFormatProperties.maxExtent.width ||
-            height > props.imageFormatProperties.maxExtent.height) return fail("image exceeds format limits");
-        VkExternalMemoryImageCreateInfo external_image{
-            .sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO,
-            .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_MTLHEAP_BIT_EXT};
-        VkImageCreateInfo image_info{.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
-            .pNext = &external_image, .imageType = VK_IMAGE_TYPE_2D,
-            .format = format, .extent = {width, height, 1},
+        // SDR pixels already carry the presenter's sRGB encode.
+        VkImageCreateInfo info{.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+            .imageType = VK_IMAGE_TYPE_2D, .format = format, .extent = {width, height, 1},
             .mipLevels = 1, .arrayLayers = 1, .samples = VK_SAMPLE_COUNT_1_BIT,
-            .tiling = VK_IMAGE_TILING_OPTIMAL, .usage = usage,
+            .tiling = VK_IMAGE_TILING_OPTIMAL, .usage = VK_IMAGE_USAGE_SAMPLED_BIT |
+                VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+                VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
             .sharingMode = VK_SHARING_MODE_EXCLUSIVE, .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED};
-        result = create_image(device, &image_info, nullptr, &t.image);
-        if (result != VK_SUCCESS) return fail("vkCreateImage", result);
-        VkMemoryRequirements req{};
-        memory_requirements(device, t.image, &req);
-        uint32_t type = memory_props.memoryTypeCount;
-        for (uint32_t i = 0; i < memory_props.memoryTypeCount; ++i) {
-            if ((req.memoryTypeBits & (1u << i)) &&
-                (memory_props.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) {
-                type = i; break;
-            }
-        }
-        if (type == memory_props.memoryTypeCount) return fail("no device-local memory type");
-        VkExportMemoryAllocateInfo export_info{.sType = VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO,
-            .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_MTLHEAP_BIT_EXT};
-        VkMemoryDedicatedAllocateInfo dedicated{.sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO,
-            .pNext = &export_info, .image = t.image};
-        VkMemoryAllocateInfo alloc{.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
-            .pNext = &dedicated, .allocationSize = req.size, .memoryTypeIndex = type};
-        result = allocate_memory(device, &alloc, nullptr, &t.memory);
-        if (result != VK_SUCCESS) return fail("vkAllocateMemory", result);
-        result = bind_memory(device, t.image, t.memory, 0);
-        if (result != VK_SUCCESS) return fail("vkBindImageMemory", result);
-        VkMemoryGetMetalHandleInfoEXT export_query{.sType = VK_STRUCTURE_TYPE_MEMORY_GET_METAL_HANDLE_INFO_EXT,
-            .memory = t.memory, .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_MTLHEAP_BIT_EXT};
-        void* handle = nullptr;
-        result = export_texture(device, &export_query, &handle);
-        if (result != VK_SUCCESS || !handle) return fail("vkGetMemoryMetalHandleEXT", result);
-        // Borrowed export: retain the heap until both APIs finish using it.
-        t.heap = (__bridge id<MTLHeap>)handle;
-        if (t.heap.type != MTLHeapTypePlacement) return fail("requires a placement heap");
-        MTLTextureDescriptor* desc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:
-            metal_format width:width height:height mipmapped:NO];
-        desc.storageMode = t.heap.storageMode;
-        desc.cpuCacheMode = t.heap.cpuCacheMode;
-        desc.hazardTrackingMode = t.heap.hazardTrackingMode;
-        desc.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite | MTLTextureUsageRenderTarget;
-        const MTLSizeAndAlign size = [t.heap.device heapTextureSizeAndAlignWithDescriptor:desc];
-        if (!size.size || size.size > req.size || size.size > t.heap.size ||
-            size.align > req.alignment) {
-            std::fprintf(stderr, "MetalFX layout: Metal size/alignment=%lu/%lu; Vulkan=%llu/%llu; heap=%lu.\n",
-                (unsigned long)size.size, (unsigned long)size.align,
-                (unsigned long long)req.size, (unsigned long long)req.alignment,
-                (unsigned long)t.heap.size);
-            return fail("Metal/Vulkan texture layout requirements differ");
-        }
-        t.metal = [t.heap newTextureWithDescriptor:desc offset:0];
-        return t.metal != nil || fail("newTextureWithDescriptor:offset:");
+        t.shared = std::make_unique<SharedImage>(instance, physical, device, info, instance_proc, device_proc);
+        t.image = t.shared->Handle();
+        t.metal = (__bridge id<MTLTexture>)t.shared->NativeHandle();
+        return t.image != VK_NULL_HANDLE;
     }
     void Disable(const char* why) {
         available = false;

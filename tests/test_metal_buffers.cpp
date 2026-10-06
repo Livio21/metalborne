@@ -10,11 +10,15 @@
 #include "video_core/renderer_vulkan/vk_runtime.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/texture_cache/blit_helper.h"
+#include "video_core/texture_cache/image.h"
+#include <vulkan/vulkan_format_traits.hpp>
 
 int main(int argc, char** argv) {
     const bool native = argc == 1 || std::strcmp(argv[1], "--vulkan");
     setenv("BB_METAL_BUFFER_CACHE", native ? "1" : "0", 1);
     setenv("BB_METAL_BUFFER_COPY", native ? "1" : "0", 1);
+    setenv("BB_METAL_IMAGE_CACHE", native ? "1" : "0", 1);
+    setenv("BB_METAL_IMAGE_COPY", native ? "1" : "0", 1);
     unsetenv("BB_VK_RECORD_THREAD");
     Vulkan::Instance instance(0, false);
     const bool threaded = argc > 1 && !std::strcmp(argv[1], "--threaded");
@@ -109,6 +113,102 @@ int main(int argc, char** argv) {
         for (size_t i = 0; i < 4096; ++i)
             assert(readback.mapped_data[i] == (i >= 128 && i < 143 ? 0x3c : 0xa5));
     }
+    Common::SlotVector<VideoCore::ImageView> views;
+    for (const auto format : {vk::Format::eR8Unorm, vk::Format::eR8G8Unorm,
+            vk::Format::eR8G8B8A8Unorm, vk::Format::eR8G8B8A8Srgb,
+            vk::Format::eB8G8R8A8Unorm, vk::Format::eB8G8R8A8Srgb,
+            vk::Format::eR16Sfloat, vk::Format::eR16G16Sfloat, vk::Format::eR16G16B16A16Sfloat}) {
+        VideoCore::ImageInfo info{};
+        info.type = AmdGpu::ImageType::Color2DArray;
+        info.pixel_format = format;
+        info.size = {32, 16, 1};
+        info.resources = {.levels = 3, .layers = 2};
+        VideoCore::Image small(instance, runtime, views, info);
+        info.size = {64, 32, 1};
+        VideoCore::Image large(instance, runtime, views, info);
+        assert(bool(small.backing->image.metal) == native && bool(large.backing->image.metal) == native);
+        const auto image_handle = small.GetImage();
+        const auto image_size = small.GetHostImageSize();
+        VideoCore::UniqueImage moved(std::move(small.backing->image));
+        assert(!small.GetImage() && moved.image == image_handle && moved.size_bytes == image_size);
+        small.backing->image = std::move(moved);
+        assert(!moved.image && small.GetImage() == image_handle && small.GetHostImageSize() == image_size);
+        const auto bytes = vk::blockSize(format);
+        std::vector<vk::BufferImageCopy> small_regions, large_regions;
+        uint64_t small_size = 0, large_size = 0;
+        for (uint32_t mip = 0; mip < 3; ++mip) {
+            small_regions.push_back({.bufferOffset = small_size,
+                .imageSubresource = {vk::ImageAspectFlagBits::eColor, mip, 0, 2}, .imageExtent = {32u >> mip, 16u >> mip, 1}});
+            large_regions.push_back({.bufferOffset = large_size,
+                .imageSubresource = {vk::ImageAspectFlagBits::eColor, mip, 0, 2}, .imageExtent = {64u >> mip, 32u >> mip, 1}});
+            small_size += (32u >> mip) * (16u >> mip) * bytes * 2;
+            large_size += (64u >> mip) * (32u >> mip) * bytes * 2;
+        }
+        Buffer upload(instance, 0, small_size + large_size, MemoryType::HostUncached);
+        Buffer pixels(instance, 0, large_size, MemoryType::HostCached);
+        for (size_t i = 0; i < small_size; ++i) upload.mapped_data[i] = (i * 37 + 11) & 255;
+        std::memset(upload.mapped_data.data() + small_size, 0xa5, large_size);
+        upload.Flush(0, upload.SizeBytes());
+        for (auto& region : large_regions) region.bufferOffset += small_size;
+        runtime.UploadImage(&small, &upload, small_regions);
+        runtime.UploadImage(&large, &upload, large_regions);
+        VideoCore::StreamBuffer held(instance, scheduler, MemoryType::HostUncached, 4096);
+        assert(held.Reserve(4096));
+        bool image_retired = false;
+        scheduler.DeferOperation([&] { image_retired = true; });
+        const auto image_tick = scheduler.CurrentTick();
+        if (native) {
+            const VkImageCopy valid{{VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {},
+                {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {}, {8, 8, 1}};
+            auto invalid = valid;
+            invalid.dstOffset.x = 64;
+            auto* src = small.backing->image.metal->NativeHandle();
+            auto* dst = large.backing->image.metal->NativeHandle();
+            assert(!BbMetalFX::CopyImages(src, src, {&valid, 1}));
+            assert(!BbMetalFX::CopyImages(src, dst, {&invalid, 1}));
+            const VkImageCopy overlap[]{valid, valid};
+            assert(!BbMetalFX::CopyImages(src, dst, overlap));
+        }
+        runtime.CopyImage(&small, &large);
+        assert(scheduler.CurrentTick() == image_tick && !image_retired && !held.Reserve(4096, 0, false));
+        for (auto& region : large_regions) region.bufferOffset -= small_size;
+        runtime.DownloadImage(&large, &pixels, large_regions);
+        scheduler.Finish();
+        scheduler.PopPendingOperations();
+        assert(image_retired);
+        pixels.Invalidate(0, pixels.SizeBytes());
+        std::vector<uint8_t> expected_pixels(large_size, 0xa5);
+        for (uint32_t mip = 0; mip < 3; ++mip)
+            for (uint32_t layer = 0; layer < 2; ++layer)
+                for (uint32_t y = 0; y < (16u >> mip); ++y) {
+                    const auto from = small_regions[mip].bufferOffset + (layer * (16u >> mip) + y) * (32u >> mip) * bytes;
+                    const auto to = large_regions[mip].bufferOffset + (layer * (32u >> mip) + y) * (64u >> mip) * bytes;
+                    std::memcpy(expected_pixels.data() + to, upload.mapped_data.data() + from, (32u >> mip) * bytes);
+                }
+        assert(std::memcmp(expected_pixels.data(), pixels.mapped_data.data(), large_size) == 0);
+        if (format == vk::Format::eR8G8B8A8Unorm) {
+            // Both images are shared, but Metal rejects a different pixel format.
+            // The Vulkan bitwise-copy fallback must reacquire the right layouts.
+            info.pixel_format = vk::Format::eR8G8B8A8Srgb;
+            VideoCore::Image other_format(instance, runtime, views, info);
+            assert(bool(other_format.backing->image.metal) == native);
+            auto initialized = large_regions;
+            for (auto& region : initialized) region.bufferOffset += small_size;
+            runtime.UploadImage(&other_format, &upload, initialized);
+            runtime.CopyImage(&small, &other_format);
+            runtime.DownloadImage(&other_format, &pixels, large_regions);
+            scheduler.Finish();
+            pixels.Invalidate(0, pixels.SizeBytes());
+            assert(std::memcmp(expected_pixels.data(), pixels.mapped_data.data(), large_size) == 0);
+        }
+    }
+    VideoCore::ImageInfo depth_info{};
+    depth_info.type = AmdGpu::ImageType::Color2D;
+    depth_info.pixel_format = vk::Format::eD32Sfloat;
+    depth_info.props.is_depth = 1;
+    VideoCore::Image depth(instance, runtime, views, depth_info);
+    assert(depth.GetImage() && !depth.backing->image.metal); // Unsupported format keeps VMA ownership.
+    std::puts("PASS: nine color formats, image moves, three mips/two layers, untouched pixels, preserved staging tick, rejected copies, format-copy and depth fallback");
     std::puts(native ? "PASS: shared cache ownership, BDA, moves, 128 MiB stream, native copies, untouched bytes, preserved staging tick and callbacks" :
                       "PASS: original Vulkan allocation and copy fallback");
 }
