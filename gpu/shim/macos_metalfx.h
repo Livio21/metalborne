@@ -46,6 +46,8 @@ bool CopyBufferImage(void* buffer, void* image, std::span<const VkBufferImageCop
                      bool upload);
 // Same ownership contract; clears complete mip/layer subresources through render passes.
 bool ClearImage(void* image, const VkImageSubresourceRange& range, const VkClearColorValue& color);
+// SDR host frame conversion; base mip/layer only, alpha forced to one like the Vulkan view.
+bool PostProcess(void* source, VkFormat view_format, void* destination, float gamma, bool srgb_input);
 // One-shot shadow dispatch: clones buffers and leaves the live Vulkan resources untouched.
 bool CheckCompute(std::span<const ComputeBuffer> buffers, std::span<const uint8_t> push,
                   uint32_t groups, uint32_t threads);
@@ -71,7 +73,8 @@ public:
                     uint32_t output_width, uint32_t output_height);
     // Caller releases external ownership and waits for Vulkan before entering.
     // Returns only after Metal completes; never copies texture pixels to the CPU.
-    bool Encode(uint32_t slot, uint32_t window_width = 0, uint32_t window_height = 0);
+    bool Encode(uint32_t slot, uint32_t window_width = 0, uint32_t window_height = 0,
+                VkFormat post_format = VK_FORMAT_UNDEFINED, float gamma = 1.0f);
 private:
     struct Impl;
     std::unique_ptr<Impl> impl;

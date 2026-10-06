@@ -42,7 +42,10 @@ struct Frame {
     u64 ready_tick;
     bool is_hdr{false};
     u8 id{};
-
+#ifdef __APPLE__
+    vk::Format native_post_format{}; // Encoded snapshot; converted on the presentation thread.
+    float native_post_gamma{1.0f};
+#endif
 
 };
 
@@ -119,7 +122,8 @@ private:
     vk::Image last_metalfx_image{};
     u32 last_metalfx_width{}, last_metalfx_height{};
 #endif
-    Frame* GetRenderFrame();
+    Frame* GetRenderFrame(u32 width = 0, u32 height = 0);
+    Frame* FinishPrepareFrame(Frame* frame);
 
     void RecreateFrame(Frame* frame, u32 width, u32 height);
 

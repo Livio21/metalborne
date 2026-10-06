@@ -378,7 +378,70 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
         texture_cache.UpdateImage(image_id);
     }
 
+#ifdef __APPLE__
+    // The display override already contains the full-resolution HUD. Preserve it
+    // instead of reducing the composite to the scene size before presenting.
+    const bool full_ui = upscaled && metalfx && metalfx->NativePresentation();
+    Frame* frame = GetRenderFrame(full_ui ? display.width : 0, full_ui ? display.height : 0);
+#else
     Frame* frame = GetRenderFrame();
+#endif
+
+#ifdef __APPLE__
+    frame->native_post_format = vk::Format::eUndefined;
+    static const bool native_post = EmulatorSettingsImpl::Flag("BB_METAL_POST_PROCESS", false);
+    const auto rgba8 = [](vk::Format format) {
+        return format == vk::Format::eR8G8B8A8Unorm || format == vk::Format::eR8G8B8A8Srgb ||
+               format == vk::Format::eB8G8R8A8Unorm || format == vk::Format::eB8G8R8A8Srgb;
+    };
+    const vk::Image source = upscaled ? display.image : texture_cache.GetImage(image_id).GetImage();
+    const auto source_format = upscaled ? display.format : texture_cache.GetImage(image_id).info.pixel_format;
+    const auto width = upscaled ? display.width : texture_cache.GetImage(image_id).info.size.width;
+    const auto height = upscaled ? display.height : texture_cache.GetImage(image_id).info.size.height;
+    if (native_post && !fsr_settings.enable && !frame->is_hdr && !pp_settings.hdr &&
+        frame->external_image && metalfx && metalfx->NativePresentation() &&
+        rgba8(source_format) && rgba8(frame_format) && rgba8(GetFrameViewFormat(attribute.attrib.pixel_format)) &&
+        width == frame->width && height == frame->height &&
+        std::isfinite(pp_settings.gamma) && pp_settings.gamma > 0 && pp_settings.gamma < 3.4f) {
+        // Snapshot encoded bytes into the fence-protected frame without waiting on the
+        // game command thread. Metal converts this snapshot on the presentation thread.
+        draw_scheduler.EndRendering();
+        if (!upscaled) {
+            runtime.Transit(&texture_cache.GetImage(image_id), vk::ImageLayout::eGeneral,
+                            vk::PipelineStageFlagBits2::eCopy, vk::AccessFlagBits2::eTransferRead);
+            runtime.FlushBarriers();
+        }
+        const auto command = draw_scheduler.CommandBuffer();
+        const vk::ImageSubresourceRange range{vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
+        const std::array barriers{
+            vk::ImageMemoryBarrier2{
+                .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+                .srcAccessMask = vk::AccessFlagBits2::eMemoryWrite,
+                .dstStageMask = vk::PipelineStageFlagBits2::eCopy,
+                .dstAccessMask = vk::AccessFlagBits2::eTransferRead,
+                .oldLayout = vk::ImageLayout::eGeneral, .newLayout = vk::ImageLayout::eGeneral,
+                .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                .image = source, .subresourceRange = range},
+            vk::ImageMemoryBarrier2{
+                .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+                .srcAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
+                .dstStageMask = vk::PipelineStageFlagBits2::eCopy,
+                .dstAccessMask = vk::AccessFlagBits2::eTransferWrite,
+                .oldLayout = vk::ImageLayout::eUndefined, .newLayout = vk::ImageLayout::eGeneral,
+                .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                .image = frame->image, .subresourceRange = range}};
+        command.pipelineBarrier2({.imageMemoryBarrierCount = barriers.size(), .pImageMemoryBarriers = barriers.data()});
+        const vk::ImageCopy region{
+            .srcSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
+            .dstSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1}, .extent = {width, height, 1}};
+        command.copyImage(source, vk::ImageLayout::eGeneral, frame->image, vk::ImageLayout::eGeneral, region);
+        frame->native_post_format = GetFrameViewFormat(attribute.attrib.pixel_format);
+        frame->native_post_gamma = pp_settings.gamma;
+        expected_ratio = float(width) / height;
+        return FinishPrepareFrame(frame);
+    }
+
+#endif
 
     const auto frame_subresources = vk::ImageSubresourceRange{
         .aspectMask = vk::ImageAspectFlagBits::eColor,
@@ -458,6 +521,10 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
 
 
 
+    return FinishPrepareFrame(frame);
+}
+
+Frame* Presenter::FinishPrepareFrame(Frame* frame) {
     // Flush frame creation commands.
     frame->ready_semaphore = draw_scheduler.GetWorkSemaphore()->Handle();
     frame->ready_tick = draw_scheduler.CurrentTick();
@@ -493,6 +560,9 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
 Frame* Presenter::PrepareBlankFrame(bool present_thread) {
     // Request a free presentation frame.
     Frame* frame = GetRenderFrame();
+#ifdef __APPLE__
+    frame->native_post_format = vk::Format::eUndefined;
+#endif
 
     auto& scheduler = present_thread ? present_scheduler : draw_scheduler;
     scheduler.EndRendering();
@@ -661,7 +731,8 @@ void Presenter::ApplyMetalFX(Frame* frame, vk::Image& source, u32& width, u32& h
     // APIs' ownership and completion explicit until GPU-side synchronization is available.
     scheduler.Wait(tick);
     const auto copied = std::chrono::steady_clock::now();
-    const bool success = metalfx->Encode(frame->id, native ? target_width : 0, native ? target_height : 0);
+    const bool success = metalfx->Encode(frame->id, native ? target_width : 0, native ? target_height : 0,
+        static_cast<VkFormat>(frame->native_post_format), frame->native_post_gamma);
     const auto scaled = std::chrono::steady_clock::now();
     const std::array acquire{
         vk::ImageMemoryBarrier{
@@ -698,7 +769,8 @@ void Presenter::ApplyMetalFX(Frame* frame, vk::Image& source, u32& width, u32& h
             std::printf("%s bridge: %u frames; Vulkan %s/completion %.2f ms/frame; "
                         "Metal encode/completion %.2f ms/frame (CPU wall time)\n",
                         native ? "Native Metal" : "MetalFX", count,
-                        direct ? "render (no input copy)" : "copy", copy_ms / count, scale_ms / count);
+                        direct ? (frame->native_post_format != vk::Format::eUndefined
+                            ? "snapshot" : "render (no input copy)") : "copy", copy_ms / count, scale_ms / count);
             count = 0; copy_ms = scale_ms = 0; window = scaled;
         }
     }
@@ -721,11 +793,14 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
     };
 
 #ifdef __APPLE__
-    if (metalfx && metalfx->NativePresentation() && !frame->is_hdr) {
+    if (metalfx && !frame->is_hdr &&
+        (metalfx->NativePresentation() || frame->native_post_format != vk::Format::eUndefined)) {
         vk::Image source = frame->image;
         u32 width = frame->width, height = frame->height;
-        ApplyMetalFX(frame, source, width, height);
-        if (metalfx->NativePresentation()) {
+        if (metalfx->NativePresentation()) ApplyMetalFX(frame, source, width, height);
+        if (metalfx->NativePresentation() || frame->native_post_format != vk::Format::eUndefined) {
+            // If raw-frame conversion failed, retire this frame and let the next frame use
+            // the Vulkan post-process. Never present its unconverted bytes on fallback.
             // Metal has finished reading the exported input. Signal the existing frame
             // fence after its Vulkan ownership acquire, before allowing frame reuse.
             Check(instance.GetDevice().resetFences(frame->present_done));
@@ -922,7 +997,7 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
     }
 }
 
-Frame* Presenter::GetRenderFrame() {
+Frame* Presenter::GetRenderFrame(u32 width, u32 height) {
     // Wait for free presentation frames
     Frame* frame;
     {
@@ -953,9 +1028,13 @@ Frame* Presenter::GetRenderFrame() {
         }
     }
 
-    if (frame->width != expected_frame_width || frame->height != expected_frame_height ||
+    if (!width || !height) {
+        width = expected_frame_width;
+        height = expected_frame_height;
+    }
+    if (frame->width != width || frame->height != height ||
         frame->is_hdr != swapchain.GetHDR()) {
-        RecreateFrame(frame, expected_frame_width, expected_frame_height);
+        RecreateFrame(frame, width, height);
     }
 
     return frame;

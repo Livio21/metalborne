@@ -6,7 +6,8 @@
 Metalborne keeps bbport's game-specific runtime and GPU translation, adapting
 its x86-64 executable to macOS and running the game through Rosetta 2. Its
 renderer translates PS4 graphics through Vulkan/KosmicKrisp, with experimental
-native Metal presentation and MetalFX spatial upscaling available separately.
+native Metal host post-processing, presentation and MetalFX spatial upscaling
+available separately.
 A complete native Metal graphics backend and ARM64 game translation remain
 research directions.
 
@@ -47,7 +48,8 @@ under the ignored `out/` directory.
   default, with Vulkan fallback when interop requirements fail. No temporal
   MetalFX or frame generation is implemented.
 - [Native Metal presentation](docs/MACOS_NATIVE_METAL.md), selected with
-  `BB_PRESENT_BACKEND=metal`, including the settings overlay and optional MetalFX.
+  `BB_PRESENT_BACKEND=metal`, including the settings overlay, full-resolution HUD
+  handoff, optional native SDR post-processing and MetalFX.
 - [GPU optimization and native Metal research](docs/MACOS_GPU_RESEARCH.md).
 
 Report macOS fork issues in [Metalborne's issue tracker](https://github.com/Livio21/metalborne/issues).

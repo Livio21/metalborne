@@ -14,6 +14,8 @@ namespace Vulkan::HostPasses {
 
 class PostProcessingPass {
 public:
+    PostProcessingPass();
+    ~PostProcessingPass();
     struct Settings {
         float gamma = 1.0f;
         u32 hdr = 0;

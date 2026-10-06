@@ -5,8 +5,9 @@ with visual issues, direct game optimization candidates and their evidence.
 
 Updated 2026-10-06. This is the first native Metal presentation stage of the
 renderer transition. The game and host CPU code still run under Rosetta;
-PS4 draw/compute commands, shader recompilation and host
-post-processing still use bbport's Vulkan renderer through KosmicKrisp.
+PS4 draw/compute commands and shader recompilation still use bbport's Vulkan
+renderer through KosmicKrisp. Host SDR post-processing now has an opt-in native
+Metal graphics pipeline; unsupported inputs retain the Vulkan pass.
 Ordinary buffer storage/copies and selected color textures/copies/transfers now have
 opt-in native Metal paths
 described below; sparse guest arenas retain Vulkan ownership.
@@ -32,13 +33,17 @@ and retains the unpatched game's 30 FPS timing. Menus can still run at 60 FPS.
 
 ## GPU path and lifetime
 
-1. The existing Vulkan host post-process renders at the requested input size
-   directly into the shared placement-heap frame. Its attachment/pipeline format
-   matches the exported texture. There is no intermediate frame-to-input blit.
+1. By default, Vulkan post-processing renders directly into the shared
+   placement-heap frame. With `BB_METAL_POST_PROCESS=1`, supported RGBA8/BGRA8
+   frames instead take an asynchronous, byte-preserving Vulkan image copy into
+   that frame; Metal performs the color conversion on the presentation thread.
+   The native presentation path preserves the display override's composed HUD
+   resolution; ordinary scene frames retain the configured input size.
 2. Vulkan releases the input to external ownership and completes the submission
    before Metal reads it. The exact Metal device comes from the exported heap.
-3. Optional MetalFX writes to a private output texture. A native Metal shader
-   samples that output, or the shared input without MetalFX, directly into a
+3. The optional native host post-process writes to a private color texture.
+   Optional MetalFX writes to a private output texture. A native Metal shader
+   samples that output, the converted color or the shared input directly into a
    `CAMetalLayer` drawable. The render pass clears letterbox bars to black and
    draws the settings overlay before presenting with display sync enabled.
 4. Metal completes before Vulkan reacquires the shared input. The existing
@@ -48,7 +53,7 @@ and retains the unpatched game's 30 FPS timing. Menus can still run at 60 FPS.
    completes and its old Vulkan view is destroyed. On fallback, shared frames
    remain valid Vulkan sources until retirement.
 
-The SDR frame is already sRGB encoded by the Vulkan post-process; the native
+The SDR frame is already sRGB encoded by the host post-process; the native
 pass samples those values into a BGRA8 UNORM drawable. It does not read pixels
 back to CPU memory. Drawable references stay within the per-frame autorelease
 pool. Temporary drawable exhaustion skips the presentation attempt and retries
@@ -56,12 +61,12 @@ on a later frame.
 
 Compared with the hybrid MetalFX path, native presentation omits the private-to-
 shared output blit, shared Vulkan output allocation, and final Vulkan swapchain
-blit. At 720p input and 1080p output, three slots need about 34 MiB of interop
+blit. For a frame that actually has 720p input and 1080p output, three slots need about 34 MiB of interop
 input/private-output pixel storage instead of 58 MiB, excluding alignment,
 MetalFX internals, ordinary game frames and drawable storage. Without MetalFX,
 the shared inputs alone use about 11 MiB. These inputs also serve as ordinary
 post-processing frames, removing a separate frame allocation for every slot.
-No measured speedup is implied.
+The full-resolution UI path uses larger inputs. No measured speedup is implied.
 
 The implementation follows [Apple's drawable/render-pass presentation flow](https://developer.apple.com/documentation/QuartzCore/CAMetalLayer)
 and [Vulkan Metal external-memory interop](https://docs.vulkan.org/features/latest/features/proposals/VK_EXT_external_memory_metal.html).
@@ -85,8 +90,10 @@ assert mode in ('spatial', 'off')
 assert ('first drawable completed successfully' +
         (' with MetalFX spatial.' if mode == 'spatial' else '.')) in log
 assert 'Overlay: native Metal renderer ready' in log
-assert 'post-processing renders directly into shared' in log
-assert 'Vulkan render (no input copy)/completion' in log
+assert ('Vulkan frame input in shared' in log or
+        'post-processing renders directly into shared' in log)
+assert ('Vulkan render (no input copy)/completion' in log or
+        'Vulkan snapshot/completion' in log)
 assert not re.search(r'Native Metal bridge:.*?Vulkan copy/completion', log)
 assert len(re.findall(r'Guest flip stats: [\d.]+ FPS.*? [1-9]\d{2,} draws/frame', log)) >= 3
 assert not re.search(r'Native Metal presentation unavailable|failed assertion|Assertion failed|SIGBUS|SIGSEGV', log)
@@ -142,6 +149,77 @@ run exited with status 0. Five later reporting windows measured 25.6–26.5 FPS
 at roughly 1263–1270 draws/frame, versus roughly 1340 draws/frame in the spatial
 run above. These are different views/workloads and cannot establish the cost of
 MetalFX or a speedup from removing the blit.
+
+## Native host graphics pipeline: 2026-10-06
+
+```bash
+BB_PRESENT_BACKEND=metal BB_METAL_POST_PROCESS=1 BB_METALFX=spatial \
+  BB_RENDER_RES=1280x720 BB_UPSCALER=off BB_FSR1=0 BB_RCAS=0 bash macos/run.sh
+```
+
+The opt-in Metal render pipeline implements the existing host SDR color
+conversion, including sRGB views, RGBA/BGRA interpretation, gamma and opaque
+alpha. PS4 geometry and game shaders still use Vulkan. The live replacement
+accepts equal-size RGBA8/BGRA8 source/frame images with host FSR and HDR off;
+other inputs use the original Vulkan pass. The standalone encoder also checks
+packed 10-bit inputs, which the live snapshot shortcut currently excludes.
+
+Vulkan copies the encoded image bytes asynchronously into the existing,
+fence-protected shared frame. This prevents a later guest write from racing a
+Metal read and lets the game command thread continue. The presentation thread
+uses its existing external-ownership release/completion/acquire contract. Native
+color conversion writes a tracked private texture, followed by optional
+MetalFX and presentation in the same Metal command buffer. There is one Metal
+submission/completion wait for those stages, and no CPU pixel copy. No public
+shared-event bridge is available, so the presentation thread still waits for
+Vulkan and Metal completion.
+
+At 1920x1080 RGBA8, this path adds a roughly 7.9 MiB private color texture per
+slot (23.7 MiB for three slots) and an 8.3 MB GPU snapshot per frame. This is a
+native pipeline transition, not an established optimization. Failed native
+conversion disables native presentation; queued unconverted frames retire
+through their existing fences without being shown, and freshly prepared frames
+use Vulkan post-processing. Runtime failure injection was not performed.
+
+The prior native path reduced the composed 1080p HUD to the 720p scene size,
+then enlarged it again. Frame allocation now preserves the display override's
+1920x1080 size after its fence completes. Spatial MetalFX still scales the
+complete composite for larger drawables; at equal or smaller sizes it is not
+invoked. Scene upscaling before drawing the HUD remains separate work.
+The checked window initially prepared a 1710x961 target. With the preserved
+1920x1080 UI input, gameplay uses native sampling rather than spatial MetalFX;
+the successful MetalFX message refers to the earlier 720p boot frame. Moving
+MetalFX before HUD composition and auditing Retina drawable sizing remain open.
+
+The existing `metal-buffer-test` now compares native output with the original
+Vulkan host pass after byte-preserving Vulkan snapshots. All 144 source-format,
+view, output-format, gamma and explicit-decode combinations passed: 165,888
+bytes compared, 192 one-LSB rounding differences, none larger. Asymmetric
+rows/channels catch orientation and channel errors; alpha is checked separately.
+Direct and threaded recording passed, as did the original Vulkan fallback
+allocation/copy check. Logs: `out/macos-native-metal/post-process-{check,threaded-check,vulkan-check}.log`.
+
+The initial synchronous implementation recorded 18.9 FPS versus a 28.0 FPS
+Vulkan reference in stationary Hunter's Dream, both with nominal pressure.
+Moving conversion to the presentation thread recorded 26.1 FPS. The final
+combined command was visually inspected in the title menu and Hunter's Dream,
+survived window zoom/restore before measurement, and exited normally. Its longer
+warmup run recorded 22.4 FPS, 50.00 ms median intervals and worst-window p99
+100.00 ms. A subsequent Vulkan reference with the same 45-second warmup and
+measurement recorded 28.3 FPS, 33.33 ms medians and worst-window p99 50.02 ms.
+Both recorded nominal pressure and no compilation. The native snapshot/pass
+path still regressed in this comparison; combining Metal submission did not
+establish a speedup. These are sequential sessions, including resize before
+the native measurement; nominal pressure does not establish equal GPU clocks
+or rule out other load. Keep the native option off by default. Stable 30 FPS
+and improved display pacing remain unproven.
+
+Evidence under `out/benchmarks/`: `20261006-204515-506098-native-post-swizzle`,
+`20261006-204806-173874-native-post-vulkan-reference`,
+`20261006-205607-287469-native-post-present-thread`,
+`20261006-210117-534512-native-post-combined`,
+`20261006-210505-198243-combined-vulkan-reference`. Each completed with status 0;
+no shader/pipeline compilation occurred during its measurement windows.
 
 ## Next transition steps
 

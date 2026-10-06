@@ -23,7 +23,8 @@ copied save through Continue.
 
 Defaults match the current experimental setup: PS4 30 FPS game timing, FIFO,
 1280x720 scene, native Metal presentation, spatial MetalFX, shared buffer/image
-caches, native buffer copies, Vulkan image copies/transfers/clears and conservative
+caches, native buffer copies, Vulkan image copies/transfers/clears/host
+post-processing and conservative
 draw preparation. The renderer still uses Vulkan for game draws. Actual output size
 is recorded in `game.log`.
 
@@ -68,6 +69,7 @@ Other examples:
 python3 tools/benchmark_macos.py --seconds 60 --label serial-preload --env BB_PRELOAD_THREADS=1
 python3 tools/benchmark_macos.py --seconds 60 --label vulkan --env BB_PRESENT_BACKEND=vulkan --env BB_METALFX=off
 python3 tools/benchmark_macos.py --seconds 60 --label metal-transfers --env BB_METAL_IMAGE_TRANSFER=1
+python3 tools/benchmark_macos.py --seconds 60 --label metal-host-pass --env BB_METAL_POST_PROCESS=1
 python3 tools/benchmark_macos.py --manual --seconds 30
 python3 tools/benchmark_macos.py --self-check
 ```
@@ -77,6 +79,13 @@ The runtime's existing `BB_PAD_RECORD` / F9 mechanism creates recordings with
 eight values per line: milliseconds, buttons, four stick axes and two triggers.
 The recording must cover the measurement duration. It starts after warmup;
 without a route, all stick axes stay centered for a stationary benchmark.
+
+For the native host pass, inspect `Native Metal post-process` messages in
+`game.log`; an enabled flag alone does not prove supported frames took that
+path. Gameplay should retain the composed UI size, for example
+`1920x1080 -> 1920x1080`. `Vulkan snapshot/completion` includes the asynchronous
+GPU copy of encoded bytes into the shared frame. It is not a CPU pixel readback.
+Resize and overlay checks belong before measurement or in a separate run.
 
 ## Results
 

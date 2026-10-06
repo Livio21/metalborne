@@ -15,6 +15,10 @@
 
 namespace Vulkan::HostPasses {
 
+// Keep Vulkan-Hpp resource construction/destruction beside the library's dispatcher.
+PostProcessingPass::PostProcessingPass() = default;
+PostProcessingPass::~PostProcessingPass() = default;
+
 void PostProcessingPass::Create(vk::Device device, const vk::Format surface_format) {
     boost::container::static_vector<vk::DescriptorSetLayoutBinding, 2> bindings{
         {

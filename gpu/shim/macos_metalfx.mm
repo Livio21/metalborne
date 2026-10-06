@@ -17,6 +17,7 @@
 #include <functional>
 #include <algorithm>
 #include <cmath>
+#include <map>
 
 namespace BbMetalFX {
 struct SharedBuffer::Impl {
@@ -179,6 +180,8 @@ static MTLPixelFormat ImageFormat(VkFormat format) {
     case VK_FORMAT_R16_SFLOAT: return MTLPixelFormatR16Float;
     case VK_FORMAT_R16G16_SFLOAT: return MTLPixelFormatRG16Float;
     case VK_FORMAT_R16G16B16A16_SFLOAT: return MTLPixelFormatRGBA16Float;
+    case VK_FORMAT_A2B10G10R10_UNORM_PACK32: return MTLPixelFormatRGB10A2Unorm;
+    case VK_FORMAT_A2R10G10B10_UNORM_PACK32: return MTLPixelFormatBGR10A2Unorm;
     default: return MTLPixelFormatInvalid;
     }
 }
@@ -304,6 +307,119 @@ SharedImage::~SharedImage() = default;
 VkImage SharedImage::Handle() const { return impl->metal ? impl->image : VK_NULL_HANDLE; }
 void* SharedImage::NativeHandle() const { return (__bridge void*)impl->metal; }
 uint64_t SharedImage::SizeBytes() const { return impl->size; }
+
+static bool PostProcessImpl(void* source, VkFormat view_format, void* destination, float gamma,
+                            bool srgb_input, id<MTLCommandBuffer> supplied = nil) {
+    @autoreleasepool {
+        id<MTLTexture> src = (__bridge id<MTLTexture>)source, dst = (__bridge id<MTLTexture>)destination;
+        auto format = ImageFormat(view_format);
+        const auto valid = [](id<MTLTexture> image) {
+            return image && image.sampleCount == 1 &&
+                (image.textureType == MTLTextureType2D || image.textureType == MTLTextureType2DArray);
+        };
+        if (!valid(src) || !valid(dst) || src == dst || src.device != dst.device ||
+            !(src.usage & MTLTextureUsageShaderRead) || !(dst.usage & MTLTextureUsageRenderTarget) ||
+            format == MTLPixelFormatInvalid || !std::isfinite(gamma) || gamma <= 0 || gamma >= 3.4f)
+            return false;
+        // Vulkan also permits RGBA/BGRA views of the same storage. Metal keeps the storage
+        // format and implements that channel interpretation in the fragment shader.
+        const auto family = [](MTLPixelFormat f) {
+            if (f == MTLPixelFormatRGBA8Unorm_sRGB) return MTLPixelFormatRGBA8Unorm;
+            if (f == MTLPixelFormatBGRA8Unorm_sRGB) return MTLPixelFormatBGRA8Unorm;
+            return f;
+        };
+        bool swap = false;
+        if (family(format) != family(src.pixelFormat)) {
+            const auto a = family(format), b = family(src.pixelFormat);
+            swap = (a == MTLPixelFormatRGBA8Unorm && b == MTLPixelFormatBGRA8Unorm) ||
+                   (a == MTLPixelFormatBGRA8Unorm && b == MTLPixelFormatRGBA8Unorm) ||
+                   (a == MTLPixelFormatRGB10A2Unorm && b == MTLPixelFormatBGR10A2Unorm) ||
+                   (a == MTLPixelFormatBGR10A2Unorm && b == MTLPixelFormatRGB10A2Unorm);
+            if (!swap) return false;
+            const bool srgb = format == MTLPixelFormatRGBA8Unorm_sRGB || format == MTLPixelFormatBGRA8Unorm_sRGB;
+            format = b;
+            if (srgb) format = b == MTLPixelFormatRGBA8Unorm ? MTLPixelFormatRGBA8Unorm_sRGB : MTLPixelFormatBGRA8Unorm_sRGB;
+        }
+        id<MTLTexture> input = [src newTextureViewWithPixelFormat:format textureType:MTLTextureType2D
+                                    levels:NSMakeRange(0, 1) slices:NSMakeRange(0, 1)];
+        id<MTLTexture> output = [dst newTextureViewWithPixelFormat:dst.pixelFormat textureType:MTLTextureType2D
+                                    levels:NSMakeRange(0, 1) slices:NSMakeRange(0, 1)];
+        if (!input || !output) return false;
+        const auto encode = [&](id<MTLCommandBuffer> command, id<MTLFence> fence) {
+            // The headless check and presentation share the same encoder and PSO cache.
+            static std::mutex mutex;
+            std::scoped_lock lock{mutex};
+            static id<MTLDevice> device;
+            static id<MTLLibrary> library;
+            static std::map<MTLPixelFormat, id<MTLRenderPipelineState>> pipelines;
+            NSError* error = nil;
+            if (device != src.device) { device = src.device; library = nil; pipelines.clear(); }
+            if (!library) {
+                NSString* source = @R"MSL(
+                    #include <metal_stdlib>
+                    using namespace metal;
+                    struct Varying { float4 position [[position]]; float2 uv; };
+                    struct Settings { float gamma; uint srgb_input; uint swap; };
+                    vertex Varying frame_vertex(uint id [[vertex_id]]) {
+                        const float2 p[] = {float2(-1,1),float2(3,1),float2(-1,-3)};
+                        return {float4(p[id],0,1),float2((p[id].x+1)*0.5,(1-p[id].y)*0.5)};
+                    }
+                    fragment float4 frame_fragment(Varying v [[stage_in]], texture2d<float> image [[texture(0)]],
+                                                    constant Settings& pp [[buffer(0)]]) {
+                        constexpr sampler linear_sampler(coord::normalized,address::clamp_to_edge,
+                                                           filter::linear,mip_filter::none);
+                        float3 rgb = image.sample(linear_sampler,v.uv).rgb;
+                        if (pp.swap) rgb = rgb.bgr;
+                        if (pp.srgb_input) rgb = select(pow(max(rgb+0.055,0.0)/1.055,float3(2.4)),
+                                                       rgb/12.92,rgb<float3(12.92*0.0031308));
+                        rgb = select(1.055*pow(rgb,float3(1.0/(3.4-pp.gamma)))-0.055,
+                                     12.92*rgb/pp.gamma,rgb<float3(0.0031308));
+                        return float4(rgb,1);
+                    }
+                )MSL";
+                MTLCompileOptions* options = [MTLCompileOptions new];
+                options.fastMathEnabled = NO;
+                library = [device newLibraryWithSource:source options:options error:&error];
+                if (!library) {
+                    std::fprintf(stderr, "Native Metal post-process shader failed: %s\n", error.localizedDescription.UTF8String);
+                    return false;
+                }
+            }
+            auto& pipeline = pipelines[output.pixelFormat];
+            if (!pipeline) {
+                MTLRenderPipelineDescriptor* desc = [MTLRenderPipelineDescriptor new];
+                desc.vertexFunction = [library newFunctionWithName:@"frame_vertex"];
+                desc.fragmentFunction = [library newFunctionWithName:@"frame_fragment"];
+                desc.colorAttachments[0].pixelFormat = output.pixelFormat;
+                pipeline = [device newRenderPipelineStateWithDescriptor:desc error:&error];
+                if (!pipeline) return false;
+            }
+            MTLRenderPassDescriptor* pass = [MTLRenderPassDescriptor renderPassDescriptor];
+            pass.colorAttachments[0].texture = output;
+            pass.colorAttachments[0].loadAction = MTLLoadActionDontCare;
+            pass.colorAttachments[0].storeAction = MTLStoreActionStore;
+            id<MTLRenderCommandEncoder> encoder = [command renderCommandEncoderWithDescriptor:pass];
+            if (!encoder) return false;
+            if (fence) [encoder waitForFence:fence beforeStages:MTLRenderStageVertex];
+            [encoder setRenderPipelineState:pipeline];
+            [encoder setViewport:MTLViewport{0,0,double(output.width),double(output.height),0,1}];
+            [encoder setFragmentTexture:input atIndex:0];
+            const struct { float gamma; uint32_t srgb_input, swap; } settings{gamma, uint32_t(srgb_input), uint32_t(swap)};
+            [encoder setFragmentBytes:&settings length:sizeof(settings) atIndex:0];
+            [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+            if (fence) [encoder updateFence:fence afterStages:MTLRenderStageFragment];
+            [encoder endEncoding];
+            return true;
+        };
+        // Vulkan completion protects the shared input. Private post-process output is
+        // tracked by Metal across the following scaler/presentation encoders.
+        return supplied ? encode(supplied, nil) : RunCommands(src.device, encode);
+    }
+}
+
+bool PostProcess(void* source, VkFormat view_format, void* destination, float gamma, bool srgb_input) {
+    return PostProcessImpl(source, view_format, destination, gamma, srgb_input);
+}
 
 bool ClearImage(void* image, const VkImageSubresourceRange& range, const VkClearColorValue& color) {
     @autoreleasepool {
@@ -540,7 +656,7 @@ struct Presentation::Impl {
         Images images;
         Texture input, output;
         id<MTLFXSpatialScaler> scaler;
-        id<MTLTexture> scaled;
+        id<MTLTexture> scaled, post;
     };
     VkInstance instance;
     VkPhysicalDevice physical;
@@ -580,7 +696,7 @@ struct Presentation::Impl {
         t.image = {};
     }
     void Release(Slot& s) {
-        s.scaler = nil; s.scaled = nil;
+        s.scaler = nil; s.scaled = nil; s.post = nil;
         Release(s.input); Release(s.output);
         s.images = {};
     }
@@ -589,6 +705,7 @@ struct Presentation::Impl {
     bool Allocate(Texture& t, uint32_t width, uint32_t height) {
         // SDR pixels already carry the presenter's sRGB encode.
         VkImageCreateInfo info{.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+            .flags = VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT,
             .imageType = VK_IMAGE_TYPE_2D, .format = format, .extent = {width, height, 1},
             .mipLevels = 1, .arrayLayers = 1, .samples = VK_SAMPLE_COUNT_1_BIT,
             .tiling = VK_IMAGE_TILING_OPTIMAL, .usage = VK_IMAGE_USAGE_SAMPLED_BIT |
@@ -628,7 +745,7 @@ VkImage Presentation::CreateFrameImage(uint8_t key, uint32_t width, uint32_t hei
             impl->Release(s); impl->Disable("exportable frame allocation failed"); return {};
         }
         s.images = {s.input.image, {}, width, height, 0, 0, false};
-        std::fprintf(stderr, "Native Metal frame #%u: post-processing renders directly into shared %s %ux%u.\n",
+        std::fprintf(stderr, "Native Metal frame #%u: Vulkan frame input in shared %s %ux%u.\n",
                      unsigned(key), impl->format_name, width, height);
         return s.input.image;
     }
@@ -706,7 +823,8 @@ Images* Presentation::Prepare(uint32_t key, uint32_t iw, uint32_t ih, uint32_t o
         return &s.images;
     }
 }
-bool Presentation::Encode(uint32_t key, uint32_t window_width, uint32_t window_height) {
+bool Presentation::Encode(uint32_t key, uint32_t window_width, uint32_t window_height,
+                          VkFormat post_format, float gamma) {
     @autoreleasepool {
         if (!impl->available) return false;
         const bool native = impl->layer != nil;
@@ -714,8 +832,28 @@ bool Presentation::Encode(uint32_t key, uint32_t window_width, uint32_t window_h
         id<MTLCommandBuffer> command = [impl->queue commandBuffer];
         if (!command) { impl->Disable("Metal command buffer allocation failed"); return false; }
         command.label = native ? @"Metalborne native presentation" : @"bbport MetalFX spatial";
+        id<MTLTexture> color = s.input.metal;
+        if (native && post_format != VK_FORMAT_UNDEFINED) {
+            if (!s.post) {
+                MTLTextureDescriptor* desc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:
+                    color.pixelFormat width:color.width height:color.height mipmapped:NO];
+                desc.storageMode = MTLStorageModePrivate;
+                desc.usage = MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget | s.scaler.colorTextureUsage;
+                s.post = [color.device newTextureWithDescriptor:desc];
+            }
+            if (!s.post || !PostProcessImpl((__bridge void*)color, post_format,
+                                           (__bridge void*)s.post, gamma, false, command)) {
+                impl->Disable("native post-process failed"); return false;
+            }
+            color = s.post;
+            static uint64_t frames = 0;
+            if (++frames <= 3 || frames % 300 == 0)
+                std::fprintf(stderr, "Native Metal post-process #%llu: %lux%lu -> %lux%lu; Vulkan fullscreen pass bypassed (presentation thread).\n",
+                    static_cast<unsigned long long>(frames), s.input.metal.width, s.input.metal.height,
+                    color.width, color.height);
+        }
         if (s.scaler) {
-            s.scaler.colorTexture = s.input.metal; s.scaler.outputTexture = s.scaled;
+            s.scaler.colorTexture = color; s.scaler.outputTexture = s.scaled;
             s.scaler.inputContentWidth = s.images.input_width;
             s.scaler.inputContentHeight = s.images.input_height;
             if (s.scaler.fence) {
@@ -777,7 +915,7 @@ bool Presentation::Encode(uint32_t key, uint32_t window_width, uint32_t window_h
                 double(window_height-s.images.output_height)/2, double(s.images.output_width),
                 double(s.images.output_height), 0, 1}];
             [encoder setRenderPipelineState:impl->present_pipeline];
-            [encoder setFragmentTexture:s.scaler ? s.scaled : s.input.metal atIndex:0];
+            [encoder setFragmentTexture:s.scaler ? s.scaled : color atIndex:0];
             [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
             const bool overlay = BbOverlay::RenderMetal((__bridge void*)layer.device,
                 (__bridge void*)pass, (__bridge void*)command, (__bridge void*)encoder,

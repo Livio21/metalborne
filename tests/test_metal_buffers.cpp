@@ -11,6 +11,7 @@
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
+#include "video_core/renderer_vulkan/vk_presenter.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/texture_cache/blit_helper.h"
 #include "video_core/texture_cache/image.h"
@@ -359,6 +360,140 @@ int main(int argc, char** argv) {
         assert(std::memcmp(actual.mapped_data.data(), expected.mapped_data.data(), size) == 0);
     }
     std::puts("PASS: nine-format render-pass clears match Vulkan bytes, selected mips/layers, untouched subresources and preserved staging/callbacks");
+    if (native) {
+        size_t compared = 0, rounding = 0;
+        for (const auto source_format : {vk::Format::eR8G8B8A8Unorm, vk::Format::eR8G8B8A8Srgb,
+                vk::Format::eB8G8R8A8Unorm, vk::Format::eB8G8R8A8Srgb,
+                vk::Format::eA2B10G10R10UnormPack32, vk::Format::eA2R10G10B10UnormPack32}) {
+            for (const bool swap : {false,true}) {
+                auto view_format = source_format;
+                if (swap) switch (source_format) {
+                case vk::Format::eR8G8B8A8Unorm: view_format=vk::Format::eB8G8R8A8Srgb; break;
+                case vk::Format::eR8G8B8A8Srgb: view_format=vk::Format::eB8G8R8A8Unorm; break;
+                case vk::Format::eB8G8R8A8Unorm: view_format=vk::Format::eR8G8B8A8Srgb; break;
+                case vk::Format::eB8G8R8A8Srgb: view_format=vk::Format::eR8G8B8A8Unorm; break;
+                case vk::Format::eA2B10G10R10UnormPack32: view_format=vk::Format::eA2R10G10B10UnormPack32; break;
+                case vk::Format::eA2R10G10B10UnormPack32: view_format=vk::Format::eA2B10G10R10UnormPack32; break;
+                default: assert(false);
+                }
+                for (const auto output_format : {vk::Format::eR8G8B8A8Unorm, vk::Format::eB8G8R8A8Unorm}) {
+                    VideoCore::ImageInfo src_info{};
+                    src_info.type = AmdGpu::ImageType::Color2D;
+                    src_info.pixel_format = source_format;
+                    src_info.size = {32,16,1};
+                    src_info.resources = {.levels = 1, .layers = 1};
+                    VideoCore::Image input(instance, runtime, views, src_info);
+                    auto dst_info = src_info; dst_info.pixel_format = output_format; dst_info.size = {24,12,1};
+                    VideoCore::Image target(instance, runtime, views, dst_info), reference(instance, runtime, views, dst_info);
+                    assert(input.backing->image.metal && target.backing->image.metal && reference.backing->image.metal);
+                    Buffer pixels(instance, 0, 32*16*4, MemoryType::HostUncached);
+                    const bool packed = source_format == vk::Format::eA2B10G10R10UnormPack32 ||
+                                        source_format == vk::Format::eA2R10G10B10UnormPack32;
+                    auto snapshot_info = src_info;
+                    if (!packed) snapshot_info.pixel_format = output_format;
+                    VideoCore::Image snapshot(instance, runtime, views, snapshot_info);
+                    assert(snapshot.backing->image.metal);
+                    for (size_t i = 0; i < 32*16; ++i) {
+                        // Asymmetric rows/channels reveal Y reversal, channel swaps and alpha handling.
+                        if (packed) {
+                            const uint32_t value = uint32_t((i*11)%1024) | uint32_t((i*7)%1024)<<10 |
+                                                   uint32_t((i*17)%1024)<<20 | uint32_t(i%4)<<30;
+                            std::memcpy(pixels.mapped_data.data()+i*4, &value, 4);
+                        } else {
+                            for (size_t c=0;c<4;++c) pixels.mapped_data[i*4+c] = (i*(c*6+7)+c*31)%256;
+                        }
+                    }
+                    pixels.Flush(0, pixels.SizeBytes());
+                    const vk::BufferImageCopy upload{.imageSubresource = {vk::ImageAspectFlagBits::eColor,0,0,1},
+                                                     .imageExtent = {32,16,1}};
+                    runtime.UploadImage(&input, &pixels, {&upload,1});
+                    // The presentation thread reads a byte-preserving Vulkan snapshot, including
+                    // RGBA/BGRA and sRGB/UNORM reinterpretation, never the mutable guest image.
+                    runtime.Transit(&input, vk::ImageLayout::eGeneral,
+                                    vk::PipelineStageFlagBits2::eCopy, vk::AccessFlagBits2::eTransferRead);
+                    runtime.Transit(&snapshot, vk::ImageLayout::eGeneral,
+                                    vk::PipelineStageFlagBits2::eCopy, vk::AccessFlagBits2::eTransferWrite);
+                    runtime.FlushBarriers();
+                    scheduler.Record([src=input.GetImage(),dst=snapshot.GetImage(),&dispatch](vk::CommandBuffer cmd) {
+                        const vk::ImageCopy copy{.srcSubresource={vk::ImageAspectFlagBits::eColor,0,0,1},
+                            .dstSubresource={vk::ImageAspectFlagBits::eColor,0,0,1},.extent={32,16,1}};
+                        cmd.copyImage(src,vk::ImageLayout::eGeneral,dst,vk::ImageLayout::eGeneral,copy,dispatch);
+                    });
+                    VideoCore::ImageViewInfo src_view_info{}; src_view_info.format = view_format;
+                    src_view_info.mapping.a = vk::ComponentSwizzle::eOne;
+                    const auto src_view = *input.FindView(src_view_info).image_view;
+                    VideoCore::ImageViewInfo dst_view_info{}; dst_view_info.format = output_format;
+                    Vulkan::Frame frame{}; frame.width=24; frame.height=12; frame.image=reference.GetImage();
+                    frame.image_view=*reference.FindView(dst_view_info).image_view;
+                    Vulkan::HostPasses::PostProcessingPass pass;
+                    pass.Create(instance.GetDevice(), output_format);
+                    for (const float gamma : {0.8f,1.0f,1.2f}) {
+                        for (const bool srgb_input : {false,true}) {
+                            runtime.Transit(&snapshot, vk::ImageLayout::eGeneral,
+                                            vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eMemoryRead);
+                            runtime.Transit(&target, vk::ImageLayout::eGeneral,
+                                            vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eMemoryWrite);
+                            runtime.FlushBarriers();
+                            const std::array handles{snapshot.GetImage(),target.GetImage()};
+                            const auto ownership = [&](bool release) {
+                                scheduler.Record([handles,release,family=instance.GetGraphicsQueueFamilyIndex(),&dispatch](vk::CommandBuffer cmd) {
+                                    std::array<vk::ImageMemoryBarrier2,2> barriers;
+                                    for(size_t i=0;i<2;++i) barriers[i]={
+                                        .srcStageMask=release?vk::PipelineStageFlagBits2::eAllCommands:vk::PipelineStageFlagBits2::eNone,
+                                        .srcAccessMask=release?vk::AccessFlagBits2::eMemoryRead|vk::AccessFlagBits2::eMemoryWrite:vk::AccessFlags2{},
+                                        .dstStageMask=release?vk::PipelineStageFlagBits2::eNone:vk::PipelineStageFlagBits2::eAllCommands,
+                                        .dstAccessMask=release?vk::AccessFlags2{}:vk::AccessFlagBits2::eMemoryRead|vk::AccessFlagBits2::eMemoryWrite,
+                                        .oldLayout=vk::ImageLayout::eGeneral,.newLayout=vk::ImageLayout::eGeneral,
+                                        .srcQueueFamilyIndex=release?family:VK_QUEUE_FAMILY_EXTERNAL,
+                                        .dstQueueFamilyIndex=release?VK_QUEUE_FAMILY_EXTERNAL:family,
+                                        .image=handles[i],.subresourceRange={vk::ImageAspectFlagBits::eColor,0,1,0,1}};
+                                    cmd.pipelineBarrier2(vk::DependencyInfo{.imageMemoryBarrierCount=2,.pImageMemoryBarriers=barriers.data()},dispatch);
+                                });
+                            };
+                            ownership(true); scheduler.FinishForExternal();
+                            assert(BbMetalFX::PostProcess(snapshot.backing->image.metal->NativeHandle(),static_cast<VkFormat>(view_format),
+                                                         target.backing->image.metal->NativeHandle(),gamma,srgb_input));
+                            assert(!BbMetalFX::PostProcess(snapshot.backing->image.metal->NativeHandle(),static_cast<VkFormat>(source_format),
+                                                          target.backing->image.metal->NativeHandle(),0,srgb_input));
+                            assert(!BbMetalFX::PostProcess(snapshot.backing->image.metal->NativeHandle(),VK_FORMAT_D32_SFLOAT,
+                                                          target.backing->image.metal->NativeHandle(),gamma,srgb_input));
+                            ownership(false);
+                            runtime.Transit(&input,vk::ImageLayout::eShaderReadOnlyOptimal,
+                                            vk::PipelineStageFlagBits2::eFragmentShader,vk::AccessFlagBits2::eShaderRead);
+                            runtime.Transit(&reference,vk::ImageLayout::eColorAttachmentOptimal,
+                                            vk::PipelineStageFlagBits2::eColorAttachmentOutput,vk::AccessFlagBits2::eColorAttachmentWrite);
+                            runtime.FlushBarriers();
+                            scheduler.Record([&](vk::CommandBuffer cmd) {
+                                pass.Render(cmd,src_view,{32,16},frame,{gamma,0,uint32_t(srgb_input)});
+                            });
+                            // The pass ends in GENERAL; update the test image tracker to that state.
+                            reference.backing->state.layout=vk::ImageLayout::eGeneral;
+                            Buffer actual(instance,0,24*12*4,MemoryType::HostCached),expected(instance,0,24*12*4,MemoryType::HostCached);
+                            const vk::BufferImageCopy download{.imageSubresource={vk::ImageAspectFlagBits::eColor,0,0,1},
+                                                               .imageExtent={24,12,1}};
+                            for(const auto pair:{std::pair{&target,&actual},std::pair{&reference,&expected}}) {
+                                runtime.Transit(pair.first,vk::ImageLayout::eTransferSrcOptimal,
+                                                vk::PipelineStageFlagBits2::eCopy,vk::AccessFlagBits2::eTransferRead);
+                                runtime.FlushBarriers();
+                                scheduler.Record([image=pair.first->GetImage(),buffer=pair.second->Handle(),download,&dispatch](vk::CommandBuffer cmd) {
+                                    cmd.copyImageToBuffer(image,vk::ImageLayout::eTransferSrcOptimal,buffer,download,dispatch);
+                                });
+                            }
+                            scheduler.Finish(); actual.Invalidate(0,actual.SizeBytes()); expected.Invalidate(0,expected.SizeBytes());
+                            for(size_t i=0;i<actual.SizeBytes();++i) {
+                                const int delta=std::abs(int(actual.mapped_data[i])-int(expected.mapped_data[i]));
+                                if(delta>1) std::fprintf(stderr,"post-process mismatch: src %u dst %u gamma %.1f decode %u byte %zu actual %u expected %u\n",
+                                    unsigned(source_format),unsigned(output_format),gamma,unsigned(srgb_input),i,actual.mapped_data[i],expected.mapped_data[i]);
+                                assert(delta<=1); rounding+=delta!=0; ++compared;
+                                if(i%4==3) assert(actual.mapped_data[i]==255);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        std::printf("PASS: native post-process from Vulkan snapshots, 144 format/view/gamma/decode combinations; %zu bytes compared, %zu one-LSB rounding differences\n",compared,rounding);
+    }
     VideoCore::ImageInfo depth_info{};
     depth_info.type = AmdGpu::ImageType::Color2D;
     depth_info.pixel_format = vk::Format::eD32Sfloat;
