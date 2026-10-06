@@ -332,7 +332,8 @@ original allocation/copy path. Logs are local under
 `out/macos-native-metal/shared-cache-{check,threaded-check,fallback-check}.log`.
 
 The rebuilt game also reached offline gameplay with both settings enabled,
-native Metal presentation and MetalFX off. The log recorded more than 900 native
+native Metal presentation and MetalFX off, using the existing uncapped
+validation profile with its 60 FPS patch. The log recorded at least 900 native
 buffer copies. A scene with roughly 1,360 draws/frame ran around 22 FPS, with
 about 42 ms/frame spent completing Vulkan render work and 0.6 ms/frame in Metal
 encode/completion. These are single-run CPU wall timings, not a matched baseline

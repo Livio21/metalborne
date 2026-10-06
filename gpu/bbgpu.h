@@ -23,6 +23,8 @@ int bbgpu_poll_events(void);
 /* SDL input is collected on the window thread and sampled by guest pad calls. */
 typedef struct {
     uint8_t keys[512];
+    uint8_t pressed_keys[512]; /* Press edges retained until the next pad sample. */
+    uint32_t pressed_mouse_buttons;
     uint32_t mouse_buttons;
     float mouse_x, mouse_y;
     int32_t wheel;

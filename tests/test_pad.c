@@ -6,7 +6,12 @@
 static int capture;
 static BbHostInput host={.focused=1};
 int bbgpu_overlay_captures_input(void) { return capture; }
-int bbgpu_read_host_input(BbHostInput *out) { *out=host; return 1; }
+int bbgpu_read_host_input(BbHostInput *out) {
+    *out=host;
+    memset(host.pressed_keys,0,sizeof(host.pressed_keys));
+    host.pressed_mouse_buttons=0;
+    return 1;
+}
 uintptr_t runtime_lookup(const RuntimeExport *table, size_t count, const char *name) {
     (void)table; (void)count; (void)name;
     return 0;
@@ -76,6 +81,21 @@ int main(void) {
     SDL_UpdateGamepads();
     assert(pad_read_state(1,&data)==0 && (data.buttons & (BTN_CROSS|BTN_L2))==(BTN_CROSS|BTN_L2));
     assert(data.left_x==255 && data.right_y==0 && data.l2==255);
+    host.focused=0;
+    assert(pad_read_state(1,&data)==0 && data.buttons==0 && data.left_x==128);
+    host.focused=1;
+    host.keys[SDL_SCANCODE_RETURN]=1;
+    assert(pad_read_state(1,&data)==0 && data.buttons==BTN_CROSS && data.left_x==128);
+    host.keys[SDL_SCANCODE_RETURN]=0;
+    assert(pad_read_state(1,&data)==0 && data.left_x==255 && (data.buttons & BTN_L2));
+    host.pressed_keys[SDL_SCANCODE_RETURN]=1; // Already released before the guest samples.
+    assert(pad_read_state(1,&data)==0 && data.buttons==BTN_CROSS && data.left_x==128);
+    assert(pad_read_state(1,&data)==0 && data.left_x==255 && (data.buttons & BTN_L2));
+    host.mouse_captured=1;
+    host.pressed_mouse_buttons=SDL_BUTTON_LMASK;
+    assert(pad_read_state(1,&data)==0 && data.buttons==BTN_R1 && data.left_x==128);
+    assert(pad_read_state(1,&data)==0 && data.buttons==0 && data.left_x==128);
+    host.mouse_captured=0;
     host.keys[SDL_SCANCODE_SPACE]=1;
     setenv("BB_INPUT_MODE","kbm",1);
     assert(pad_read_state(1,&data)==0 && data.buttons==BTN_CIRCLE && data.left_x==128);
@@ -103,7 +123,9 @@ int main(void) {
     SDL_UpdateJoysticks();
     SDL_UpdateGamepads();
     host.keys[SDL_SCANCODE_E]=1;
-    assert(pad_read_state(1,&data)==0 && gamepad && data.buttons==BTN_CIRCLE);
+    assert(pad_read_state(1,&data)==0 && gamepad && data.buttons==(BTN_CIRCLE|BTN_CROSS));
+    host.keys[SDL_SCANCODE_SPACE]=host.keys[SDL_SCANCODE_E]=0;
+    assert(pad_read_state(1,&data)==0 && data.buttons==BTN_CIRCLE);
     SDL_CloseJoystick(joystick);
     SDL_CloseGamepad(gamepad);
     gamepad=NULL;

@@ -176,12 +176,22 @@ static void sample_host(PadData *d) {
     BbHostInput input={0};
     int host_input=bbgpu_read_host_input(&input);
     if (host_input && !input.focused) { reset_mouse(); return; }
+    if (host_input) {
+        for (size_t i=0;i<sizeof(input.keys);++i) input.keys[i]|=input.pressed_keys[i];
+        if (input.mouse_captured) input.mouse_buttons|=input.pressed_mouse_buttons;
+    }
     const uint8_t *k=host_input ? input.keys : SDL_WasInit(SDL_INIT_VIDEO) ? (const uint8_t *)SDL_GetKeyboardState(NULL) : NULL;
     const char *mode=getenv("BB_INPUT_MODE");
     int force_kbm=mode && !strcmp(mode,"kbm");
     int legacy=mode && !strcmp(mode,"legacy");
-    if (mode && !strcmp(mode,"gamepad") && !g) return;
-    if (host_input && !legacy && (!g || force_kbm)) { sample_keyboard_mouse(d,&input); return; }
+    int gamepad_only=mode && !strcmp(mode,"gamepad");
+    if (gamepad_only && !g) return;
+    if (host_input && !legacy && !gamepad_only) {
+        sample_keyboard_mouse(d,&input);
+        /* Auto keeps keyboard controls available while a controller is connected.
+         * Explicit mouse capture selects KBM until F8 releases it. */
+        if (!g || force_kbm || d->buttons || d->left_x!=128 || d->left_y!=128 || input.mouse_captured) return;
+    }
     if (g) {
         static const struct { SDL_GamepadButton sdl; uint32_t ps; } map[]={
             {SDL_GAMEPAD_BUTTON_SOUTH,BTN_CROSS}, {SDL_GAMEPAD_BUTTON_EAST,BTN_CIRCLE},

@@ -128,8 +128,20 @@ bool WindowSDL::PollEvents() {
         }
         switch (event.type) {
         case SDL_EVENT_KEY_DOWN:
-            if (!event.key.repeat && event.key.key==SDLK_F8 && keyboard_mouse)
-                mouse_requested=!mouse_requested;
+            if (!event.key.repeat && event.key.scancode>SDL_SCANCODE_UNKNOWN && event.key.scancode<512) {
+                std::scoped_lock lock{input_mutex};
+                host_input.pressed_keys[event.key.scancode]=1;
+            }
+            if (!event.key.repeat && event.key.key==SDLK_F8 && keyboard_mouse) {
+                mouse_requested=!mouse_captured;
+                force_keyboard_mouse=true;
+            }
+            break;
+        case SDL_EVENT_MOUSE_BUTTON_DOWN:
+            if (mouse_captured && event.button.button>=1 && event.button.button<=32) {
+                std::scoped_lock lock{input_mutex};
+                host_input.pressed_mouse_buttons|=SDL_BUTTON_MASK(event.button.button);
+            }
             break;
         case SDL_EVENT_MOUSE_MOTION:
             if (mouse_captured) {
@@ -171,6 +183,7 @@ bool WindowSDL::PollEvents() {
         std::scoped_lock lock{input_mutex};
         host_input.mouse_x=host_input.mouse_y=0;
         host_input.wheel=0;
+        host_input.pressed_mouse_buttons=0;
     }
     {
         std::scoped_lock lock{input_mutex};
@@ -181,7 +194,11 @@ bool WindowSDL::PollEvents() {
         static_assert(SDL_SCANCODE_COUNT<=sizeof(host_input.keys));
         for (int i=0;i<512;++i) host_input.keys[i]=gameplay && i<count && keys[i];
         host_input.mouse_buttons=host_input.mouse_captured ? SDL_GetMouseState(nullptr,nullptr) : 0;
-        if (!gameplay) { host_input.mouse_x=host_input.mouse_y=0; host_input.wheel=0; }
+        if (!gameplay) {
+            host_input.mouse_x=host_input.mouse_y=0; host_input.wheel=0;
+            std::memset(host_input.pressed_keys,0,sizeof(host_input.pressed_keys));
+            host_input.pressed_mouse_buttons=0;
+        }
     }
     return is_open;
 }
@@ -191,6 +208,8 @@ bool WindowSDL::ReadHostInput(BbHostInput& input) {
     input=host_input;
     host_input.mouse_x=host_input.mouse_y=0;
     host_input.wheel=0;
+    std::memset(host_input.pressed_keys,0,sizeof(host_input.pressed_keys));
+    host_input.pressed_mouse_buttons=0;
     return true;
 }
 

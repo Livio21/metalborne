@@ -38,6 +38,9 @@ Mouse capture releases when the window loses focus, the host settings overlay
 opens, or the game's native text-entry dialog opens. Keyboard game input is
 also suspended during those dialogs. Capture resumes afterwards if enabled.
 Mouse buttons and the wheel are game inputs only while the mouse is captured.
+Keyboard and captured mouse presses are retained until the next pad sample,
+so a short tap between game frames is still delivered once. Pending presses
+are cleared when gameplay loses focus or a dialog/overlay takes input.
 
 ## Input selection and sensitivity
 
@@ -45,7 +48,7 @@ Set these environment variables before launching:
 
 | Variable | Values and default |
 |---|---|
-| `BB_INPUT_MODE` | `auto` (default): use a connected controller, otherwise KBM. `kbm`: force KBM even with a controller connected. `gamepad`: controller only. `legacy`: controller or the original keyboard fallback. |
+| `BB_INPUT_MODE` | `auto` (default): controller with keyboard controls still available; captured mouse selects KBM. `kbm`: force KBM even with a controller connected. `gamepad`: controller only. `legacy`: controller or the original keyboard fallback. |
 | `BB_MOUSE_CAPTURE` | `1` (default): capture while active. `0`: start released; F8 enables capture. |
 | `BB_MOUSE_SENSITIVITY` | Number greater than 0 and at most 20; default `2.0`. Higher values turn faster. |
 | `BB_MOUSE_INVERT_Y` | `1`: invert vertical camera movement. Default `0`. |
@@ -56,12 +59,20 @@ For the current macOS workspace:
 bash macos/run.sh
 ```
 
-Connect a controller over USB or Bluetooth before or during play; `auto` switches
-to it when SDL detects it and falls back to KBM on disconnect. Set
+Connect a controller over USB or Bluetooth before or during play. In `auto`,
+keyboard buttons and movement take priority while held, then controller input
+resumes. Press F8 to capture the mouse and select KBM; press it again to release
+the mouse and resume controller input. Set
 `BB_INPUT_MODE=kbm` explicitly to keep using keyboard/mouse with a controller connected.
 Back/Select acts as a left touchpad click on controllers without a touch surface;
 Tab and Backspace remain available for left/right touchpad clicks. L3 + R3 opens
 the host settings overlay.
+
+The macOS pad check passed controller buttons, sticks, triggers, touchpad,
+disconnect/reconnect, mixed input selection and retained short taps. In live
+gameplay with a GameSir controller connected, Escape opened the game menu and
+Space returned to gameplay. Physical controller button delivery still needs
+confirmation on the user's device.
 
 Mouse movement is converted to right-stick velocity. Bloodborne's own stick
 dead zone, acceleration and maximum turn speed still apply; this is not raw
