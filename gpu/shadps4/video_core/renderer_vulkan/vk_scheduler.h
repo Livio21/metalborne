@@ -682,6 +682,9 @@ public:
     /// Sends the current execution context to the GPU and waits for it to complete.
     void Finish();
 
+    /// Completes recorded GPU work for an external API without retiring current reservations.
+    void FinishForExternal();
+
     /// Waits for the given tick to trigger on the GPU.
     void Wait(u64 tick);
 
@@ -876,7 +879,7 @@ private:
 
     void RecorderThread(std::stop_token stoken);
 
-    void SubmitExecution(SubmitInfo& info);
+    void SubmitExecution(SubmitInfo& info, bool complete_tick = true);
 
     void PriorityPendingOpsThread(std::stop_token stoken);
 

@@ -2,8 +2,10 @@
 
 Updated 2026-10-06. This is the first native Metal presentation stage of the
 renderer transition. The game and host CPU code still run under Rosetta;
-PS4 draw/compute commands, shader recompilation, resource caches and host
+PS4 draw/compute commands, shader recompilation, textures and host
 post-processing still use bbport's Vulkan renderer through KosmicKrisp.
+Ordinary buffer-cache storage and copies now have an opt-in native Metal path
+described below; sparse guest arenas retain Vulkan ownership.
 
 ## Enable it
 
@@ -141,8 +143,9 @@ MetalFX or a speedup from removing the blit.
 
 The host frame renders directly into exportable storage, and the real game
 buffer-copy workload below passes on native Metal, including shared GPU buffers.
-The next transition requires native buffer/cache ownership that avoids copying
-each game's sparse-arena binding across APIs, followed by texture workloads.
+Ordinary cache buffers now have the opt-in shared ownership path below. Guest
+sparse arenas still require a different allocation/binding contract before
+their shader bindings can move directly to Metal, followed by texture workloads.
 The full backend still needs native resource/cache management, bindings,
 graphics/compute pipelines and command submission. Geometry/tessellation and
 guest completion semantics require their own proofs; presentation alone does
@@ -276,3 +279,62 @@ shortcut flag. The Metal comparison recorded 226,410 mismatches; no shortcut
 was enabled. Central Yharnam and HUD continued to render through the original
 compute path, and the run exited with status 0. A log assertion confirmed both
 continued gameplay and the absence of any live shortcut calls.
+
+### Shared ordinary buffer cache and native copies
+
+`BB_METAL_BUFFER_CACHE=1` makes ordinary upload, readback, stream and device
+buffers use a single coherent allocation shared by Vulkan and Metal. It reuses
+the existing `Buffer`, `StreamBuffer` and staging-pool lifetimes. Vulkan device
+addresses refer to those allocations; host mappings refer to the same storage.
+Allocation, export or layout incompatibility falls back to the original VMA
+allocator. Shared allocations are limited to 512 MiB each. Sparse arenas retain
+their original allocation and aliasing behavior.
+
+`BB_METAL_BUFFER_COPY=1` additionally sends eligible ordinary-buffer copies
+through native Metal blit commands over that cache storage. These live copies
+need no clone allocation, bridge upload or CPU pixel readback. Same-buffer,
+unaligned, out-of-bounds and overlapping destination regions are rejected by
+the native helper; unsupported copies and Metal failures use the original
+Vulkan path. Normal Vulkan caller validity requirements still apply.
+
+Vulkan releases ownership and completes a partial submission under a fence.
+This waits for earlier GPU work and deferred host uploads without signaling the
+scheduler's logical tick. Stream reservations, staging entries, descriptors and
+deferred callbacks therefore remain protected until the eventual ordinary
+submission. Metal completes synchronously before Vulkan acquisition is recorded.
+Completed callbacks run outside the queue submit lock and can submit a nested
+native page-table upload without deadlocking. This is deliberately synchronous;
+it establishes ownership correctness and does not establish a performance win.
+Both settings are off by default.
+
+```bash
+BB_METAL_BUFFER_CACHE=1 BB_METAL_BUFFER_COPY=1 \
+  BB_PRESENT_BACKEND=metal BB_METALFX=off bash macos/run.sh
+```
+
+One headless check uses no game-derived data and exercises the production paths:
+
+```bash
+out/macos-tools/bin/cmake --build out/macos --target metal-buffer-test --parallel 4
+export VK_DRIVER_FILES="$PWD/out/vendor/kosmickrisp-0.19.0/kosmickrisp_mesa_icd.json"
+out/macos/gpu/metal-buffer-test
+out/macos/gpu/metal-buffer-test --threaded
+out/macos/gpu/metal-buffer-test --vulkan
+```
+
+On Apple M5, the direct and threaded checks passed shared mappings/device
+addresses, move ownership, a 128 MiB stream allocation, offset copies and every
+untouched byte. They also checked that a native partial submission preserves
+unrelated staging reservations and callbacks, that a completed callback can
+submit another native copy, and that a rejected byte-aligned copy falls back
+before its staging ring is overwritten. The third invocation passed the
+original allocation/copy path. Logs are local under
+`out/macos-native-metal/shared-cache-{check,threaded-check,fallback-check}.log`.
+
+The rebuilt game also reached offline gameplay with both settings enabled,
+native Metal presentation and MetalFX off. The log recorded more than 900 native
+buffer copies. A scene with roughly 1,360 draws/frame ran around 22 FPS, with
+about 42 ms/frame spent completing Vulkan render work and 0.6 ms/frame in Metal
+encode/completion. These are single-run CPU wall timings, not a matched baseline
+or proof of a speedup. Stable 30 FPS remains unproven. The local run log is
+`out/macos-native-metal/shared-cache-input-game.log`.

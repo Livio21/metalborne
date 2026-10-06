@@ -2,6 +2,10 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <numeric>
+#include <cstdlib>
+#include <cstdio>
+#include <cstring>
+#include <atomic>
 
 #include "common/alignment.h"
 #include "common/assert.h"
@@ -71,6 +75,11 @@ UniqueBuffer::~UniqueBuffer() {
 }
 
 void UniqueBuffer::Destroy() {
+#ifdef __APPLE__
+    if (metal) {
+        metal.reset();
+    } else
+#endif
     if (allocation) {
         vmaDestroyBuffer(allocator, buffer, allocation);
     } else if (buffer) {
@@ -131,7 +140,38 @@ Buffer::Buffer(const Vulkan::Instance& instance, VAddr cpu_addr_, u64 size_bytes
         .sharingMode = vk::SharingMode::eExclusive,
     };
     VmaAllocationInfo alloc_info{};
-    buffer.Create(buffer_ci, mem_type, &alloc_info);
+#ifdef __APPLE__
+    static const char* native_cache = std::getenv("BB_METAL_BUFFER_CACHE");
+    if (mem_type != MemoryType::Sparse && native_cache && std::strcmp(native_cache, "1") == 0 &&
+        instance.HasExternalMemoryMetal()) {
+        const auto usage = static_cast<VkBufferUsageFlags>(buffer_ci.usage);
+        const auto features = instance.GetPhysicalDevice().getExternalBufferProperties(
+            vk::PhysicalDeviceExternalBufferInfo{.usage = buffer_ci.usage,
+                .handleType = static_cast<vk::ExternalMemoryHandleTypeFlagBits>(VK_EXTERNAL_MEMORY_HANDLE_TYPE_MTLHEAP_BIT_EXT)}
+            ).externalMemoryProperties.externalMemoryFeatures;
+        if (features & vk::ExternalMemoryFeatureFlagBits::eExportable) {
+            buffer.metal = std::make_unique<BbMetalFX::SharedBuffer>(
+                instance.GetDevice(), static_cast<VkPhysicalDeviceMemoryProperties>(instance.GetMemoryProperties()),
+                size_bytes, VULKAN_HPP_DEFAULT_DISPATCHER.vkGetDeviceProcAddr, usage);
+            if (buffer.metal->Handle()) {
+                buffer.buffer = buffer.metal->Handle();
+                buffer.bda_addr = buffer.metal->DeviceAddress();
+                if (mem_type != MemoryType::DeviceLocal)
+                    mapped_data = {buffer.metal->MappedData(), size_bytes};
+                is_coherent = true;
+                static std::atomic<unsigned> allocated{0};
+                const auto count = allocated.fetch_add(1, std::memory_order_relaxed) + 1;
+                if (count <= 8)
+                    std::fprintf(stderr, "Native Metal buffer cache: shared allocation #%u (%zu bytes, BDA=%llx).\n",
+                        count, size_bytes, static_cast<unsigned long long>(buffer.bda_addr));
+            } else {
+                buffer.metal.reset();
+            }
+        }
+    }
+    if (!buffer.metal)
+#endif
+        buffer.Create(buffer_ci, mem_type, &alloc_info);
 
     const auto device = instance.GetDevice();
     if (!debug_name.empty()) {
@@ -140,7 +180,7 @@ Buffer::Buffer(const Vulkan::Instance& instance, VAddr cpu_addr_, u64 size_bytes
         Vulkan::SetObjectName(device, Handle(), "Buffer {:#x}:{:#x}", cpu_addr, size_bytes);
     }
 
-    if (mem_type != MemoryType::Sparse) {
+    if (mem_type != MemoryType::Sparse && buffer.allocation) {
         VkMemoryPropertyFlags property_flags{};
         vmaGetAllocationMemoryProperties(instance.GetAllocator(), buffer.allocation,
                                          &property_flags);

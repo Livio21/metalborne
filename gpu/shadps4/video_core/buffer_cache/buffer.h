@@ -13,6 +13,9 @@
 #include "common/assert.h"
 #include "common/types.h"
 #include "video_core/renderer_vulkan/vk_common.h"
+#ifdef __APPLE__
+#include "macos_metalfx.h"
+#endif
 
 namespace Vulkan {
 class Instance;
@@ -54,7 +57,11 @@ struct UniqueBuffer {
         : device{other.device}, buffer{std::exchange(other.buffer, VK_NULL_HANDLE)},
           bda_addr{std::exchange(other.bda_addr, 0)},
           allocator{std::exchange(other.allocator, VK_NULL_HANDLE)},
-          allocation{std::exchange(other.allocation, VK_NULL_HANDLE)} {}
+          allocation{std::exchange(other.allocation, VK_NULL_HANDLE)} {
+#ifdef __APPLE__
+        metal = std::move(other.metal);
+#endif
+    }
 
     UniqueBuffer& operator=(UniqueBuffer&& other) noexcept {
         if (this != &other) {
@@ -64,6 +71,9 @@ struct UniqueBuffer {
             bda_addr = std::exchange(other.bda_addr, 0);
             allocator = std::exchange(other.allocator, VK_NULL_HANDLE);
             allocation = std::exchange(other.allocation, VK_NULL_HANDLE);
+#ifdef __APPLE__
+            metal = std::move(other.metal);
+#endif
         }
         return *this;
     }
@@ -78,6 +88,9 @@ struct UniqueBuffer {
     vk::DeviceAddress bda_addr{};
     VmaAllocator allocator;
     VmaAllocation allocation{};
+#ifdef __APPLE__
+    std::unique_ptr<BbMetalFX::SharedBuffer> metal;
+#endif
 };
 
 struct Buffer {

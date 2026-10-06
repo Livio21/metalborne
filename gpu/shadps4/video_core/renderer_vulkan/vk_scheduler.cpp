@@ -335,6 +335,15 @@ void Scheduler::Finish() {
     Wait(presubmit_tick);
 }
 
+void Scheduler::FinishForExternal() {
+    const auto device = instance.GetDevice();
+    auto fence = Check(device.createFenceUnique({}));
+    SubmitInfo info{};
+    info.fence = *fence;
+    SubmitExecution(info, false);
+    Check(device.waitForFences(*fence, true, UINT64_MAX));
+}
+
 void Scheduler::Wait(u64 tick) {
     if (tick >= work_semaphore.CurrentTick()) {
         // Make sure we are not waiting for the current tick without signalling
@@ -390,9 +399,9 @@ void Scheduler::AllocateWorkerCommandBuffers() {
 #endif
 }
 
-void Scheduler::SubmitExecution(SubmitInfo& info) {
-    std::scoped_lock lk{submit_mutex};
-    const u64 signal_value = work_semaphore.NextTick();
+void Scheduler::SubmitExecution(SubmitInfo& info, bool complete_tick) {
+    std::unique_lock lk{submit_mutex};
+    const u64 signal_value = complete_tick ? work_semaphore.NextTick() : CurrentTick();
 
 #if TRACY_GPU_ENABLED
     auto* profiler_ctx = instance.GetProfilerContext();
@@ -417,7 +426,7 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
     Check(current_cmdbuf.end());
 
     const vk::Semaphore timeline = work_semaphore.Handle();
-    info.AddSignal(timeline, signal_value);
+    if (complete_tick) info.AddSignal(timeline, signal_value);
 
     static constexpr std::array<vk::PipelineStageFlags, 2> wait_stage_masks = {
         vk::PipelineStageFlagBits::eAllCommands,
@@ -449,8 +458,9 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
     work_semaphore.Refresh();
     AllocateWorkerCommandBuffers();
 
-    // Apply pending operations
-    PopPendingOperations();
+    // Callbacks may upload a newly resident page table through a partial submission.
+    lk.unlock();
+    if (complete_tick) PopPendingOperations();
 }
 
 void Scheduler::PriorityPendingOpsThread(std::stop_token stoken) {

@@ -12,14 +12,20 @@ struct ComputeBuffer {
 class SharedBuffer {
 public:
     SharedBuffer(VkDevice device, const VkPhysicalDeviceMemoryProperties& properties,
-                 uint64_t size, PFN_vkGetDeviceProcAddr proc);
+                 uint64_t size, PFN_vkGetDeviceProcAddr proc,
+                 VkBufferUsageFlags usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                     VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
     ~SharedBuffer();
     VkBuffer Handle() const;
     void* NativeHandle() const;
+    uint8_t* MappedData() const;
+    uint64_t DeviceAddress() const;
 private:
     struct Impl;
     std::unique_ptr<Impl> impl;
 };
+// Caller completes Vulkan release before entering, then acquires after completion.
+bool CopyBuffers(void* source, void* destination, std::span<const VkBufferCopy> copies);
 // One-shot shadow dispatch: clones buffers and leaves the live Vulkan resources untouched.
 bool CheckCompute(std::span<const ComputeBuffer> buffers, std::span<const uint8_t> push,
                   uint32_t groups, uint32_t threads);

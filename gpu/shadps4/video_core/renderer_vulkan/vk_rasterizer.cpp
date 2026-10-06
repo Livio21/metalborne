@@ -59,7 +59,7 @@ static std::vector<std::vector<u8>> ReadComputeBuffers(
         };
         command.pipelineBarrier2(vk::DependencyInfo{.memoryBarrierCount = 1, .pMemoryBarriers = &barrier});
     });
-    scheduler.Finish();
+    scheduler.FinishForExternal();
     std::vector<std::vector<u8>> result;
     for (auto& readback : readbacks) {
         readback.Invalidate(0, readback.SizeBytes());
@@ -1438,7 +1438,7 @@ void Rasterizer::DispatchRecord(const ComputePipeline* pipeline) {
                             .memoryBarrierCount = 1, .pMemoryBarriers = &restore,
                             .bufferMemoryBarrierCount = 2, .pBufferMemoryBarriers = release.data()});
                     });
-                    scheduler.Finish();
+                    scheduler.FinishForExternal();
                     std::fprintf(stderr, "Native Metal compute bridge: GPU copies into shared buffers; no CPU uploads to Metal.\n");
                 }
             }
@@ -1482,7 +1482,7 @@ void Rasterizer::DispatchRecord(const ComputePipeline* pipeline) {
                 command.pipelineBarrier2(vk::DependencyInfo{
                     .bufferMemoryBarrierCount = 2, .pBufferMemoryBarriers = acquire.data()});
             });
-            scheduler.Finish(); // Acquire completes before either API's shared handles are retired.
+            scheduler.FinishForExternal(); // Acquire completes before either API's shared handles are retired.
             if (copy_hle && std::strcmp(copy_hle, "1") == 0 &&
                 ((push_data.buf_offsets[0] | push_data.buf_offsets[1]) & 3)) metal_validated = false;
             if (copy_hle && std::strcmp(copy_hle, "1") == 0 && metal_validated) {

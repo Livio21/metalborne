@@ -13,33 +13,36 @@
 #include <array>
 #include <atomic>
 #include <vector>
+#include <mutex>
 
 namespace BbMetalFX {
 struct SharedBuffer::Impl {
     VkDevice device;
     VkBuffer buffer{};
     VkDeviceMemory memory{};
+    uint64_t address{};
     id<MTLHeap> heap;
     id<MTLBuffer> metal;
     PFN_vkDestroyBuffer destroy;
     PFN_vkFreeMemory free;
     Impl(VkDevice d, const VkPhysicalDeviceMemoryProperties& properties, uint64_t size,
-         PFN_vkGetDeviceProcAddr proc) : device(d) {
+         PFN_vkGetDeviceProcAddr proc, VkBufferUsageFlags usage) : device(d) {
 #define BUFFER_PROC(name) auto name = reinterpret_cast<PFN_##name>(proc(d, #name))
         BUFFER_PROC(vkCreateBuffer); BUFFER_PROC(vkGetBufferMemoryRequirements);
         BUFFER_PROC(vkAllocateMemory); BUFFER_PROC(vkBindBufferMemory);
         BUFFER_PROC(vkGetMemoryMetalHandleEXT);
+        BUFFER_PROC(vkGetBufferDeviceAddress);
         destroy = reinterpret_cast<PFN_vkDestroyBuffer>(proc(d, "vkDestroyBuffer"));
         free = reinterpret_cast<PFN_vkFreeMemory>(proc(d, "vkFreeMemory"));
 #undef BUFFER_PROC
-        if (!vkGetMemoryMetalHandleEXT || !size || size > 16 * 1024 * 1024) return;
+        if (!vkGetMemoryMetalHandleEXT || !size || size > 512 * 1024 * 1024) return;
         const auto fail = [](const char* where, VkResult result) {
             std::fprintf(stderr, "Native Metal shared buffer unavailable: %s (VkResult=%d).\n", where, result);
         };
         VkExternalMemoryBufferCreateInfo external{.sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO,
             .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_MTLHEAP_BIT_EXT};
         VkBufferCreateInfo info{.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .pNext = &external,
-            .size = size, .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+            .size = size, .usage = usage,
             .sharingMode = VK_SHARING_MODE_EXCLUSIVE};
         VkResult result = vkCreateBuffer(d, &info, nullptr, &buffer);
         if (result != VK_SUCCESS) { fail("vkCreateBuffer", result); return; }
@@ -55,8 +58,11 @@ struct SharedBuffer::Impl {
         if (type == properties.memoryTypeCount) { fail("coherent shared memory required", VK_ERROR_FEATURE_NOT_PRESENT); return; }
         VkExportMemoryAllocateInfo exported{.sType = VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO,
             .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_MTLHEAP_BIT_EXT};
+        VkMemoryAllocateFlagsInfo flags{.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO,
+            .pNext = &exported, .flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT};
         VkMemoryDedicatedAllocateInfo dedicated{.sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO,
-            .pNext = &exported, .buffer = buffer};
+            .pNext = (usage & VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT) ?
+                static_cast<void*>(&flags) : static_cast<void*>(&exported), .buffer = buffer};
         VkMemoryAllocateInfo allocation{.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
             .pNext = &dedicated, .allocationSize = req.size, .memoryTypeIndex = type};
         result = vkAllocateMemory(d, &allocation, nullptr, &memory);
@@ -79,6 +85,11 @@ struct SharedBuffer::Impl {
             { fail("Metal/Vulkan buffer layout differs", VK_ERROR_FEATURE_NOT_PRESENT); return; }
         metal = [heap newBufferWithLength:size options:options offset:0];
         if (!metal) fail("newBufferWithLength:offset:", VK_ERROR_OUT_OF_DEVICE_MEMORY);
+        if (metal && (usage & VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT)) {
+            const VkBufferDeviceAddressInfo info{.sType = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO, .buffer = buffer};
+            address = vkGetBufferDeviceAddress(d, &info);
+            if (!address) { metal = nil; fail("buffer device address unavailable", VK_ERROR_FEATURE_NOT_PRESENT); }
+        }
     }
     ~Impl() {
         metal = nil;
@@ -88,11 +99,55 @@ struct SharedBuffer::Impl {
     }
 };
 SharedBuffer::SharedBuffer(VkDevice device, const VkPhysicalDeviceMemoryProperties& properties,
-                           uint64_t size, PFN_vkGetDeviceProcAddr proc)
-    : impl(std::make_unique<Impl>(device, properties, size, proc)) {}
+                           uint64_t size, PFN_vkGetDeviceProcAddr proc, VkBufferUsageFlags usage)
+    : impl(std::make_unique<Impl>(device, properties, size, proc, usage)) {}
 SharedBuffer::~SharedBuffer() = default;
 VkBuffer SharedBuffer::Handle() const { return impl->metal ? impl->buffer : VK_NULL_HANDLE; }
 void* SharedBuffer::NativeHandle() const { return (__bridge void*)impl->metal; }
+uint8_t* SharedBuffer::MappedData() const { return static_cast<uint8_t*>(impl->metal.contents); }
+uint64_t SharedBuffer::DeviceAddress() const { return impl->address; }
+
+bool CopyBuffers(void* source, void* destination, std::span<const VkBufferCopy> copies) {
+    @autoreleasepool {
+        id<MTLBuffer> src = (__bridge id<MTLBuffer>)source, dst = (__bridge id<MTLBuffer>)destination;
+        if (!src || !dst || src == dst || src.device != dst.device || copies.empty()) return false;
+        for (size_t i = 0; i < copies.size(); ++i) {
+            const auto& c = copies[i];
+            if (!c.size || ((c.srcOffset | c.dstOffset | c.size) & 3) ||
+                c.srcOffset > src.length || c.size > src.length - c.srcOffset ||
+                c.dstOffset > dst.length || c.size > dst.length - c.dstOffset) return false;
+            for (size_t j = 0; j < i; ++j)
+                if (c.dstOffset < copies[j].dstOffset + copies[j].size &&
+                    copies[j].dstOffset < c.dstOffset + c.size) return false;
+        }
+        // ponytail: one device/queue and synchronous completion; batch with guest submissions later.
+        static std::mutex mutex;
+        std::lock_guard lock{mutex};
+        static id<MTLCommandQueue> queue;
+        if (!queue || queue.device != src.device) queue = [src.device newCommandQueue];
+        id<MTLCommandBuffer> command = [queue commandBuffer];
+        id<MTLFence> fence = [src.device newFence];
+        id<MTLBlitCommandEncoder> release = [command blitCommandEncoder];
+        if (!command || !fence || !release) return false;
+        [release updateFence:fence];
+        [release endEncoding];
+        id<MTLBlitCommandEncoder> encoder = [command blitCommandEncoder];
+        if (!encoder) return false;
+        [encoder waitForFence:fence];
+        for (const auto& c : copies)
+            [encoder copyFromBuffer:src sourceOffset:c.srcOffset toBuffer:dst
+                    destinationOffset:c.dstOffset size:c.size];
+        [encoder endEncoding];
+        [command commit];
+        [command waitUntilCompleted];
+        if (command.status != MTLCommandBufferStatusCompleted) {
+            std::fprintf(stderr, "Native Metal buffer copy failed: %s; falling back to Vulkan.\n",
+                         (command.error.localizedDescription ?: @"command failed").UTF8String);
+            return false;
+        }
+        return true;
+    }
+}
 
 bool CheckCompute(std::span<const ComputeBuffer> buffers, std::span<const uint8_t> push,
                   uint32_t groups, uint32_t threads) {

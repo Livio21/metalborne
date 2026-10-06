@@ -142,6 +142,46 @@ void Runtime::CopyBuffer(const VideoCore::Buffer* src, const VideoCore::Buffer* 
         FlushBarriers();
     }
 
+#ifdef __APPLE__
+    bool native_copied = false;
+    static const char* native_copy = std::getenv("BB_METAL_BUFFER_COPY");
+    if (native_copy && std::strcmp(native_copy, "1") == 0 && src != dst &&
+        src->buffer.metal && dst->buffer.metal && !copies.empty()) {
+        const std::array<vk::Buffer, 2> handles{src->Handle(), dst->Handle()};
+        const u32 family = instance.GetGraphicsQueueFamilyIndex();
+        const auto ownership = [&](bool release) {
+            scheduler.Record([handles, family, release](vk::CommandBuffer command) {
+                std::array<vk::BufferMemoryBarrier2, 2> barriers;
+                for (size_t i = 0; i < handles.size(); ++i) barriers[i] = {
+                    .srcStageMask = release ? vk::PipelineStageFlagBits2::eAllCommands : vk::PipelineStageFlagBits2::eNone,
+                    .srcAccessMask = release ? vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite : vk::AccessFlags2{},
+                    .dstStageMask = release ? vk::PipelineStageFlagBits2::eNone : vk::PipelineStageFlagBits2::eAllCommands,
+                    .dstAccessMask = release ? vk::AccessFlags2{} : vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
+                    .srcQueueFamilyIndex = release ? family : VK_QUEUE_FAMILY_EXTERNAL,
+                    .dstQueueFamilyIndex = release ? VK_QUEUE_FAMILY_EXTERNAL : family,
+                    .buffer = handles[i], .offset = 0, .size = VK_WHOLE_SIZE,
+                };
+                command.pipelineBarrier2(vk::DependencyInfo{
+                    .bufferMemoryBarrierCount = 2, .pBufferMemoryBarriers = barriers.data()});
+            });
+        };
+        ownership(true);
+        scheduler.FinishForExternal(); // Wait for uploads/accesses while keeping staging reservations live.
+        std::vector<VkBufferCopy> regions;
+        for (const auto& copy : copies) regions.push_back(static_cast<VkBufferCopy>(copy));
+        native_copied = BbMetalFX::CopyBuffers(src->buffer.metal->NativeHandle(),
+                                             dst->buffer.metal->NativeHandle(), regions);
+        ownership(false);
+        if (native_copied) {
+            static std::atomic<u64> native_copies{0};
+            const auto count = native_copies.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (count <= 3 || count % 300 == 0)
+                std::fprintf(stderr, "Native Metal buffer copy #%llu: %zu regions; shared cache storage, no bridge copies.\n",
+                             static_cast<unsigned long long>(count), copies.size());
+        }
+    }
+    if (!native_copied)
+#endif
     scheduler.Record([src_handle = src->Handle(), dst_handle = dst->Handle(),
                       regions = scheduler.RecordData(copies)](vk::CommandBuffer cmdbuf) {
         cmdbuf.copyBuffer(src_handle, dst_handle, regions.size(), regions.data());
