@@ -26,6 +26,12 @@ def immediate(writes, address):
 
 
 class NativeUiTests(unittest.TestCase):
+    def test_boot_skip_matches_community_v109_writes(self):
+        self.assertEqual(compile_patches(XML, ['Skip Intro + warning message'], '01.09', SEGMENTS),
+                         [(address-EBOOT_BASE, data) for address, data in (
+                             (0x04d99138, bytes(4)), (0x04d99154, bytes(4)),
+                             (0x04d9916e, bytes(4)), (0x0202EE1C, bytes.fromhex('eb73')))])
+
     def test_presets_keep_ui_native(self):
         for preset, expected in [(1, (1280, 720)), (2, (1130, 636)),
                                  (3, (960, 540)), (4, (640, 360))]:

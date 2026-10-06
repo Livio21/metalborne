@@ -182,6 +182,7 @@ def benchmark(args):
                BB_MACOS_CONSERVATIVE_GPU="1", BB_METAL_BUFFER_CACHE="1", BB_METAL_BUFFER_COPY="1",
                BB_METAL_IMAGE_CACHE="1", BB_METAL_IMAGE_COPY="0", BB_METAL_IMAGE_TRANSFER="0", BB_FULLSCREEN="0")
     env.update(args.overrides)
+    env.setdefault("BB_PATCHES", "Skip Intro + warning message")
     env.setdefault("BB_GPU_USER_DIR", str(ROOT / "out/macos-run/user"))
     env.update(BB_DATA_DIR=str(run), BB_USER_DIR=str(run / "user"), BB_CONFIG=str(config),
                BB_PAD_FILE=str(pad), BB_QUIT_FILE=str(quit_file), BB_TIMEOUT="0",
@@ -262,6 +263,7 @@ def benchmark(args):
             if not args.manual:
                 wait(args.menu_delay)
                 # ponytail: timed standard menu; use --manual for other dialogs.
+                press("up")  # Clamp to Online before selecting Offline, regardless of saved selection.
                 press("down")
                 press("cross")
                 wait(6)

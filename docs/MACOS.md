@@ -64,6 +64,12 @@ For the macOS defaults, launch with your own game directory:
 BB_GAME_DIR=/absolute/path/to/CUSA03173 bash macos/run.sh
 ```
 
+The macOS launcher enables the v1.09 **Skip Intro + warning message** patch by
+default. It patches the prepared runtime image; the original dump is unchanged.
+Set `BB_PATCHES=""` to disable it, or supply your own semicolon-separated patch list
+to replace the default. This skips startup screens; loading a save still uses
+Continue. [The benchmark runner](MACOS_BENCHMARK.md) selects Continue automatically.
+
 The macOS launcher currently disables speculative draw-preparation workers and
 the parallel draw pipeline by default after PM4 assertions during map loading.
 This is a temporary workaround, not a confirmed repair of the underlying race.

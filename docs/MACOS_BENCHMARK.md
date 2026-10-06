@@ -14,6 +14,13 @@ close path. This workload gate is a heuristic; it does not read the game's menu
 or player state. A new save, a different title-menu selection or unexpected
 dialogue may need `--manual` or a longer `--menu-delay`.
 
+The v1.09 **Skip Intro + warning message** patch is enabled by default and
+recorded in the run metadata. Override it with `--env BB_PATCHES=` to disable
+it. The default menu delay remains 12 seconds. Navigation first clamps to Play
+Online with Up, then selects Play Offline with Down; the saved menu selection
+can otherwise send a run into the login-failure dialog. The runner loads the
+copied save through Continue.
+
 Defaults match the current experimental setup: PS4 30 FPS game timing, FIFO,
 1280x720 scene, native Metal presentation, spatial MetalFX, shared buffer/image
 caches, native buffer copies, Vulkan image copies and conservative draw
@@ -118,3 +125,9 @@ The run used the development app's freshly copied `bb-probe`; its executable
 is identical to the newly built `out/bb-probe`, which is the script's default.
 The earlier calibration correctly rejected the title menu and closed cleanly
 on startup timeout. The parser self-check and macOS build also passed.
+
+The boot-skip verification in
+`out/benchmarks/20261006-154247-348453-boot-skip-verified/` automatically reached
+Hunter's Dream with the four community patch writes active, measured 10 seconds,
+and closed normally with status 0. Original save hashes were unchanged. Thermal
+pressure rose to fair during the run, so its FPS is not evidence of a speedup.
