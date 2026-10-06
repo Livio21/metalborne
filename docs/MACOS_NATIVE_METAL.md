@@ -1,5 +1,8 @@
 # Experimental native Metal renderer transition
 
+During graphics work, update [the game rendering and handling register](GAME_RENDERING_ISSUES.md)
+with visual issues, direct game optimization candidates and their evidence.
+
 Updated 2026-10-06. This is the first native Metal presentation stage of the
 renderer transition. The game and host CPU code still run under Rosetta;
 PS4 draw/compute commands, shader recompilation and host

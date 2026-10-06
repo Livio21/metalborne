@@ -1,5 +1,8 @@
 # macOS performance investigation — 2026-10-04
 
+Track new game rendering/handling findings and Souls-series references in
+[the rendering issue register](GAME_RENDERING_ISSUES.md).
+
 Repeatable automatic gameplay measurements are available through
 `python3 tools/benchmark_macos.py --seconds 30`; see
 [the benchmark runbook](MACOS_BENCHMARK.md) for settings, results and caveats.
