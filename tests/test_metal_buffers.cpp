@@ -7,6 +7,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <vector>
+#include <limits>
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
@@ -22,6 +23,7 @@ int main(int argc, char** argv) {
     setenv("BB_METAL_IMAGE_CACHE", native ? "1" : "0", 1);
     setenv("BB_METAL_IMAGE_COPY", native ? "1" : "0", 1);
     setenv("BB_METAL_IMAGE_TRANSFER", native ? "1" : "0", 1);
+    setenv("BB_METAL_IMAGE_CLEAR", native ? "1" : "0", 1);
     unsetenv("BB_VK_RECORD_THREAD");
     Vulkan::Instance instance(0, false);
     // Match the existing scene check: executable headers need their own dispatcher.
@@ -281,6 +283,82 @@ int main(int argc, char** argv) {
             assert(std::memcmp(expected_pixels.data(), pixels.mapped_data.data(), large_size) == 0);
         }
     }
+    // Clear production shared attachments and compare every byte with Vulkan's clear.
+    for (const auto format : {vk::Format::eR8Unorm, vk::Format::eR8G8Unorm,
+            vk::Format::eR8G8B8A8Unorm, vk::Format::eR8G8B8A8Srgb,
+            vk::Format::eB8G8R8A8Unorm, vk::Format::eB8G8R8A8Srgb,
+            vk::Format::eR16Sfloat, vk::Format::eR16G16Sfloat, vk::Format::eR16G16B16A16Sfloat}) {
+        VideoCore::ImageInfo info{};
+        info.type = AmdGpu::ImageType::Color2DArray;
+        info.pixel_format = format;
+        info.size = {32, 16, 1};
+        info.resources = {.levels = 3, .layers = 2};
+        VideoCore::Image target(instance, runtime, views, info), reference(instance, runtime, views, info);
+        assert(bool(target.backing->image.metal) == native && bool(reference.backing->image.metal) == native);
+        const VideoCore::SubresourceRange all{.base = {0, 0}, .extent = info.resources};
+        const VideoCore::SubresourceRange part{.base = {1, 1}, .extent = {.levels = 2, .layers = 1}};
+        const vk::ClearValue base{.color = {.float32 = std::array{0.0f, 1.0f, 0.0f, 1.0f}}};
+        const vk::ClearValue color{.color = {.float32 = std::array{0.125f, 0.5f, 1.5f, 0.25f}}};
+        const auto vulkan_clear = [&](const VideoCore::SubresourceRange& range, const vk::ClearValue& value) {
+            runtime.Transit(&reference, vk::ImageLayout::eTransferDstOptimal,
+                            vk::PipelineStageFlagBits2::eClear, vk::AccessFlagBits2::eTransferWrite, range);
+            runtime.FlushBarriers();
+            scheduler.Record([image = reference.GetImage(), range, value, &dispatch](vk::CommandBuffer cmd) {
+                const vk::ImageSubresourceRange sub{vk::ImageAspectFlagBits::eColor,
+                    range.base.level, range.extent.levels, range.base.layer, range.extent.layers};
+                cmd.clearColorImage(image, vk::ImageLayout::eTransferDstOptimal, value.color, sub, dispatch);
+            });
+        };
+        runtime.ClearImage(&target, all, base);
+        vulkan_clear(all, base);
+        VideoCore::StreamBuffer held(instance, scheduler, MemoryType::HostUncached, 4096);
+        assert(held.Reserve(4096));
+        bool retired = false;
+        scheduler.DeferOperation([&] { retired = true; });
+        const auto tick = scheduler.CurrentTick();
+        runtime.ClearImage(&target, part, color);
+        assert(scheduler.CurrentTick() == tick && !retired && !held.Reserve(4096, 0, false));
+        vulkan_clear(part, color);
+        if (native) {
+            void* texture = target.backing->image.metal->NativeHandle();
+            const VkImageSubresourceRange good{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+            auto bad = good; bad.levelCount = 0;
+            assert(!BbMetalFX::ClearImage(texture, bad, static_cast<VkClearColorValue>(color.color)));
+            bad = good; bad.baseMipLevel = UINT32_MAX;
+            assert(!BbMetalFX::ClearImage(texture, bad, static_cast<VkClearColorValue>(color.color)));
+            bad = good; bad.layerCount = 3;
+            assert(!BbMetalFX::ClearImage(texture, bad, static_cast<VkClearColorValue>(color.color)));
+            bad = good; bad.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+            assert(!BbMetalFX::ClearImage(texture, bad, static_cast<VkClearColorValue>(color.color)));
+            auto nonfinite = static_cast<VkClearColorValue>(color.color);
+            nonfinite.float32[0] = std::numeric_limits<float>::quiet_NaN();
+            assert(!BbMetalFX::ClearImage(texture, good, nonfinite));
+        }
+        std::vector<vk::BufferImageCopy> regions;
+        uint64_t size = 0;
+        for (uint32_t mip = 0; mip < 3; ++mip) {
+            regions.push_back({.bufferOffset = size, .imageSubresource = {vk::ImageAspectFlagBits::eColor, mip, 0, 2},
+                              .imageExtent = {32u >> mip, 16u >> mip, 1}});
+            size += (32u >> mip) * (16u >> mip) * vk::blockSize(format) * 2;
+        }
+        Buffer actual(instance, 0, size, MemoryType::HostCached), expected(instance, 0, size, MemoryType::HostCached);
+        // Independent Vulkan readbacks avoid cancelling out a native texture mapping bug.
+        for (const auto pair : {std::pair{&target, &actual}, std::pair{&reference, &expected}}) {
+            runtime.Transit(pair.first, vk::ImageLayout::eTransferSrcOptimal,
+                            vk::PipelineStageFlagBits2::eCopy, vk::AccessFlagBits2::eTransferRead);
+            runtime.FlushBarriers();
+            scheduler.Record([image = pair.first->GetImage(), buffer = pair.second->Handle(), regions, &dispatch](vk::CommandBuffer cmd) {
+                cmd.copyImageToBuffer(image, vk::ImageLayout::eTransferSrcOptimal, buffer, regions, dispatch);
+            });
+            runtime.AccessBuffer(pair.second, 0, size, vk::PipelineStageFlagBits2::eCopy, vk::AccessFlagBits2::eTransferWrite);
+        }
+        scheduler.Finish();
+        scheduler.PopPendingOperations();
+        assert(retired);
+        actual.Invalidate(0, size); expected.Invalidate(0, size);
+        assert(std::memcmp(actual.mapped_data.data(), expected.mapped_data.data(), size) == 0);
+    }
+    std::puts("PASS: nine-format render-pass clears match Vulkan bytes, selected mips/layers, untouched subresources and preserved staging/callbacks");
     VideoCore::ImageInfo depth_info{};
     depth_info.type = AmdGpu::ImageType::Color2D;
     depth_info.pixel_format = vk::Format::eD32Sfloat;

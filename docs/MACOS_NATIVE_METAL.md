@@ -450,3 +450,43 @@ A separate short run, `out/benchmarks/20261006-152604-166928-metal-transfer-visu
 was used to inspect Hunter's Dream, the character, scene textures and HUD with
 native transfers enabled. This confirms the observed rendering state, rather
 than adding an FPS comparison.
+
+## Native color-attachment clears (2026-10-06)
+
+`BB_METAL_IMAGE_CLEAR=1` with `BB_METAL_IMAGE_CACHE=1` replaces eligible game
+color clears with native Metal render passes over the existing shared texture.
+Each selected mip/layer uses `MTLLoadActionClear` and `MTLStoreActionStore`;
+there is no clone texture or CPU pixel transfer. This follows Apple's
+[render-pass clear contract](https://developer.apple.com/documentation/metal/mtlrenderpasscolorattachmentdescriptor/clearcolor).
+It covers the cache's nine uncompressed color formats and single-sample 2D
+textures/arrays. Empty or out-of-bounds ranges, non-color aspects, non-finite
+clear values, unsupported storage and native command failure retain Vulkan
+fallback. Depth, compressed and multisample storage still uses Vulkan.
+
+The runtime releases only the selected subresources to GENERAL, completes
+preceding Vulkan work without retiring the guest tick, runs Metal, then records
+the Vulkan acquisition. Staging reservations and callbacks remain live until
+ordinary submission. The clear and blit paths reuse one native command queue
+and completion helper. This remains synchronous and off by default; native
+draw pipelines and batching are unfinished.
+
+```bash
+python3 tools/benchmark_macos.py --seconds 30 --label native-color-clear --env BB_METAL_IMAGE_CLEAR=1
+```
+
+The existing `metal-buffer-test` passed direct, threaded and Vulkan modes. It
+compares every byte against independent Vulkan clear/readback commands across
+all nine formats, including sRGB and half-float, three mips and two layers. It
+checks partial-range preservation, rejected ranges/non-finite values and pending
+staging/callback lifetime. Logs:
+`out/macos-native-metal/image-clear-{check,threaded-check,vulkan-check}.log`.
+
+The automatic gameplay check
+`out/benchmarks/20261006-155126-270220-native-color-clear/` reached Hunter's Dream,
+visually retained the character/scene/HUD, logged at least 6,600 native clears,
+measured 20 seconds after five seconds of workload warmup and exited normally
+with status 0. Original save hashes were unchanged. The run selected PS4 30 FPS
+timing but averaged 16.05 guest FPS across its two complete measurement windows.
+Thermal pressure rose to fair and the runner flagged the result. This single
+run does not isolate the clear-path cost or establish a speedup; the path stays
+off by default.

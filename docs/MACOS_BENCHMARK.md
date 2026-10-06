@@ -23,8 +23,8 @@ copied save through Continue.
 
 Defaults match the current experimental setup: PS4 30 FPS game timing, FIFO,
 1280x720 scene, native Metal presentation, spatial MetalFX, shared buffer/image
-caches, native buffer copies, Vulkan image copies and conservative draw
-preparation. The renderer still uses Vulkan for game draws. Actual output size
+caches, native buffer copies, Vulkan image copies/transfers/clears and conservative
+draw preparation. The renderer still uses Vulkan for game draws. Actual output size
 is recorded in `game.log`.
 
 Before launch, the runner waits for 30 seconds of nominal macOS thermal pressure

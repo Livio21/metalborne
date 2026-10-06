@@ -16,6 +16,7 @@
 #include <mutex>
 #include <functional>
 #include <algorithm>
+#include <cmath>
 
 namespace BbMetalFX {
 struct SharedBuffer::Impl {
@@ -109,7 +110,8 @@ void* SharedBuffer::NativeHandle() const { return (__bridge void*)impl->metal; }
 uint8_t* SharedBuffer::MappedData() const { return static_cast<uint8_t*>(impl->metal.contents); }
 uint64_t SharedBuffer::DeviceAddress() const { return impl->address; }
 
-static bool RunBlit(id<MTLDevice> device, const std::function<void(id<MTLBlitCommandEncoder>)>& encode) {
+static bool RunCommands(id<MTLDevice> device,
+                        const std::function<bool(id<MTLCommandBuffer>, id<MTLFence>)>& encode) {
     @autoreleasepool {
         // ponytail: one device/queue and synchronous completion; batch with guest submissions later.
         static std::mutex mutex;
@@ -122,20 +124,27 @@ static bool RunBlit(id<MTLDevice> device, const std::function<void(id<MTLBlitCom
         if (!command || !fence || !release) return false;
         [release updateFence:fence];
         [release endEncoding];
-        id<MTLBlitCommandEncoder> encoder = [command blitCommandEncoder];
-        if (!encoder) return false;
-        [encoder waitForFence:fence];
-        encode(encoder);
-        [encoder endEncoding];
+        if (!encode(command, fence)) return false;
         [command commit];
         [command waitUntilCompleted];
         if (command.status != MTLCommandBufferStatusCompleted) {
-            std::fprintf(stderr, "Native Metal blit failed: %s; falling back to Vulkan.\n",
+            std::fprintf(stderr, "Native Metal command failed: %s; falling back to Vulkan.\n",
                          (command.error.localizedDescription ?: @"command failed").UTF8String);
             return false;
         }
         return true;
     }
+}
+
+static bool RunBlit(id<MTLDevice> device, const std::function<void(id<MTLBlitCommandEncoder>)>& encode) {
+    return RunCommands(device, [&](id<MTLCommandBuffer> command, id<MTLFence> fence) {
+        id<MTLBlitCommandEncoder> encoder = [command blitCommandEncoder];
+        if (!encoder) return false;
+        [encoder waitForFence:fence];
+        encode(encoder);
+        [encoder endEncoding];
+        return true;
+    });
 }
 
 bool CopyBuffers(void* source, void* destination, std::span<const VkBufferCopy> copies) {
@@ -295,6 +304,39 @@ SharedImage::~SharedImage() = default;
 VkImage SharedImage::Handle() const { return impl->metal ? impl->image : VK_NULL_HANDLE; }
 void* SharedImage::NativeHandle() const { return (__bridge void*)impl->metal; }
 uint64_t SharedImage::SizeBytes() const { return impl->size; }
+
+bool ClearImage(void* image, const VkImageSubresourceRange& range, const VkClearColorValue& color) {
+    @autoreleasepool {
+        id<MTLTexture> texture = (__bridge id<MTLTexture>)image;
+        if (!texture || (texture.textureType != MTLTextureType2D && texture.textureType != MTLTextureType2DArray) ||
+            texture.sampleCount != 1 || !(texture.usage & MTLTextureUsageRenderTarget) ||
+            range.aspectMask != VK_IMAGE_ASPECT_COLOR_BIT || !range.levelCount || !range.layerCount ||
+            range.baseMipLevel >= texture.mipmapLevelCount || range.levelCount > texture.mipmapLevelCount - range.baseMipLevel ||
+            range.baseArrayLayer >= texture.arrayLength || range.layerCount > texture.arrayLength - range.baseArrayLayer)
+            return false;
+        for (float component : color.float32) if (!std::isfinite(component)) return false;
+        return RunCommands(texture.device, [&](id<MTLCommandBuffer> command, id<MTLFence> fence) {
+            for (uint32_t level = range.baseMipLevel; level < range.baseMipLevel + range.levelCount; ++level)
+                for (uint32_t layer = range.baseArrayLayer; layer < range.baseArrayLayer + range.layerCount; ++layer) {
+                    MTLRenderPassDescriptor* pass = [MTLRenderPassDescriptor renderPassDescriptor];
+                    auto attachment = pass.colorAttachments[0];
+                    attachment.texture = texture;
+                    attachment.level = level;
+                    attachment.slice = layer;
+                    attachment.loadAction = MTLLoadActionClear;
+                    attachment.storeAction = MTLStoreActionStore;
+                    attachment.clearColor = MTLClearColorMake(color.float32[0], color.float32[1],
+                                                              color.float32[2], color.float32[3]);
+                    id<MTLRenderCommandEncoder> encoder = [command renderCommandEncoderWithDescriptor:pass];
+                    if (!encoder) return false;
+                    [encoder waitForFence:fence beforeStages:MTLRenderStageVertex];
+                    [encoder updateFence:fence afterStages:MTLRenderStageFragment];
+                    [encoder endEncoding];
+                }
+            return true;
+        });
+    }
+}
 
 static bool ValidImageRegion(id<MTLTexture> t, const VkImageSubresourceLayers& sub,
                              const VkOffset3D& o, const VkExtent3D& e) {

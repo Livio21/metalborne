@@ -812,6 +812,43 @@ void Runtime::ClearImage(VideoCore::Image* dst, const VideoCore::SubresourceRang
         .baseArrayLayer = range.base.layer,
         .layerCount = range.extent.layers,
     };
+#ifdef __APPLE__
+    bool native_cleared = false;
+    static const char* native_clear = std::getenv("BB_METAL_IMAGE_CLEAR");
+    if (native_clear && std::strcmp(native_clear, "1") == 0 && dst->backing->image.metal) {
+        const auto image = dst->GetImage();
+        const u32 family = instance.GetGraphicsQueueFamilyIndex();
+        const auto ownership = [&](bool release) {
+            scheduler.Record([image, vk_range, family, release](vk::CommandBuffer command) {
+                const vk::ImageMemoryBarrier2 barrier{
+                    .srcStageMask = release ? vk::PipelineStageFlagBits2::eAllCommands : vk::PipelineStageFlagBits2::eNone,
+                    .srcAccessMask = release ? vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite : vk::AccessFlags2{},
+                    .dstStageMask = release ? vk::PipelineStageFlagBits2::eNone : vk::PipelineStageFlagBits2::eAllCommands,
+                    .dstAccessMask = release ? vk::AccessFlags2{} : vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
+                    .oldLayout = release ? vk::ImageLayout::eTransferDstOptimal : vk::ImageLayout::eGeneral,
+                    .newLayout = release ? vk::ImageLayout::eGeneral : vk::ImageLayout::eTransferDstOptimal,
+                    .srcQueueFamilyIndex = release ? family : VK_QUEUE_FAMILY_EXTERNAL,
+                    .dstQueueFamilyIndex = release ? VK_QUEUE_FAMILY_EXTERNAL : family,
+                    .image = image, .subresourceRange = vk_range};
+                command.pipelineBarrier2(vk::DependencyInfo{.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &barrier});
+            });
+        };
+        ownership(true);
+        scheduler.FinishForExternal();
+        native_cleared = BbMetalFX::ClearImage(dst->backing->image.metal->NativeHandle(),
+                                            static_cast<VkImageSubresourceRange>(vk_range),
+                                            static_cast<VkClearColorValue>(clear_value.color));
+        ownership(false);
+        if (native_cleared) {
+            static std::atomic<u64> clears{0};
+            const auto count = clears.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (count <= 3 || count % 300 == 0)
+                std::fprintf(stderr, "Native Metal image clear #%llu: %u mips, %u layers; shared render attachment.\n",
+                             static_cast<unsigned long long>(count), vk_range.levelCount, vk_range.layerCount);
+        }
+    }
+    if (!native_cleared)
+#endif
     scheduler.Record([image = dst->GetImage(), color = clear_value.color,
                       vk_range](vk::CommandBuffer cmdbuf) {
         cmdbuf.clearColorImage(image, vk::ImageLayout::eTransferDstOptimal, color, vk_range);

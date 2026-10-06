@@ -180,7 +180,8 @@ def benchmark(args):
                BB_UPSCALER="off", BB_FSR1="0", BB_RCAS="0", BB_FPS="30", BB_FPS_LIMIT="0",
                BB_VBLANK_HZ="60", BB_PRESENT_MODE="Fifo", BB_PREP_WORKERS="0",
                BB_MACOS_CONSERVATIVE_GPU="1", BB_METAL_BUFFER_CACHE="1", BB_METAL_BUFFER_COPY="1",
-               BB_METAL_IMAGE_CACHE="1", BB_METAL_IMAGE_COPY="0", BB_METAL_IMAGE_TRANSFER="0", BB_FULLSCREEN="0")
+               BB_METAL_IMAGE_CACHE="1", BB_METAL_IMAGE_COPY="0", BB_METAL_IMAGE_TRANSFER="0",
+               BB_METAL_IMAGE_CLEAR="0", BB_FULLSCREEN="0")
     env.update(args.overrides)
     env.setdefault("BB_PATCHES", "Skip Intro + warning message")
     env.setdefault("BB_GPU_USER_DIR", str(ROOT / "out/macos-run/user"))

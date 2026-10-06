@@ -44,6 +44,8 @@ bool CopyImages(void* source, void* destination, std::span<const VkImageCopy> co
 // Shared uncompressed color storage; buffer pitches follow VkBufferImageCopy.
 bool CopyBufferImage(void* buffer, void* image, std::span<const VkBufferImageCopy> copies,
                      bool upload);
+// Same ownership contract; clears complete mip/layer subresources through render passes.
+bool ClearImage(void* image, const VkImageSubresourceRange& range, const VkClearColorValue& color);
 // One-shot shadow dispatch: clones buffers and leaves the live Vulkan resources untouched.
 bool CheckCompute(std::span<const ComputeBuffer> buffers, std::span<const uint8_t> push,
                   uint32_t groups, uint32_t threads);
