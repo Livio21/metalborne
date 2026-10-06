@@ -1,5 +1,9 @@
 # macOS performance investigation — 2026-10-04
 
+Repeatable automatic gameplay measurements are available through
+`python3 tools/benchmark_macos.py --seconds 30`; see
+[the benchmark runbook](MACOS_BENCHMARK.md) for settings, results and caveats.
+
 ## Reused bbport-mac optimizations (2026-10-06)
 
 Metalborne now incorporates the small KosmicKrisp list-restart optimization,

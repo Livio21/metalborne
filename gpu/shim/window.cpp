@@ -1,5 +1,6 @@
 // bbport: SDL3 window for the Vulkan swapchain (X11 or Wayland).
 #include <cstdlib>
+#include <cstdio>
 #include <cstring>
 #include <SDL3/SDL.h>
 #ifdef __APPLE__
@@ -93,6 +94,9 @@ void WindowSDL::UpdateTextTitle() {
 }
 
 bool WindowSDL::PollEvents() {
+    // Opt-in automation uses the same shutdown path as closing this window.
+    static const char* quit_file=std::getenv("BB_QUIT_FILE");
+    if (quit_file && *quit_file && std::remove(quit_file)==0) return false;
     {
         std::scoped_lock lock{text_mutex};
         if (text_requested) { // SDL text input must be toggled from the window thread
