@@ -47,7 +47,11 @@ bool CopyBufferImage(void* buffer, void* image, std::span<const VkBufferImageCop
 // Same ownership contract; clears complete mip/layer subresources through render passes.
 bool ClearImage(void* image, const VkImageSubresourceRange& range, const VkClearColorValue& color);
 // SDR host frame conversion; base mip/layer only, alpha forced to one like the Vulkan view.
-bool PostProcess(void* source, VkFormat view_format, void* destination, float gamma, bool srgb_input);
+bool PostProcess(void* source, VkFormat view_format, void* destination, float gamma, bool srgb_input,
+                 VkRect2D region = {}); // Empty region fills the image; otherwise clears black bars.
+// Tonemapped SDR scene, before UI; matching RGBA/BGRA8 storage, base mip/layer only.
+// Caller releases both images and completes Vulkan first, then acquires even on failure.
+bool UpscaleScene(void* source, void* destination, float* gpu_ms = nullptr);
 // One-shot shadow dispatch: clones buffers and leaves the live Vulkan resources untouched.
 bool CheckCompute(std::span<const ComputeBuffer> buffers, std::span<const uint8_t> push,
                   uint32_t groups, uint32_t threads);

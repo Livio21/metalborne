@@ -1457,6 +1457,15 @@ void TemporalUpscaler::RunUiOnly(VideoCore::ImageId color_id, VideoCore::ImageId
     vk::Image source = color.GetImage();
     auto source_layout = vk::ImageLayout::eTransferSrcOptimal;
     u32 source_width = color.info.size.width, source_height = color.info.size.height;
+#ifdef __APPLE__
+    static const bool metal_scene = [] {
+        const char* opt = std::getenv("BB_METALFX_SCENE");
+        const char* mode = std::getenv("BB_METALFX");
+        return opt && opt[0] == '1' && mode && std::strcmp(mode, "spatial") == 0;
+    }();
+    if (metal_scene) source_layout = vk::ImageLayout::eGeneral;
+    void* metal_source = color.backing->image.metal ? color.backing->image.metal->NativeHandle() : nullptr;
+#endif
     if (!scaled_session && camera_motion.Depth() && scene_targets.Reduced() &&
         scene_targets.EligibleScene(color)) {
         VideoCore::ImageViewInfo view;
@@ -1468,40 +1477,96 @@ void TemporalUpscaler::RunUiOnly(VideoCore::ImageId color_id, VideoCore::ImageId
         source_layout = proxy.layout;
         source_width = render_width;
         source_height = render_height;
+#ifdef __APPLE__
+        metal_source = proxy.metal;
+#endif
     } else {
-        runtime.Transit(&texture_cache.GetImage(color_id), vk::ImageLayout::eTransferSrcOptimal,
+        runtime.Transit(&texture_cache.GetImage(color_id), source_layout,
                         vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferRead);
         runtime.FlushBarriers();
     }
+    bool scaled = false;
+#ifdef __APPLE__
+    if (metal_scene && !metal_scene_failed && camera_motion.Ready() && ldr_target == color_id &&
+        metal_source && ui_image.metal && source_width < ui_width && source_height < ui_height &&
+        (color.info.pixel_format == vk::Format::eR8G8B8A8Unorm ||
+         color.info.pixel_format == vk::Format::eR8G8B8A8Srgb)) {
+        const auto start = std::chrono::steady_clock::now();
+        // The guest cannot reuse this scene until the shared UI background is ready.
+        // A command-thread bridge is necessary here until the driver exports GPU events.
+        const auto ownership = [&](bool release) {
+            const auto family = instance.GetGraphicsQueueFamilyIndex();
+            std::array<vk::ImageMemoryBarrier2, 2> barriers;
+            for (u32 i = 0; i < 2; ++i) barriers[i] = {
+                .srcStageMask = release ? vk::PipelineStageFlagBits2::eAllCommands : vk::PipelineStageFlagBits2::eNone,
+                .srcAccessMask = release ? vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite : vk::AccessFlags2{},
+                .dstStageMask = release ? vk::PipelineStageFlagBits2::eNone : vk::PipelineStageFlagBits2::eAllCommands,
+                .dstAccessMask = release ? vk::AccessFlags2{} : vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
+                .oldLayout = release ? (i ? vk::ImageLayout::eUndefined : source_layout) : vk::ImageLayout::eGeneral,
+                .newLayout = vk::ImageLayout::eGeneral,
+                .srcQueueFamilyIndex = release ? family : VK_QUEUE_FAMILY_EXTERNAL,
+                .dstQueueFamilyIndex = release ? VK_QUEUE_FAMILY_EXTERNAL : family,
+                .image = i ? vk::Image(ui_image) : source,
+                .subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1},
+            };
+            scheduler.CommandBuffer().pipelineBarrier2({.imageMemoryBarrierCount = 2,
+                                                         .pImageMemoryBarriers = barriers.data()});
+        };
+        ownership(true);
+        scheduler.FinishForExternal();
+        const auto released = std::chrono::steady_clock::now();
+        float gpu_ms = NAN;
+        scaled = BbMetalFX::UpscaleScene(metal_source, ui_image.metal->NativeHandle(), &gpu_ms);
+        ownership(false); // Failure must also return both images to Vulkan before the blit.
+        if (!scaled) {
+            metal_scene_failed = true;
+            std::printf("MetalFX scene unavailable: scaler/command failed; keeping Vulkan background blit\n");
+        }
+        static u64 completed = 0;
+        if (scaled && (++completed <= 3 || completed % 300 == 0)) {
+            const auto now = std::chrono::steady_clock::now();
+            std::printf("MetalFX scene #%llu: %ux%u -> %ux%u before HUD; Vulkan release %.3f ms, Metal/completion %.3f ms, GPU upscale+copy %.3f ms\n",
+                static_cast<unsigned long long>(completed), source_width, source_height, ui_width, ui_height,
+                std::chrono::duration<double, std::milli>(released-start).count(),
+                std::chrono::duration<double, std::milli>(now-released).count(), gpu_ms);
+        }
+    }
+#endif
     const auto cmd = scheduler.CommandBuffer();
+    if (!scaled) {
+        vk::ImageMemoryBarrier2 barrier{
+            .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+            .srcAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
+            .dstStageMask = vk::PipelineStageFlagBits2::eTransfer,
+            .dstAccessMask = vk::AccessFlagBits2::eTransferWrite,
+            .oldLayout = vk::ImageLayout::eUndefined,
+            .newLayout = vk::ImageLayout::eTransferDstOptimal,
+            .image = vk::Image(ui_image),
+            .subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1},
+        };
+        cmd.pipelineBarrier2({.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &barrier});
+        const vk::ImageBlit region{
+            .srcSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
+            .srcOffsets = std::array{vk::Offset3D{0, 0, 0},
+                vk::Offset3D{s32(source_width), s32(source_height), 1}},
+            .dstSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
+            .dstOffsets = std::array{vk::Offset3D{0, 0, 0},
+                vk::Offset3D{s32(ui_width), s32(ui_height), 1}},
+        };
+        cmd.blitImage(source, source_layout,
+                      vk::Image(ui_image), vk::ImageLayout::eTransferDstOptimal, region,
+                      vk::Filter::eLinear);
+    }
     vk::ImageMemoryBarrier2 barrier{
-        .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
-        .srcAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
-        .dstStageMask = vk::PipelineStageFlagBits2::eTransfer,
-        .dstAccessMask = vk::AccessFlagBits2::eTransferWrite,
-        .oldLayout = vk::ImageLayout::eUndefined,
-        .newLayout = vk::ImageLayout::eTransferDstOptimal,
         .image = vk::Image(ui_image),
         .subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1},
     };
-    cmd.pipelineBarrier2({.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &barrier});
-    const vk::ImageBlit region{
-        .srcSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
-        .srcOffsets = std::array{vk::Offset3D{0, 0, 0},
-            vk::Offset3D{s32(source_width), s32(source_height), 1}},
-        .dstSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
-        .dstOffsets = std::array{vk::Offset3D{0, 0, 0},
-            vk::Offset3D{s32(ui_width), s32(ui_height), 1}},
-    };
-    cmd.blitImage(source, source_layout,
-                  vk::Image(ui_image), vk::ImageLayout::eTransferDstOptimal, region,
-                  vk::Filter::eLinear);
-    barrier.srcStageMask = vk::PipelineStageFlagBits2::eTransfer;
-    barrier.srcAccessMask = vk::AccessFlagBits2::eTransferWrite;
+    barrier.srcStageMask = scaled ? vk::PipelineStageFlagBits2::eAllCommands : vk::PipelineStageFlagBits2::eTransfer;
+    barrier.srcAccessMask = scaled ? vk::AccessFlagBits2::eMemoryWrite : vk::AccessFlagBits2::eTransferWrite;
     barrier.dstStageMask = vk::PipelineStageFlagBits2::eColorAttachmentOutput;
     barrier.dstAccessMask = vk::AccessFlagBits2::eColorAttachmentRead |
                             vk::AccessFlagBits2::eColorAttachmentWrite;
-    barrier.oldLayout = vk::ImageLayout::eTransferDstOptimal;
+    barrier.oldLayout = scaled ? vk::ImageLayout::eGeneral : vk::ImageLayout::eTransferDstOptimal;
     barrier.newLayout = vk::ImageLayout::eGeneral;
     cmd.pipelineBarrier2({.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &barrier});
     reset = true; // returning to 3D must not reuse history from before a menu/loading screen

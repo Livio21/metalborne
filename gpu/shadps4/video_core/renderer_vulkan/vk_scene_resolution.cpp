@@ -407,7 +407,7 @@ SceneTargets::Entry& SceneTargets::Get(VideoCore::ImageId id, u32 level) {
         const auto proxy = ProxySize(original, level);
         ci.extent = vk::Extent3D{proxy.width, proxy.height, 1};
         ci.mipLevels = 1;
-        entry->image.Create(ci);
+        entry->image.Create(ci, &instance);
         tracked.insert(original.image_uid);
     }
     recent[recent_next++ % recent.size()] = {key, entry.get()};
@@ -484,6 +484,10 @@ SceneTargets::Target SceneTargets::Read(VideoCore::ImageId id,
     auto& original = *lookup(id, 0);
     auto& e = Get(id);
     Transition(e, original.aspect_mask, vk::ImageLayout::eGeneral, stages, access);
-    return {e.image, View(e, original, info), e.layout, e.image.image_ci.usage};
+    Target target{e.image, View(e, original, info), e.layout, e.image.image_ci.usage};
+#ifdef __APPLE__
+    if (e.image.metal) target.metal = e.image.metal->NativeHandle();
+#endif
+    return target;
 }
 } // namespace Vulkan

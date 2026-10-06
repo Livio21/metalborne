@@ -112,7 +112,9 @@ uint8_t* SharedBuffer::MappedData() const { return static_cast<uint8_t*>(impl->m
 uint64_t SharedBuffer::DeviceAddress() const { return impl->address; }
 
 static bool RunCommands(id<MTLDevice> device,
-                        const std::function<bool(id<MTLCommandBuffer>, id<MTLFence>)>& encode) {
+                        const std::function<bool(id<MTLCommandBuffer>, id<MTLFence>)>& encode,
+                        float* gpu_ms = nullptr) {
+    if (gpu_ms) *gpu_ms = NAN;
     @autoreleasepool {
         // ponytail: one device/queue and synchronous completion; batch with guest submissions later.
         static std::mutex mutex;
@@ -133,6 +135,8 @@ static bool RunCommands(id<MTLDevice> device,
                          (command.error.localizedDescription ?: @"command failed").UTF8String);
             return false;
         }
+        if (gpu_ms && command.GPUStartTime > 0 && command.GPUEndTime >= command.GPUStartTime)
+            *gpu_ms = 1000 * (command.GPUEndTime - command.GPUStartTime);
         return true;
     }
 }
@@ -309,7 +313,8 @@ void* SharedImage::NativeHandle() const { return (__bridge void*)impl->metal; }
 uint64_t SharedImage::SizeBytes() const { return impl->size; }
 
 static bool PostProcessImpl(void* source, VkFormat view_format, void* destination, float gamma,
-                            bool srgb_input, id<MTLCommandBuffer> supplied = nil) {
+                            bool srgb_input, id<MTLCommandBuffer> supplied = nil, VkRect2D region = {},
+                            bool overlay = false) {
     @autoreleasepool {
         id<MTLTexture> src = (__bridge id<MTLTexture>)source, dst = (__bridge id<MTLTexture>)destination;
         auto format = ImageFormat(view_format);
@@ -321,6 +326,10 @@ static bool PostProcessImpl(void* source, VkFormat view_format, void* destinatio
             !(src.usage & MTLTextureUsageShaderRead) || !(dst.usage & MTLTextureUsageRenderTarget) ||
             format == MTLPixelFormatInvalid || !std::isfinite(gamma) || gamma <= 0 || gamma >= 3.4f)
             return false;
+        const bool letterbox = region.extent.width || region.extent.height;
+        if (letterbox && (!region.extent.width || !region.extent.height || region.offset.x < 0 ||
+            region.offset.y < 0 || uint64_t(region.offset.x)+region.extent.width > dst.width ||
+            uint64_t(region.offset.y)+region.extent.height > dst.height)) return false;
         // Vulkan also permits RGBA/BGRA views of the same storage. Metal keeps the storage
         // format and implements that channel interpretation in the fragment shader.
         const auto family = [](MTLPixelFormat f) {
@@ -342,8 +351,9 @@ static bool PostProcessImpl(void* source, VkFormat view_format, void* destinatio
         }
         id<MTLTexture> input = [src newTextureViewWithPixelFormat:format textureType:MTLTextureType2D
                                     levels:NSMakeRange(0, 1) slices:NSMakeRange(0, 1)];
-        id<MTLTexture> output = [dst newTextureViewWithPixelFormat:dst.pixelFormat textureType:MTLTextureType2D
-                                    levels:NSMakeRange(0, 1) slices:NSMakeRange(0, 1)];
+        id<MTLTexture> output = dst.textureType == MTLTextureType2D ? dst :
+            [dst newTextureViewWithPixelFormat:dst.pixelFormat textureType:MTLTextureType2D
+                   levels:NSMakeRange(0, 1) slices:NSMakeRange(0, 1)];
         if (!input || !output) return false;
         const auto encode = [&](id<MTLCommandBuffer> command, id<MTLFence> fence) {
             // The headless check and presentation share the same encoder and PSO cache.
@@ -396,20 +406,26 @@ static bool PostProcessImpl(void* source, VkFormat view_format, void* destinatio
             }
             MTLRenderPassDescriptor* pass = [MTLRenderPassDescriptor renderPassDescriptor];
             pass.colorAttachments[0].texture = output;
-            pass.colorAttachments[0].loadAction = MTLLoadActionDontCare;
+            pass.colorAttachments[0].loadAction = letterbox ? MTLLoadActionClear : MTLLoadActionDontCare;
+            pass.colorAttachments[0].clearColor = MTLClearColorMake(0,0,0,1);
             pass.colorAttachments[0].storeAction = MTLStoreActionStore;
             id<MTLRenderCommandEncoder> encoder = [command renderCommandEncoderWithDescriptor:pass];
             if (!encoder) return false;
             if (fence) [encoder waitForFence:fence beforeStages:MTLRenderStageVertex];
             [encoder setRenderPipelineState:pipeline];
-            [encoder setViewport:MTLViewport{0,0,double(output.width),double(output.height),0,1}];
+            [encoder setViewport:letterbox ? MTLViewport{double(region.offset.x),double(region.offset.y),
+                double(region.extent.width),double(region.extent.height),0,1} :
+                MTLViewport{0,0,double(output.width),double(output.height),0,1}];
             [encoder setFragmentTexture:input atIndex:0];
             const struct { float gamma; uint32_t srgb_input, swap; } settings{gamma, uint32_t(srgb_input), uint32_t(swap)};
             [encoder setFragmentBytes:&settings length:sizeof(settings) atIndex:0];
             [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+            const bool overlay_ok = !overlay || BbOverlay::RenderMetal((__bridge void*)dst.device,
+                (__bridge void*)pass, (__bridge void*)command, (__bridge void*)encoder,
+                uint32_t(dst.width), uint32_t(dst.height));
             if (fence) [encoder updateFence:fence afterStages:MTLRenderStageFragment];
             [encoder endEncoding];
-            return true;
+            return overlay_ok;
         };
         // Vulkan completion protects the shared input. Private post-process output is
         // tracked by Metal across the following scaler/presentation encoders.
@@ -417,8 +433,79 @@ static bool PostProcessImpl(void* source, VkFormat view_format, void* destinatio
     }
 }
 
-bool PostProcess(void* source, VkFormat view_format, void* destination, float gamma, bool srgb_input) {
-    return PostProcessImpl(source, view_format, destination, gamma, srgb_input);
+bool PostProcess(void* source, VkFormat view_format, void* destination, float gamma, bool srgb_input,
+                 VkRect2D region) {
+    return PostProcessImpl(source, view_format, destination, gamma, srgb_input, nil, region);
+}
+
+bool UpscaleScene(void* source, void* destination, float* gpu_ms) {
+    if (gpu_ms) *gpu_ms = NAN;
+    @autoreleasepool {
+        id<MTLTexture> src = (__bridge id<MTLTexture>)source, dst = (__bridge id<MTLTexture>)destination;
+        const auto format = [](MTLPixelFormat f) {
+            if (f == MTLPixelFormatRGBA8Unorm_sRGB) return MTLPixelFormatRGBA8Unorm;
+            if (f == MTLPixelFormatBGRA8Unorm_sRGB) return MTLPixelFormatBGRA8Unorm;
+            return f;
+        };
+        const auto valid = [](id<MTLTexture> t) {
+            return t && t.textureType == MTLTextureType2D && t.sampleCount == 1 &&
+                   t.mipmapLevelCount == 1 && t.arrayLength == 1;
+        };
+        if (!valid(src) || !valid(dst) || src == dst || src.device != dst.device ||
+            dst.width <= src.width || dst.height <= src.height ||
+            format(src.pixelFormat) != format(dst.pixelFormat) ||
+            (format(src.pixelFormat) != MTLPixelFormatRGBA8Unorm &&
+             format(src.pixelFormat) != MTLPixelFormatBGRA8Unorm) ||
+            ![MTLFXSpatialScalerDescriptor supportsDevice:src.device]) return false;
+        // The game has already tonemapped these encoded bytes. Avoid an extra sRGB
+        // view decode/encode before the subsequent sRGB HUD attachment uses them.
+        id<MTLTexture> input = [src newTextureViewWithPixelFormat:format(src.pixelFormat)];
+        id<MTLTexture> output = [dst newTextureViewWithPixelFormat:format(dst.pixelFormat)];
+        if (!input || !output) return false;
+        // ponytail: one synchronous scene scaler; per-renderer cache if multiple games share a process.
+        static std::mutex mutex;
+        std::scoped_lock lock{mutex};
+        static id<MTLDevice> device;
+        static id<MTLFXSpatialScaler> scaler;
+        static id<MTLTexture> scaled;
+        if (device != src.device || !scaler || scaler.inputWidth != src.width ||
+            scaler.inputHeight != src.height || scaler.outputWidth != dst.width ||
+            scaler.outputHeight != dst.height || scaler.colorTextureFormat != input.pixelFormat) {
+            device = src.device;
+            MTLFXSpatialScalerDescriptor* desc = [MTLFXSpatialScalerDescriptor new];
+            desc.inputWidth = src.width; desc.inputHeight = src.height;
+            desc.outputWidth = dst.width; desc.outputHeight = dst.height;
+            desc.colorTextureFormat = input.pixelFormat; desc.outputTextureFormat = output.pixelFormat;
+            desc.colorProcessingMode = MTLFXSpatialScalerColorProcessingModePerceptual;
+            scaler = [desc newSpatialScalerWithDevice:device];
+            MTLTextureDescriptor* texture = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:
+                output.pixelFormat width:dst.width height:dst.height mipmapped:NO];
+            texture.storageMode = MTLStorageModePrivate;
+            texture.usage = scaler.outputTextureUsage;
+            scaled = [device newTextureWithDescriptor:texture];
+        }
+        if (!scaler || !scaled || (input.usage & scaler.colorTextureUsage) != scaler.colorTextureUsage)
+            return false;
+        scaler.colorTexture = input; scaler.outputTexture = scaled;
+        scaler.inputContentWidth = src.width; scaler.inputContentHeight = src.height;
+        const bool ok = RunCommands(device, [&](id<MTLCommandBuffer> command, id<MTLFence> fence) {
+            scaler.fence = fence;
+            [scaler encodeToCommandBuffer:command];
+            // MetalFX requires private output; copy it to the shared UI attachment on the GPU.
+            id<MTLBlitCommandEncoder> copy = [command blitCommandEncoder];
+            if (!copy) return false;
+            [copy waitForFence:fence];
+            [copy copyFromTexture:scaled sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0,0,0)
+                sourceSize:MTLSizeMake(dst.width,dst.height,1) toTexture:output
+                destinationSlice:0 destinationLevel:0 destinationOrigin:MTLOriginMake(0,0,0)];
+            [copy updateFence:fence];
+            [copy endEncoding];
+            return true;
+        }, gpu_ms);
+        // Never retain a borrowed guest/shared texture after the synchronous call returns.
+        scaler.colorTexture = nil; scaler.outputTexture = nil; scaler.fence = nil;
+        return ok;
+    }
 }
 
 bool ClearImage(void* image, const VkImageSubresourceRange& range, const VkClearColorValue& color) {
@@ -833,7 +920,9 @@ bool Presentation::Encode(uint32_t key, uint32_t window_width, uint32_t window_h
         if (!command) { impl->Disable("Metal command buffer allocation failed"); return false; }
         command.label = native ? @"Metalborne native presentation" : @"bbport MetalFX spatial";
         id<MTLTexture> color = s.input.metal;
-        if (native && post_format != VK_FORMAT_UNDEFINED) {
+        const bool direct_post = native && post_format != VK_FORMAT_UNDEFINED && !s.scaler;
+        if (direct_post) s.post = nil;
+        if (native && post_format != VK_FORMAT_UNDEFINED && s.scaler) {
             if (!s.post) {
                 MTLTextureDescriptor* desc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:
                     color.pixelFormat width:color.width height:color.height mipmapped:NO];
@@ -875,7 +964,7 @@ bool Presentation::Encode(uint32_t key, uint32_t window_width, uint32_t window_h
             layer.framebufferOnly = YES;
             layer.displaySyncEnabled = YES;
             layer.drawableSize = CGSizeMake(window_width, window_height);
-            if (!impl->present_pipeline) {
+            if (!direct_post && !impl->present_pipeline) {
                 NSString* source = @R"MSL(
                     #include <metal_stdlib>
                     using namespace metal;
@@ -903,24 +992,36 @@ bool Presentation::Encode(uint32_t key, uint32_t window_width, uint32_t window_h
             }
             id<CAMetalDrawable> drawable = [layer nextDrawable];
             if (!drawable) return false; // Occlusion/resize can temporarily exhaust drawables.
-            MTLRenderPassDescriptor* pass = [MTLRenderPassDescriptor renderPassDescriptor];
-            pass.colorAttachments[0].texture = drawable.texture;
-            pass.colorAttachments[0].loadAction = MTLLoadActionClear;
-            pass.colorAttachments[0].storeAction = MTLStoreActionStore;
-            pass.colorAttachments[0].clearColor = MTLClearColorMake(0,0,0,1);
-            id<MTLRenderCommandEncoder> encoder = [command renderCommandEncoderWithDescriptor:pass];
-            if (!encoder) { impl->Disable("presentation encoder allocation failed"); return false; }
-            if (s.scaler.fence) [encoder waitForFence:s.scaler.fence beforeStages:MTLRenderStageFragment];
-            [encoder setViewport:MTLViewport{double(window_width-s.images.output_width)/2,
-                double(window_height-s.images.output_height)/2, double(s.images.output_width),
-                double(s.images.output_height), 0, 1}];
-            [encoder setRenderPipelineState:impl->present_pipeline];
-            [encoder setFragmentTexture:s.scaler ? s.scaled : color atIndex:0];
-            [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
-            const bool overlay = BbOverlay::RenderMetal((__bridge void*)layer.device,
-                (__bridge void*)pass, (__bridge void*)command, (__bridge void*)encoder,
-                window_width, window_height);
-            [encoder endEncoding];
+            if (direct_post) {
+                const VkRect2D region{{int32_t((window_width-s.images.output_width)/2),
+                                       int32_t((window_height-s.images.output_height)/2)},
+                                      {s.images.output_width,s.images.output_height}};
+                if (!PostProcessImpl((__bridge void*)color,post_format,(__bridge void*)drawable.texture,
+                                     gamma,false,command,region,true)) {
+                    impl->Disable("direct drawable post-process failed"); return false;
+                }
+            }
+            bool overlay = true;
+            if (!direct_post) {
+                MTLRenderPassDescriptor* pass = [MTLRenderPassDescriptor renderPassDescriptor];
+                pass.colorAttachments[0].texture = drawable.texture;
+                pass.colorAttachments[0].loadAction = MTLLoadActionClear;
+                pass.colorAttachments[0].storeAction = MTLStoreActionStore;
+                pass.colorAttachments[0].clearColor = MTLClearColorMake(0,0,0,1);
+                id<MTLRenderCommandEncoder> encoder = [command renderCommandEncoderWithDescriptor:pass];
+                if (!encoder) { impl->Disable("presentation encoder allocation failed"); return false; }
+                if (s.scaler.fence) [encoder waitForFence:s.scaler.fence beforeStages:MTLRenderStageFragment];
+                [encoder setViewport:MTLViewport{double(window_width-s.images.output_width)/2,
+                    double(window_height-s.images.output_height)/2, double(s.images.output_width),
+                    double(s.images.output_height), 0, 1}];
+                [encoder setRenderPipelineState:impl->present_pipeline];
+                [encoder setFragmentTexture:s.scaler ? s.scaled : color atIndex:0];
+                [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+                overlay = BbOverlay::RenderMetal((__bridge void*)layer.device,
+                    (__bridge void*)pass, (__bridge void*)command, (__bridge void*)encoder,
+                    window_width, window_height);
+                [encoder endEncoding];
+            }
             [command presentDrawable:drawable];
             [command commit];
             [command waitUntilCompleted];
@@ -928,6 +1029,19 @@ bool Presentation::Encode(uint32_t key, uint32_t window_width, uint32_t window_h
                 impl->Disable(!overlay ? "Metal overlay initialization failed" : "Metal presentation command failed");
                 return false;
             }
+            static uint64_t timed = 0;
+            if (command.GPUStartTime > 0 && command.GPUEndTime >= command.GPUStartTime &&
+                (++timed <= 3 || timed % 300 == 0))
+                std::fprintf(stderr, "Native Metal GPU #%llu: %.3f ms; post=%u spatial=%u, frame=%ux%u target=%ux%u drawable=%ux%u direct_post=%u\n",
+                    static_cast<unsigned long long>(timed), 1000*(command.GPUEndTime-command.GPUStartTime),
+                    unsigned(post_format != VK_FORMAT_UNDEFINED), unsigned(s.scaler != nil),
+                    s.images.input_width, s.images.input_height, s.images.output_width, s.images.output_height,
+                    window_width, window_height, unsigned(direct_post));
+            static uint64_t direct_frames = 0;
+            if (direct_post && (++direct_frames <= 3 || direct_frames % 300 == 0))
+                std::fprintf(stderr, "Native Metal direct post-process #%llu: %ux%u -> %ux%u; color conversion/scaling into drawable, no intermediate frame.\n",
+                    static_cast<unsigned long long>(direct_frames), s.images.input_width,s.images.input_height,
+                    s.images.output_width,s.images.output_height);
             if (!impl->presented) {
                 impl->presented = true;
                 std::fprintf(stderr, "Native Metal presentation: first drawable completed successfully%s.\n",

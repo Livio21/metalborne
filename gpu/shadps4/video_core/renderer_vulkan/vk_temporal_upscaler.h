@@ -186,6 +186,9 @@ private:
 
     bool enabled = false;
     bool failed = false;
+#ifdef __APPLE__
+    bool metal_scene_failed = false;
+#endif
     u64 trigger_hash = 0x9a9cf8a9;
     VideoCore::ImageId scene_color{};
     bool done_this_frame = false;

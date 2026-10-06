@@ -21,7 +21,9 @@ BB_PRESENT_BACKEND=metal BB_METALFX=off BB_RENDER_RES=1280x720 \
 
 Use `BB_METALFX=spatial` in that command to upscale through MetalFX before the
 native presentation pass. Equal-size and smaller windows use Metal sampling;
-they do not invoke the spatial scaler. The game HUD is part of the game frame.
+they do not invoke that scaler. `BB_METALFX_SCENE=1 BB_METAL_IMAGE_CACHE=1`
+also enables the experimental scene upscale before the native-resolution HUD;
+see the measured limitations below. The game HUD is otherwise part of the frame.
 The settings menu and FPS counter use the existing ImGui Metal backend at
 display resolution, with the same keyboard, mouse and controller input handling.
 
@@ -77,8 +79,8 @@ existing format/frame setup; the native branch does not acquire or present it.
 ## Small runtime check
 
 Run with `BB_FRAME_STATS=1`, enter offline gameplay, open and close the settings
-menu once, then close the game normally. Pass `spatial` or `off` to match the
-MetalFX mode used for that run:
+menu once, then close the game normally. Pass `spatial` or `off` for the
+presentation mode, or `scene` to require completed pre-HUD upscales:
 
 ```bash
 python3 - out/native-metal-check.log spatial <<'PY'
@@ -86,23 +88,31 @@ from pathlib import Path
 import re, sys
 log = Path(sys.argv[1]).read_text(errors='replace')
 mode = sys.argv[2]
-assert mode in ('spatial', 'off')
-assert ('first drawable completed successfully' +
-        (' with MetalFX spatial.' if mode == 'spatial' else '.')) in log
+assert mode in ('spatial', 'off', 'scene')
+assert 'first drawable completed successfully' in log
+if mode == 'spatial':
+    assert 'first drawable completed successfully with MetalFX spatial.' in log
+if mode == 'off':
+    assert 'first drawable completed successfully.' in log
+if mode == 'scene':
+    assert len(re.findall(r'MetalFX scene #\d+: 1280x720 -> 1920x1080 before HUD', log)) >= 3
 assert 'Overlay: native Metal renderer ready' in log
 assert ('Vulkan frame input in shared' in log or
         'post-processing renders directly into shared' in log)
 assert ('Vulkan render (no input copy)/completion' in log or
         'Vulkan snapshot/completion' in log)
 assert not re.search(r'Native Metal bridge:.*?Vulkan copy/completion', log)
-assert len(re.findall(r'Guest flip stats: [\d.]+ FPS.*? [1-9]\d{2,} draws/frame', log)) >= 3
+assert sum(int(n) >= 500 for n in re.findall(r'Guest flip stats: [\d.]+ FPS.*? (\d+) draws/frame', log)) >= 3
 assert not re.search(r'Native Metal presentation unavailable|failed assertion|Assertion failed|SIGBUS|SIGSEGV', log)
-print('Native presentation, MetalFX, overlay and gameplay progress recorded')
+print('Native presentation, overlay and gameplay progress recorded; ' +
+      ('scene scaler completions checked' if mode == 'scene' else 'first drawable scaler mode checked'))
 PY
 ```
 
 The check requires at least three gameplay reporting windows; inspect the actual
-image, controls and resize behavior separately. It is not a scanout or pacing
+image, controls and resize behavior separately. `spatial` proves its first
+drawable, which can be a boot frame; use `scene` for pre-HUD gameplay scaler
+completions. It is not a scanout or pacing
 measurement. `Native Metal bridge` reports CPU wall time including render
 completion, drawable acquisition and Metal encoding/completion waits.
 
@@ -168,28 +178,37 @@ Vulkan copies the encoded image bytes asynchronously into the existing,
 fence-protected shared frame. This prevents a later guest write from racing a
 Metal read and lets the game command thread continue. The presentation thread
 uses its existing external-ownership release/completion/acquire contract. Native
-color conversion writes a tracked private texture, followed by optional
-MetalFX and presentation in the same Metal command buffer. There is one Metal
+color conversion renders directly into the drawable when no presentation scaler
+is needed, including scaling and letterboxing. The overlay shares that encoder
+and render pass. This removes the intermediate color texture and second fullscreen
+draw. When a larger window uses MetalFX, conversion still writes a tracked private
+texture, followed by the scaler and presentation in the same command buffer. There is one Metal
 submission/completion wait for those stages, and no CPU pixel copy. No public
 shared-event bridge is available, so the presentation thread still waits for
 Vulkan and Metal completion.
 
-At 1920x1080 RGBA8, this path adds a roughly 7.9 MiB private color texture per
-slot (23.7 MiB for three slots) and an 8.3 MB GPU snapshot per frame. This is a
+At 1920x1080 RGBA8, the scaler path adds a roughly 7.9 MiB private color texture per
+slot (23.7 MiB for three slots); direct conversion into the drawable does not.
+Both retain the 8.3 MB GPU snapshot per frame. This is a
 native pipeline transition, not an established optimization. Failed native
 conversion disables native presentation; queued unconverted frames retire
 through their existing fences without being shown, and freshly prepared frames
 use Vulkan post-processing. Runtime failure injection was not performed.
+Fusing scaling with conversion also filters the source before gamma conversion,
+whereas the previous two-pass path filtered the already-converted frame. Constant
+color/letterbox checks and the native/Vulkan conversion fixtures pass; complete
+pipeline pixel equivalence and moving-scene quality remain separate checks.
 
 The prior native path reduced the composed 1080p HUD to the 720p scene size,
 then enlarged it again. Frame allocation now preserves the display override's
 1920x1080 size after its fence completes. Spatial MetalFX still scales the
 complete composite for larger drawables; at equal or smaller sizes it is not
-invoked. Scene upscaling before drawing the HUD remains separate work.
+invoked. The optional scene scaler below runs before drawing the HUD.
 The checked window initially prepared a 1710x961 target. With the preserved
 1920x1080 UI input, gameplay uses native sampling rather than spatial MetalFX;
-the successful MetalFX message refers to the earlier 720p boot frame. Moving
-MetalFX before HUD composition and auditing Retina drawable sizing remain open.
+the successful presentation MetalFX message refers to the earlier 720p boot frame.
+The scene option has its own completed-upscale counter. Retina drawable sizing
+remains a separate audit.
 
 The existing `metal-buffer-test` now compares native output with the original
 Vulkan host pass after byte-preserving Vulkan snapshots. All 144 source-format,
@@ -199,7 +218,7 @@ rows/channels catch orientation and channel errors; alpha is checked separately.
 Direct and threaded recording passed, as did the original Vulkan fallback
 allocation/copy check. Logs: `out/macos-native-metal/post-process-{check,threaded-check,vulkan-check}.log`.
 
-The initial synchronous implementation recorded 18.9 FPS versus a 28.0 FPS
+Before the direct-drawable change, the initial synchronous implementation recorded 18.9 FPS versus a 28.0 FPS
 Vulkan reference in stationary Hunter's Dream, both with nominal pressure.
 Moving conversion to the presentation thread recorded 26.1 FPS. The final
 combined command was visually inspected in the title menu and Hunter's Dream,
@@ -220,6 +239,108 @@ Evidence under `out/benchmarks/`: `20261006-204515-506098-native-post-swizzle`,
 `20261006-210117-534512-native-post-combined`,
 `20261006-210505-198243-combined-vulkan-reference`. Each completed with status 0;
 no shader/pipeline compilation occurred during its measurement windows.
+
+### Direct drawable and shared overlay pass
+
+With no presentation scaler, host color conversion, aspect-fit scaling,
+letterboxing and the settings overlay now share one native render encoder on the
+drawable. The optional private post-process texture is released after its prior
+command completes. Larger-window MetalFX retains the private conversion path.
+There is still a Vulkan raw-frame snapshot to protect guest lifetime.
+
+Stationary warm-cache sessions with original 30 FPS timing, 30-second warmup and
+45-second measurement recorded:
+
+| Host path | Guest FPS | Median / worst-window p99 | Measurement pressure | GPU command samples |
+| --- | --- | --- | --- | --- |
+| Vulkan host pass, native presentation reference | 27.6 | 33.33 / 50.02 ms | fair | 0.148-0.166 ms, presentation only |
+| Native drawable conversion, separate overlay load pass | 25.0 | 33.33-33.34 / 50.02 ms | fair | 0.482-0.673 ms |
+| Vulkan reference repeat | 27.5 | 33.33 / 50.02 ms | fair | retained in raw results |
+| Native drawable conversion and overlay in one pass | 27.3 | 33.33 / 50.02 ms | fair | 0.452-0.468 ms |
+
+These sequential sessions logged no compilation and comparable stationary draw
+counts; they all became thermally **fair** after starting at nominal pressure.
+The final native path has approached reference throughput in this observation,
+but no isolated speedup, fixed clocks or stable 30 FPS are established. GPU
+samples cover different command contents in Vulkan-host and native-host modes;
+they are not whole-frame GPU time or per-shader comparisons. Keep native host
+conversion off by default.
+
+Evidence under `out/benchmarks/`: `20261006-213744-860914-direct-post-vulkan-reference`,
+`20261006-214133-337492-direct-drawable-post`,
+`20261006-214608-526894-direct-post-vulkan-repeat`, and
+`20261006-215133-876161-direct-drawable-one-pass`. All four exited normally.
+The two-pass drawable run visibly rendered the native settings overlay; the
+final one-pass timing run completed through the same overlay backend with it hidden.
+A separate correctness run, `20261006-215600-687520-direct-one-pass-ui-check`,
+visibly rendered the settings overlay in the shared pass, survived window
+zoom/restore during its 90-second warmup, and exited normally. Its 15-second
+interval averaged 21.8 FPS with fair pressure and worst-window p99 66.67 ms.
+The different warmup and UI interaction make it unsuitable for the comparison
+above; the lower sustained throughput reinforces that stable 30 FPS is unproven.
+Full image comparisons and moving-camera/gameplay validation remain open.
+
+## Scene MetalFX before the HUD: 2026-10-06
+
+```bash
+BB_PRESENT_BACKEND=metal BB_METALFX=spatial BB_METALFX_SCENE=1 \
+  BB_METAL_IMAGE_CACHE=1 BB_RENDER_RES=1280x720 BB_UPSCALER=off \
+  BB_FSR1=0 BB_RCAS=0 bash macos/run.sh
+```
+
+`RunUiOnly` replaces the linear scene-background blit at the existing UI boundary.
+Only a camera-identified finished RGBA8 scene qualifies; menus, unsupported
+resources and failed scaler commands keep the Vulkan blit. Native conversion is
+still disabled by default (`BB_METAL_POST_PROCESS=0`). The normal benchmark also
+keeps scene MetalFX off; select it with `--env BB_METALFX_SCENE=1`.
+
+The source and UI destination use the existing shared image cache. Reduced scene
+proxies can now allocate through that cache and expose their borrowed Metal
+handle from `SceneTargets::Read`. The ordinary source enters GENERAL through
+`Runtime::Transit`, keeping the image layout tracker coherent even on fallback.
+Vulkan releases both images and
+`FinishForExternal` preserves staging reservations until completion. MetalFX
+reads encoded tonemapped bytes through UNORM views in perceptual mode, writes a
+cached private output, then GPU-blits into the shared UI attachment. Both images
+return to Vulkan ownership even if scaling fails. Subsequent HUD/text draws stay
+at 1920x1080. The driver still needs a synchronous command-thread completion
+bridge here; pixels never pass through CPU memory.
+
+The existing headless check covers four RGBA/BGRA UNORM/sRGB source formats,
+changed input, two output sizes, constant-color quadrants for orientation/color/
+alpha, rejected scaling, and finite GPU duration. It also checks direct host
+conversion with black letterboxing and invalid viewport bounds. The earlier
+144 native/Vulkan color-conversion comparisons still pass. Direct, deferred
+recording and original Vulkan modes passed. Logs:
+`out/macos-native-metal/scene-direct-{check,threaded-check,vulkan-check}.log`.
+
+Hunter's Dream rendered with repeated `MetalFX scene ... 1280x720 -> 1920x1080
+before HUD` completion messages, visible scene/HUD, and a clean exit in
+`out/benchmarks/20261006-212923-357699-pre-hud-metalfx/`. The 60-second interval
+averaged 18.2 FPS, median 50 ms and worst-window p99 150 ms, with no compilation
+and 783-798 draws/frame. Thermal pressure became **fair**, so this run establishes
+functionality and measured costs, not an isolated slowdown or speedup.
+Repeated sparse samples logged 37.6-42.4 ms waiting for Vulkan release versus
+0.46-0.60 ms of GPU upscale/copy work and 0.79-1.00 ms of Metal CPU completion
+time. Keep it opt-in while addressing the command-thread bridge.
+
+The final layout-tracking build repeated at least 600 scene completions and
+exited normally in `20261006-220321-916073-pre-hud-layout-check`. This short
+correctness run used 5-second warmup / 15-second measurement and no additional
+cooldown. It recorded 20.8 FPS with nominal OS pressure; sparse samples showed
+33.6-34.9 ms Vulkan release and 0.438-0.444 ms GPU upscale/copy. Nominal pressure
+does not establish equal clocks, and these durations are not a controlled
+performance comparison. All seven runs retained the 15 source-save file hashes.
+
+Native presentation now logs completed command GPU durations and exact input,
+target and drawable sizes. The benchmark retains those sparse samples in
+`results.json`; they include all work in that command, not an isolated shader or
+display scanout time. The first scene run predates that parser extension and
+retains its samples in `game.log`. Timing is read after command completion using
+[Apple's command-buffer GPU timestamps](https://developer.apple.com/documentation/metal/mtlcommandbuffer/gpustarttime).
+The integration follows Apple's guidance to cache the scaler and upscale the
+tonemapped scene in perceptual space
+[before drawing the UI](https://developer.apple.com/videos/play/wwdc2022/10103/).
 
 ## Next transition steps
 

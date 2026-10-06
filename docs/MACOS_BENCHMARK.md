@@ -22,7 +22,7 @@ can otherwise send a run into the login-failure dialog. The runner loads the
 copied save through Continue.
 
 Defaults match the current experimental setup: PS4 30 FPS game timing, FIFO,
-1280x720 scene, native Metal presentation, spatial MetalFX, shared buffer/image
+1280x720 scene, native Metal presentation, presentation spatial MetalFX, shared buffer/image
 caches, native buffer copies, Vulkan image copies/transfers/clears/host
 post-processing and conservative
 draw preparation. The renderer still uses Vulkan for game draws. Actual output size
@@ -70,6 +70,7 @@ python3 tools/benchmark_macos.py --seconds 60 --label serial-preload --env BB_PR
 python3 tools/benchmark_macos.py --seconds 60 --label vulkan --env BB_PRESENT_BACKEND=vulkan --env BB_METALFX=off
 python3 tools/benchmark_macos.py --seconds 60 --label metal-transfers --env BB_METAL_IMAGE_TRANSFER=1
 python3 tools/benchmark_macos.py --seconds 60 --label metal-host-pass --env BB_METAL_POST_PROCESS=1
+python3 tools/benchmark_macos.py --seconds 60 --label metal-scene --env BB_METALFX_SCENE=1
 python3 tools/benchmark_macos.py --manual --seconds 30
 python3 tools/benchmark_macos.py --self-check
 ```
@@ -80,12 +81,17 @@ eight values per line: milliseconds, buttons, four stick axes and two triggers.
 The recording must cover the measurement duration. It starts after warmup;
 without a route, all stick axes stay centered for a stationary benchmark.
 
-For the native host pass, inspect `Native Metal post-process` messages in
+For the native host pass, inspect `Native Metal post-process` or
+`Native Metal direct post-process` messages in
 `game.log`; an enabled flag alone does not prove supported frames took that
-path. Gameplay should retain the composed UI size, for example
-`1920x1080 -> 1920x1080`. `Vulkan snapshot/completion` includes the asynchronous
+path. The input should retain the composed UI size (1920x1080); direct conversion
+scales it once to the drawable's aspect-fit target. The larger-window scaler
+path retains `1920x1080 -> 1920x1080` during host conversion.
+`Vulkan snapshot/completion` includes the asynchronous
 GPU copy of encoded bytes into the shared frame. It is not a CPU pixel readback.
 Resize and overlay checks belong before measurement or in a separate run.
+For scene MetalFX, require completed `MetalFX scene ... before HUD` messages;
+a boot presentation message alone does not establish use in gameplay.
 
 ## Results
 
@@ -95,7 +101,7 @@ Each `out/benchmarks/<timestamp>-<label>/` contains:
 - `metadata.json`: chip, OS, Git revision, dirty state, executable/GPU hashes,
   save hashes, settings and benchmark durations.
 - `results.json`: completion/failure status, exit status, all measured guest
-  and host timing windows and the summary.
+  and host timing windows, sparse completed native GPU samples and the summary.
 - `windows.csv`: guest FPS, draw count, compilation time, median, standard
   deviation, p99 and slow-frame count for each accepted reporting window.
 - `user/`, `bbport.ini`, `pad.txt`: the isolated save/settings and input file.
@@ -106,6 +112,11 @@ largest window p99, not a pooled percentile across all frames. Guest flips
 measure game throughput; host timings measure presentation API calls. Neither
 is a display scanout measurement. `workload_changed` flags draw-count spread
 above 10%; that threshold cannot establish that two runs show the same scene.
+Native GPU samples are first completions and every 300th command, filtered to
+the measurement interval. Scene samples include the upscale and private-output
+copy; presentation samples include the selected post/scaler/overlay passes.
+Their release/completion wall times include CPU waits. Missing GPU timestamps
+remain `null`; do not treat these sparse samples as per-frame percentiles.
 
 Startup timeout, an early exit, lack of timing progress, insufficient workload
 windows or forced shutdown produce a failed result and nonzero runner exit.

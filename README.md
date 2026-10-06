@@ -49,7 +49,8 @@ under the ignored `out/` directory.
   MetalFX or frame generation is implemented.
 - [Native Metal presentation](docs/MACOS_NATIVE_METAL.md), selected with
   `BB_PRESENT_BACKEND=metal`, including the settings overlay, full-resolution HUD
-  handoff, optional native SDR post-processing and MetalFX.
+  handoff, optional native SDR color conversion/scaling/overlay in one drawable
+  pass and scene MetalFX before the HUD. Both experimental options remain opt-in.
 - [GPU optimization and native Metal research](docs/MACOS_GPU_RESEARCH.md).
 
 Report macOS fork issues in [Metalborne's issue tracker](https://github.com/Livio21/metalborne/issues).

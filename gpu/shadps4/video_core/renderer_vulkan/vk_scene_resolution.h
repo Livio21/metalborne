@@ -38,6 +38,9 @@ public:
         vk::ImageView view;
         vk::ImageLayout layout;
         vk::ImageUsageFlags usage;
+#ifdef __APPLE__
+        void* metal{}; // Borrowed while this scene entry remains alive.
+#endif
     };
     Target Attachment(VideoCore::ImageId, const VideoCore::ImageViewInfo&);
     Target Read(VideoCore::ImageId, const VideoCore::ImageViewInfo&,

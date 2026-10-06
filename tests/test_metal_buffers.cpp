@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <cmath>
 #include <vector>
 #include <limits>
 #include "video_core/buffer_cache/buffer.h"
@@ -360,6 +361,104 @@ int main(int argc, char** argv) {
         assert(std::memcmp(actual.mapped_data.data(), expected.mapped_data.data(), size) == 0);
     }
     std::puts("PASS: nine-format render-pass clears match Vulkan bytes, selected mips/layers, untouched subresources and preserved staging/callbacks");
+    if (native) {
+        // Asymmetric constant quadrants expose orientation, channel and extra sRGB conversion.
+        constexpr std::array<std::array<uint8_t,4>,4> colors{{
+            {17,63,149,255}, {215,90,33,255}, {32,185,67,255}, {179,48,201,255}}};
+        for (const auto format : {vk::Format::eR8G8B8A8Unorm, vk::Format::eR8G8B8A8Srgb,
+                                 vk::Format::eB8G8R8A8Unorm, vk::Format::eB8G8R8A8Srgb}) {
+            VideoCore::ImageInfo info{};
+            info.type = AmdGpu::ImageType::Color2D; info.pixel_format = format;
+            info.size = {64,32,1}; info.resources = {.levels=1,.layers=1};
+            VideoCore::Image input(instance,runtime,views,info);
+            Buffer pixels(instance,0,64*32*4,MemoryType::HostUncached);
+            for (const u32 width : {96u,128u}) {
+                auto output_info = info; output_info.size = {width,width/2,1};
+                // The drawable/presentation frame is UNORM; scene UI also exercises sRGB at the other size.
+                if(width==96) output_info.pixel_format=(format==vk::Format::eR8G8B8A8Unorm || format==vk::Format::eR8G8B8A8Srgb)
+                    ? vk::Format::eR8G8B8A8Unorm : vk::Format::eB8G8R8A8Unorm;
+                VideoCore::Image target(instance,runtime,views,output_info);
+                assert(input.backing->image.metal && target.backing->image.metal);
+                for (const u32 phase : {0u,1u}) {
+                    for (u32 y=0;y<32;++y) for(u32 x=0;x<64;++x) {
+                        const auto& color=colors[((y>=16)*2+(x>=32)+phase)%4];
+                        std::memcpy(pixels.mapped_data.data()+(y*64+x)*4,color.data(),4);
+                    }
+                    pixels.Flush(0,pixels.SizeBytes());
+                    const vk::BufferImageCopy upload{.imageSubresource={vk::ImageAspectFlagBits::eColor,0,0,1},
+                                                     .imageExtent={64,32,1}};
+                    runtime.UploadImage(&input,&pixels,{&upload,1});
+                    for (auto* image : {&input,&target})
+                        runtime.Transit(image,vk::ImageLayout::eGeneral,
+                                        vk::PipelineStageFlagBits2::eAllCommands,
+                                        vk::AccessFlagBits2::eMemoryRead|vk::AccessFlagBits2::eMemoryWrite);
+                    runtime.FlushBarriers();
+                    const std::array handles{input.GetImage(),target.GetImage()};
+                    const auto ownership=[&](bool release) {
+                        scheduler.Record([handles,release,family=instance.GetGraphicsQueueFamilyIndex(),&dispatch](vk::CommandBuffer cmd) {
+                            std::array<vk::ImageMemoryBarrier2,2> barriers;
+                            for(size_t i=0;i<2;++i) barriers[i]={
+                                .srcStageMask=release?vk::PipelineStageFlagBits2::eAllCommands:vk::PipelineStageFlagBits2::eNone,
+                                .srcAccessMask=release?vk::AccessFlagBits2::eMemoryRead|vk::AccessFlagBits2::eMemoryWrite:vk::AccessFlags2{},
+                                .dstStageMask=release?vk::PipelineStageFlagBits2::eNone:vk::PipelineStageFlagBits2::eAllCommands,
+                                .dstAccessMask=release?vk::AccessFlags2{}:vk::AccessFlagBits2::eMemoryRead|vk::AccessFlagBits2::eMemoryWrite,
+                                .oldLayout=vk::ImageLayout::eGeneral,.newLayout=vk::ImageLayout::eGeneral,
+                                .srcQueueFamilyIndex=release?family:VK_QUEUE_FAMILY_EXTERNAL,
+                                .dstQueueFamilyIndex=release?VK_QUEUE_FAMILY_EXTERNAL:family,
+                                .image=handles[i],.subresourceRange={vk::ImageAspectFlagBits::eColor,0,1,0,1}};
+                            cmd.pipelineBarrier2(vk::DependencyInfo{.imageMemoryBarrierCount=2,.pImageMemoryBarriers=barriers.data()},dispatch);
+                        });
+                    };
+                    ownership(true); scheduler.FinishForExternal();
+                    auto src=input.backing->image.metal->NativeHandle(), dst=target.backing->image.metal->NativeHandle();
+                    float gpu_ms=0;
+                    assert(!BbMetalFX::UpscaleScene(src,src,&gpu_ms) && std::isnan(gpu_ms));
+                    assert(!BbMetalFX::UpscaleScene(dst,src)); // Equal/downscaled input stays Vulkan.
+                    assert(BbMetalFX::UpscaleScene(src,dst,&gpu_ms));
+                    assert(std::isfinite(gpu_ms) && gpu_ms>=0);
+                    const bool boxed=width==96 && phase==1;
+                    const VkRect2D region{{8,4},{width-16,width/2-8}};
+                    if(boxed) {
+                        const auto srgb=(format==vk::Format::eR8G8B8A8Unorm || format==vk::Format::eR8G8B8A8Srgb)
+                            ? VK_FORMAT_R8G8B8A8_SRGB : VK_FORMAT_B8G8R8A8_SRGB;
+                        assert(!BbMetalFX::PostProcess(src,srgb,dst,1,false,{{-1,0},{width,width/2}}));
+                        assert(!BbMetalFX::PostProcess(src,srgb,dst,1,false,{{1,0},{width,width/2}}));
+                        assert(!BbMetalFX::PostProcess(src,srgb,dst,1,false,{{0,0},{width,0}}));
+                        assert(BbMetalFX::PostProcess(src,srgb,dst,1,false,region));
+                    }
+                    ownership(false);
+                    Buffer readback(instance,0,width*(width/2)*4,MemoryType::HostCached);
+                    runtime.Transit(&target,vk::ImageLayout::eTransferSrcOptimal,
+                                    vk::PipelineStageFlagBits2::eCopy,vk::AccessFlagBits2::eTransferRead);
+                    runtime.FlushBarriers();
+                    const vk::BufferImageCopy download{.imageSubresource={vk::ImageAspectFlagBits::eColor,0,0,1},
+                                                       .imageExtent={width,width/2,1}};
+                    scheduler.Record([image=target.GetImage(),buffer=readback.Handle(),download,&dispatch](vk::CommandBuffer cmd) {
+                        cmd.copyImageToBuffer(image,vk::ImageLayout::eTransferSrcOptimal,buffer,download,dispatch);
+                    });
+                    scheduler.Finish(); readback.Invalidate(0,readback.SizeBytes());
+                    for (u32 q=0;q<4;++q) {
+                        const u32 x=boxed?8+region.extent.width*(q%2?3:1)/4:width*(q%2?3:1)/4;
+                        const u32 y=boxed?4+region.extent.height*(q/2?3:1)/4:(width/2)*(q/2?3:1)/4;
+                        const auto& expected=colors[(q+phase)%4];
+                        for(size_t c=0;c<4;++c) {
+                            const auto actual=readback.mapped_data[(y*width+x)*4+c];
+                            if(std::abs(int(actual)-int(expected[c]))>1)
+                                std::fprintf(stderr,"scene upscale mismatch: format %u phase %u quadrant %u channel %zu actual %u expected %u\n",
+                                    unsigned(format),phase,q,c,actual,expected[c]);
+                            assert(std::abs(int(actual)-int(expected[c]))<=1);
+                        }
+                    }
+                    if(boxed) for(u32 y=0;y<width/2;++y) for(u32 x=0;x<width;++x) {
+                        if(x>=8 && x<width-8 && y>=4 && y<width/2-4) continue;
+                        for(size_t c=0;c<4;++c)
+                            assert(readback.mapped_data[(y*width+x)*4+c]==(c==3?255:0));
+                    }
+                }
+            }
+        }
+        std::puts("PASS: pre-HUD MetalFX, four RGBA/BGRA/sRGB formats, changed input, resize, orientation/color/alpha, GPU timing, letterboxed post-process and rejected fallback");
+    }
     if (native) {
         size_t compared = 0, rounding = 0;
         for (const auto source_format : {vk::Format::eR8G8B8A8Unorm, vk::Format::eR8G8B8A8Srgb,
