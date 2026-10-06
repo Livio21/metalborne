@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <functional>
+
 #include <unordered_map>
 #include <shared_mutex>
 #include <variant>
@@ -188,6 +190,14 @@ private:
     vk::UniquePipelineLayout pipeline_layout;
     Shader::Profile profile{};
     Shader::Pools pools;
+    /// bbport: set during a parallel WarmUp: Load*Pipeline queue the pipeline creation (the
+    /// driver's shader compile, `build`, run on worker threads) and the map insertion
+    /// (`finish`, run afterwards on the WarmUp thread).
+    struct PreloadJob {
+        std::function<void()> build;
+        std::function<void()> finish;
+    };
+    std::vector<PreloadJob>* preload_jobs{};
     tsl::robin_map<size_t, std::unique_ptr<Program>> program_cache;
     /// bbport: exclusive for program/permutation insertions, shared for worker lookups.
     std::shared_mutex programs_mutex;

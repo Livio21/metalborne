@@ -1,5 +1,51 @@
 # macOS performance investigation — 2026-10-04
 
+## Reused bbport-mac optimizations (2026-10-06)
+
+Metalborne now incorporates the small KosmicKrisp list-restart optimization,
+FSR unified-memory fallback and parallel pipeline warmup from
+[bmy/bbport-mac at 0a25a43](https://github.com/bmy/bbport-mac/tree/0a25a43693fb03b645eada115f16365148dafc4a).
+
+- KosmicKrisp list restart is disabled by default, avoiding the driver's indexed
+  list unrolling path. Strip restart still follows the existing topology rules.
+  Set `BB_LIST_RESTART=1` before launch to restore extension negotiation for a
+  comparison. Other drivers keep their existing extension selection.
+- FSR's Vulkan backend can use a host-visible/device-local memory type if no
+  invisible device-local type matches. Discrete-memory preference, memory-type
+  masks and the AMD device-coherent-memory feature guard are retained. The patch
+  is applied by both build scripts; existing FSR profiling edits are preserved.
+- Cached pipeline creation uses up to four workers on macOS. Store reads,
+  shared shader metadata and map insertion remain on the warmup thread. Raw
+  pipeline-key bytes are retained, including padding. `BB_PRELOAD_THREADS=1`
+  restores serial loading; explicit values 1 through 16 are accepted. Invalid
+  values fall back to the default. Cached unsupported geometry/tessellation
+  stages are rejected before driver creation.
+
+The x86-64 macOS build succeeded. `python3 tests/test_macos_gpu_reuse.py` checks
+the production memory selector, worker-count parser and completion loop with
+stubbed device memory and jobs. This checks policy and ordering, not actual GPU
+shader correctness. Live startup subsequently loaded 475 cached pipelines on
+four workers in 9.5 seconds (9.3 seconds in the parallel creation phase), then
+prepared native Metal presentation and entered gameplay with spatial MetalFX.
+There is no matched serial startup measurement yet.
+
+After the user reported gameplay loaded, four complete windows at a similar
+workload (1,323-1,350 draws/frame) reported 21.9-24.1 guest Flip FPS, averaging
+23.3. Guest interval p99 ranged from 50.01 to 83.33 ms; host presentation-call
+interval p99 ranged from 47.02 to 81.79 ms. There were no shader/pipeline compiles.
+Later windows had changing draw counts, so they are unsuitable for a scene
+comparison. These are guest/API measurements, not display scanout; neither a
+speedup nor stable 30 FPS is established. The captured windows are retained in
+`out/macos-native-metal/bbport-reuse-stationary.json`.
+
+The driver disk-cache patch has not been applied: this workspace uses a
+prebuilt KosmicKrisp binary, while the patch changes Mesa source. Temporal
+MetalFX and experimental parallel draw recording were not imported in this
+stage. Native graphics pipelines and the full renderer transition remain open.
+
+Local evidence: `out/macos-bbport-reuse-build.log` and
+`out/macos-native-metal/bbport-reuse-game.log`.
+
 ## Setup
 
 Apple M5, 16 GiB unified memory, 10 CPU cores (4 performance / 6 efficiency),

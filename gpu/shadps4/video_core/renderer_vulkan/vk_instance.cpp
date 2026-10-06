@@ -310,7 +310,17 @@ bool Instance::CreateDevice() {
     depth_clip_control = add_extension(VK_EXT_DEPTH_CLIP_CONTROL_EXTENSION_NAME);
     depth_clip_enable = add_extension(VK_EXT_DEPTH_CLIP_ENABLE_EXTENSION_NAME);
     vertex_input_dynamic_state = add_extension(VK_EXT_VERTEX_INPUT_DYNAMIC_STATE_EXTENSION_NAME);
-    list_restart = add_extension(VK_EXT_PRIMITIVE_TOPOLOGY_LIST_RESTART_EXTENSION_NAME);
+    // From bmy/bbport-mac 9e2ce65 (shadPS4 #5161): list restart makes KosmicKrisp
+    // unroll indexed list draws with an extra compute dispatch and encoder switch.
+    // Keep strip restart; BB_LIST_RESTART=1 restores the extension for comparison.
+    const char* restart_override = std::getenv("BB_LIST_RESTART");
+    const bool skip_list_restart = driver_id == vk::DriverId::eMesaKosmickrisp &&
+                                   !(restart_override && std::strcmp(restart_override, "1") == 0);
+    list_restart = !skip_list_restart &&
+                   add_extension(VK_EXT_PRIMITIVE_TOPOLOGY_LIST_RESTART_EXTENSION_NAME);
+    if (skip_list_restart) {
+        LOG_INFO(Render_Vulkan, "List primitive restart disabled on KosmicKrisp");
+    }
     if (list_restart) {
         list_restart_features =
             feature_chain.get<vk::PhysicalDevicePrimitiveTopologyListRestartFeaturesEXT>();
