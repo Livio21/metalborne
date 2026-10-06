@@ -41,6 +41,9 @@ private:
 };
 // Same release/completion/acquire contract as CopyBuffers; no format conversion.
 bool CopyImages(void* source, void* destination, std::span<const VkImageCopy> copies);
+// Shared uncompressed color storage; buffer pitches follow VkBufferImageCopy.
+bool CopyBufferImage(void* buffer, void* image, std::span<const VkBufferImageCopy> copies,
+                     bool upload);
 // One-shot shadow dispatch: clones buffers and leaves the live Vulkan resources untouched.
 bool CheckCompute(std::span<const ComputeBuffer> buffers, std::span<const uint8_t> push,
                   uint32_t groups, uint32_t threads);

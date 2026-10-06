@@ -4,7 +4,7 @@ Updated 2026-10-06. This is the first native Metal presentation stage of the
 renderer transition. The game and host CPU code still run under Rosetta;
 PS4 draw/compute commands, shader recompilation and host
 post-processing still use bbport's Vulkan renderer through KosmicKrisp.
-Ordinary buffer storage/copies and selected color textures/copies now have
+Ordinary buffer storage/copies and selected color textures/copies/transfers now have
 opt-in native Metal paths
 described below; sparse guest arenas retain Vulkan ownership.
 
@@ -147,8 +147,9 @@ buffer-copy workload below passes on native Metal, including shared GPU buffers.
 Ordinary cache buffers and selected color images now have the opt-in shared
 ownership paths below. Guest
 sparse arenas still require a different allocation/binding contract before
-their shader bindings can move directly to Metal. Texture uploads, downloads,
-depth, compressed, volume and multisample workloads still use Vulkan.
+their shader bindings can move directly to Metal. Selected shared color-image
+uploads/downloads have the opt-in Metal path below. Depth, compressed, volume
+and multisample workloads still use Vulkan.
 The full backend still needs native resource/cache management, bindings,
 graphics/compute pipelines and command submission. Geometry/tessellation and
 guest completion semantics require their own proofs; presentation alone does
@@ -367,8 +368,8 @@ tick is preserved, keeping unrelated staging allocations/callbacks live.
 Invalid regions, overlapping destinations, format mismatches or Metal failure
 use the original Vulkan copy. The command queue and completion helper are
 shared with native buffer copies; neither path stages texture pixels on the CPU.
-Both new settings default to off. Native texture uploads/downloads and batched
-Metal command submission are still unfinished.
+Both new settings default to off. Selected native texture uploads/downloads are
+described below; batched Metal command submission remains unfinished.
 
 ```bash
 BB_METAL_IMAGE_CACHE=1 BB_METAL_IMAGE_COPY=1 \
@@ -397,3 +398,55 @@ that synchronous release/Metal-completion waits are too costly for this scene.
 Native image copies remain off by default; batch submission and dependency
 handling are the next performance work. The comparison log is
 `out/macos-native-metal/shared-image-vulkan-copy-game.log`.
+
+## Native color-image uploads and downloads (2026-10-06)
+
+`BB_METAL_IMAGE_TRANSFER=1`, together with `BB_METAL_BUFFER_CACHE=1` and
+`BB_METAL_IMAGE_CACHE=1`, sends eligible buffer/texture transfers through the
+existing Metal blit queue. No extra bridge allocation or CPU texture upload is
+introduced. Vulkan detiling and other compute work still precede these uploads.
+The same nine uncompressed color formats, 2D mipmaps and array layers supported
+by the shared image cache qualify. Buffer offsets, padded rows/slices and
+subregions follow `VkBufferImageCopy`; invalid ranges, overlapping writes,
+unsupported resources and Metal failure fall back to Vulkan. Row lengths above
+16,384 pixels use Vulkan. Depth, compressed, volume and multisample images keep
+their existing path.
+
+The helper releases both shared resources, finishes the preceding Vulkan work
+without advancing the scheduler tick, completes the Metal blit, then reacquires
+Vulkan's transfer layouts. Staging reservations, callbacks and ordinary buffer
+access tracking remain live until normal guest submission. This is still a
+synchronous interoperability step, off by default, and makes no speedup claim.
+Batching these transfers requires scheduler/dependency work next.
+
+```bash
+BB_METAL_BUFFER_CACHE=1 BB_METAL_IMAGE_CACHE=1 BB_METAL_IMAGE_TRANSFER=1 \
+  BB_PRESENT_BACKEND=metal BB_METALFX=spatial bash macos/run.sh
+```
+
+The existing headless `metal-buffer-test` passed direct, deferred-recording and
+Vulkan modes. It checks all nine formats, three mips/two layers, independent
+Vulkan readback, padded rows/slices, subregion preservation, byte bounds,
+overlapping-write rejection and reacquired Vulkan fallback. It also verifies
+that native uploads preserve a pending staging reservation and callback.
+Local logs: `out/macos-native-metal/image-transfer-{check,threaded-check,vulkan-check}.log`.
+
+Two stationary 30-second gameplay runs used the same copied save, 720p scene,
+spatial MetalFX and executable/GPU hashes, with a nominal-pressure cooldown
+before each launch. Transfers off measured 25.1 FPS; transfers on measured
+16.4 FPS and recorded at least 300 native uploads and 600 native downloads.
+Both returned status 0, preserved the original save, showed stable draw counts
+around 790/frame, and had no shader/pipeline compiles during measurement.
+Both also reported **fair thermal pressure during measurement**, so the runner
+flagged them. These single thermally flagged runs cannot establish an isolated
+speedup or regression. The native path remains off by default because it is a
+synchronous interoperability proof, with batching still unfinished.
+
+Evidence: `out/benchmarks/20261006-151831-952274-thermal-transfer-off/` and
+`out/benchmarks/20261006-152230-458970-thermal-transfer-on/`, including timing
+windows, thermal samples and power-source metadata.
+
+A separate short run, `out/benchmarks/20261006-152604-166928-metal-transfer-visual/`,
+was used to inspect Hunter's Dream, the character, scene textures and HUD with
+native transfers enabled. This confirms the observed rendering state, rather
+than adding an FPS comparison.

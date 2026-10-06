@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // One headless check of the production cache/copy path; no game data required.
 #include <cassert>
+#include <algorithm>
+#include <array>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -19,8 +21,15 @@ int main(int argc, char** argv) {
     setenv("BB_METAL_BUFFER_COPY", native ? "1" : "0", 1);
     setenv("BB_METAL_IMAGE_CACHE", native ? "1" : "0", 1);
     setenv("BB_METAL_IMAGE_COPY", native ? "1" : "0", 1);
+    setenv("BB_METAL_IMAGE_TRANSFER", native ? "1" : "0", 1);
     unsetenv("BB_VK_RECORD_THREAD");
     Vulkan::Instance instance(0, false);
+    // Match the existing scene check: executable headers need their own dispatcher.
+    static vk::detail::DynamicLoader loader;
+    vk::detail::DispatchLoaderDynamic dispatch;
+    dispatch.init(loader.getProcAddress<PFN_vkGetInstanceProcAddr>("vkGetInstanceProcAddr"));
+    dispatch.init(instance.GetInstance());
+    dispatch.init(instance.GetDevice());
     const bool threaded = argc > 1 && !std::strcmp(argv[1], "--threaded");
     Vulkan::Scheduler scheduler(instance, threaded);
     assert(scheduler.IsRecordingDeferred() == threaded);
@@ -150,13 +159,14 @@ int main(int argc, char** argv) {
         std::memset(upload.mapped_data.data() + small_size, 0xa5, large_size);
         upload.Flush(0, upload.SizeBytes());
         for (auto& region : large_regions) region.bufferOffset += small_size;
-        runtime.UploadImage(&small, &upload, small_regions);
-        runtime.UploadImage(&large, &upload, large_regions);
         VideoCore::StreamBuffer held(instance, scheduler, MemoryType::HostUncached, 4096);
         assert(held.Reserve(4096));
         bool image_retired = false;
         scheduler.DeferOperation([&] { image_retired = true; });
         const auto image_tick = scheduler.CurrentTick();
+        runtime.UploadImage(&small, &upload, small_regions);
+        runtime.UploadImage(&large, &upload, large_regions);
+        assert(scheduler.CurrentTick() == image_tick && !image_retired && !held.Reserve(4096, 0, false));
         if (native) {
             const VkImageCopy valid{{VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {},
                 {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {}, {8, 8, 1}};
@@ -168,6 +178,20 @@ int main(int argc, char** argv) {
             assert(!BbMetalFX::CopyImages(src, dst, {&invalid, 1}));
             const VkImageCopy overlap[]{valid, valid};
             assert(!BbMetalFX::CopyImages(src, dst, overlap));
+            const auto good = static_cast<VkBufferImageCopy>(small_regions[0]);
+            auto bad = good;
+            bad.bufferOffset = upload.SizeBytes();
+            void* buffer = upload.buffer.metal->NativeHandle();
+            assert(!BbMetalFX::CopyBufferImage(buffer, src, {&bad, 1}, true));
+            assert(!BbMetalFX::CopyBufferImage(buffer, src, {&bad, 1}, false));
+            bad = good; bad.bufferRowLength = good.imageExtent.width - 1;
+            assert(!BbMetalFX::CopyBufferImage(buffer, src, {&bad, 1}, true));
+            bad = good; bad.imageSubresource.mipLevel = 99;
+            const VkBufferImageCopy invalid_late[]{good, bad};
+            assert(!BbMetalFX::CopyBufferImage(buffer, src, invalid_late, true));
+            const VkBufferImageCopy duplicate[]{good, good};
+            assert(!BbMetalFX::CopyBufferImage(buffer, src, duplicate, true));
+            assert(!BbMetalFX::CopyBufferImage(buffer, src, duplicate, false));
         }
         runtime.CopyImage(&small, &large);
         assert(scheduler.CurrentTick() == image_tick && !image_retired && !held.Reserve(4096, 0, false));
@@ -186,7 +210,62 @@ int main(int argc, char** argv) {
                     std::memcpy(expected_pixels.data() + to, upload.mapped_data.data() + from, (32u >> mip) * bytes);
                 }
         assert(std::memcmp(expected_pixels.data(), pixels.mapped_data.data(), large_size) == 0);
+        // Read independently through Vulkan: a matching pair of wrong native
+        // upload/download mappings must not cancel out in this round trip.
+        std::memset(pixels.mapped_data.data(), 0x6d, large_size);
+        pixels.Flush(0, large_size);
+        runtime.Transit(&large, vk::ImageLayout::eTransferSrcOptimal,
+                        vk::PipelineStageFlagBits2::eCopy, vk::AccessFlagBits2::eTransferRead);
+        runtime.FlushBarriers();
+        scheduler.Record([image = large.GetImage(), buffer = pixels.Handle(),
+                          regions = scheduler.RecordData(std::span<const vk::BufferImageCopy>{large_regions}), &dispatch](vk::CommandBuffer cmd) {
+            cmd.copyImageToBuffer(image, vk::ImageLayout::eTransferSrcOptimal, buffer, regions.size(), regions.data(), dispatch);
+        });
+        runtime.AccessBuffer(&pixels, 0, large_size, vk::PipelineStageFlagBits2::eCopy, vk::AccessFlagBits2::eTransferWrite);
+        scheduler.Finish();
+        pixels.Invalidate(0, large_size);
+        assert(std::memcmp(expected_pixels.data(), pixels.mapped_data.data(), large_size) == 0);
         if (format == vk::Format::eR8G8B8A8Unorm) {
+            Buffer padded(instance, 0, 4096, MemoryType::HostCached);
+            std::memset(padded.mapped_data.data(), 0x6d, 4096);
+            padded.Flush(0, 4096);
+            const vk::BufferImageCopy partial{.bufferOffset = 20, .bufferRowLength = 19, .bufferImageHeight = 11,
+                .imageSubresource = {vk::ImageAspectFlagBits::eColor, 1, 0, 2},
+                .imageOffset = {3, 2, 0}, .imageExtent = {7, 4, 1}};
+            std::vector<uint8_t> expected_pad(4096, 0x6d);
+            for (uint32_t layer = 0; layer < 2; ++layer)
+                for (uint32_t y = 0; y < 4; ++y) {
+                    const auto from = large_regions[1].bufferOffset + (layer * 16 + y + 2) * 32 * 4 + 3 * 4;
+                    const auto to = 20 + (layer * 11 + y) * 19 * 4;
+                    std::memcpy(expected_pad.data() + to, expected_pixels.data() + from, 7 * 4);
+                }
+            runtime.DownloadImage(&large, &padded, {&partial, 1});
+            scheduler.Finish();
+            padded.Invalidate(0, 4096);
+            assert(std::memcmp(expected_pad.data(), padded.mapped_data.data(), 4096) == 0);
+            runtime.UploadImage(&large, &padded, {&partial, 1});
+            runtime.DownloadImage(&large, &pixels, large_regions);
+            scheduler.Finish();
+            pixels.Invalidate(0, large_size);
+            assert(std::memcmp(expected_pixels.data(), pixels.mapped_data.data(), large_size) == 0);
+            // Disjoint writes in padded rows have overlapping bounding spans:
+            // the conservative native guard rejects them, so test reacquired Vulkan fallback.
+            auto split = std::array{partial, partial};
+            for (auto& c : split) { c.imageSubresource.baseArrayLayer = 1; c.imageSubresource.layerCount = 1; c.imageExtent.width = 3; }
+            split[1].bufferOffset += 16;
+            split[1].imageOffset.x += 3;
+            std::fill(expected_pad.begin(), expected_pad.end(), 0x6d);
+            std::memset(padded.mapped_data.data(), 0x6d, 4096);
+            padded.Flush(0, 4096);
+            for (const auto& c : split)
+                for (uint32_t y = 0; y < 4; ++y) {
+                    const auto from = large_regions[1].bufferOffset + (16 + y + 2) * 32 * 4 + c.imageOffset.x * 4;
+                    std::memcpy(expected_pad.data() + c.bufferOffset + y * 19 * 4, expected_pixels.data() + from, 12);
+                }
+            runtime.DownloadImage(&large, &padded, split);
+            scheduler.Finish();
+            padded.Invalidate(0, 4096);
+            assert(std::memcmp(expected_pad.data(), padded.mapped_data.data(), 4096) == 0);
             // Both images are shared, but Metal rejects a different pixel format.
             // The Vulkan bitwise-copy fallback must reacquire the right layouts.
             info.pixel_format = vk::Format::eR8G8B8A8Srgb;
@@ -208,7 +287,7 @@ int main(int argc, char** argv) {
     depth_info.props.is_depth = 1;
     VideoCore::Image depth(instance, runtime, views, depth_info);
     assert(depth.GetImage() && !depth.backing->image.metal); // Unsupported format keeps VMA ownership.
-    std::puts("PASS: nine color formats, image moves, three mips/two layers, untouched pixels, preserved staging tick, rejected copies, format-copy and depth fallback");
+    std::puts("PASS: nine color formats, native uploads/downloads, Vulkan reference, padded rows/layers, untouched bytes/pixels, preserved staging tick, rejected copies and depth fallback");
     std::puts(native ? "PASS: shared cache ownership, BDA, moves, 128 MiB stream, native copies, untouched bytes, preserved staging tick and callbacks" :
                       "PASS: original Vulkan allocation and copy fallback");
 }

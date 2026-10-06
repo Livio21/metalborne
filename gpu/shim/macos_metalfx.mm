@@ -296,33 +296,39 @@ VkImage SharedImage::Handle() const { return impl->metal ? impl->image : VK_NULL
 void* SharedImage::NativeHandle() const { return (__bridge void*)impl->metal; }
 uint64_t SharedImage::SizeBytes() const { return impl->size; }
 
+static bool ValidImageRegion(id<MTLTexture> t, const VkImageSubresourceLayers& sub,
+                             const VkOffset3D& o, const VkExtent3D& e) {
+    if ((t.textureType != MTLTextureType2D && t.textureType != MTLTextureType2DArray) || t.sampleCount != 1 ||
+        sub.aspectMask != VK_IMAGE_ASPECT_COLOR_BIT || sub.mipLevel >= t.mipmapLevelCount || !sub.layerCount ||
+        sub.baseArrayLayer >= t.arrayLength || sub.layerCount > t.arrayLength - sub.baseArrayLayer ||
+        o.x < 0 || o.y < 0 || o.z || !e.width || !e.height || e.depth != 1) return false;
+    const auto width = std::max<NSUInteger>(t.width >> sub.mipLevel, 1);
+    const auto height = std::max<NSUInteger>(t.height >> sub.mipLevel, 1);
+    return NSUInteger(o.x) < width && e.width <= width - o.x && NSUInteger(o.y) < height && e.height <= height - o.y;
+}
+
+static bool ImageRegionsOverlap(const VkImageSubresourceLayers& a, const VkOffset3D& ao, const VkExtent3D& ae,
+                                const VkImageSubresourceLayers& b, const VkOffset3D& bo, const VkExtent3D& be) {
+    return a.mipLevel == b.mipLevel && a.baseArrayLayer < b.baseArrayLayer + b.layerCount &&
+        b.baseArrayLayer < a.baseArrayLayer + a.layerCount &&
+        uint64_t(ao.x) < uint64_t(bo.x) + be.width && uint64_t(bo.x) < uint64_t(ao.x) + ae.width &&
+        uint64_t(ao.y) < uint64_t(bo.y) + be.height && uint64_t(bo.y) < uint64_t(ao.y) + ae.height;
+}
+
 bool CopyImages(void* source, void* destination, std::span<const VkImageCopy> copies) {
     @autoreleasepool {
         id<MTLTexture> src = (__bridge id<MTLTexture>)source, dst = (__bridge id<MTLTexture>)destination;
         const auto is_2d = [](id<MTLTexture> t) { return t.textureType == MTLTextureType2D || t.textureType == MTLTextureType2DArray; };
         if (!src || !dst || src == dst || src.device != dst.device || src.pixelFormat != dst.pixelFormat ||
             !is_2d(src) || !is_2d(dst) || src.sampleCount != 1 || dst.sampleCount != 1 || copies.empty()) return false;
-        const auto valid = [](id<MTLTexture> t, const VkImageSubresourceLayers& sub, const VkOffset3D& o, const VkExtent3D& e) {
-            if (sub.aspectMask != VK_IMAGE_ASPECT_COLOR_BIT || sub.mipLevel >= t.mipmapLevelCount || !sub.layerCount ||
-                sub.baseArrayLayer >= t.arrayLength || sub.layerCount > t.arrayLength - sub.baseArrayLayer ||
-                o.x < 0 || o.y < 0 || o.z || !e.width || !e.height || e.depth != 1) return false;
-            const auto width = std::max<NSUInteger>(t.width >> sub.mipLevel, 1);
-            const auto height = std::max<NSUInteger>(t.height >> sub.mipLevel, 1);
-            return NSUInteger(o.x) < width && e.width <= width - o.x && NSUInteger(o.y) < height && e.height <= height - o.y;
-        };
         for (size_t i = 0; i < copies.size(); ++i) {
             const auto& c = copies[i];
             if (c.srcSubresource.layerCount != c.dstSubresource.layerCount ||
-                !valid(src, c.srcSubresource, c.srcOffset, c.extent) || !valid(dst, c.dstSubresource, c.dstOffset, c.extent)) return false;
+                !ValidImageRegion(src, c.srcSubresource, c.srcOffset, c.extent) || !ValidImageRegion(dst, c.dstSubresource, c.dstOffset, c.extent)) return false;
             for (size_t j = 0; j < i; ++j) {
                 const auto& p = copies[j];
-                if (c.dstSubresource.mipLevel == p.dstSubresource.mipLevel &&
-                    c.dstSubresource.baseArrayLayer < p.dstSubresource.baseArrayLayer + p.dstSubresource.layerCount &&
-                    p.dstSubresource.baseArrayLayer < c.dstSubresource.baseArrayLayer + c.dstSubresource.layerCount &&
-                    uint64_t(c.dstOffset.x) < uint64_t(p.dstOffset.x) + p.extent.width &&
-                    uint64_t(p.dstOffset.x) < uint64_t(c.dstOffset.x) + c.extent.width &&
-                    uint64_t(c.dstOffset.y) < uint64_t(p.dstOffset.y) + p.extent.height &&
-                    uint64_t(p.dstOffset.y) < uint64_t(c.dstOffset.y) + c.extent.height) return false;
+                if (ImageRegionsOverlap(c.dstSubresource, c.dstOffset, c.extent,
+                                        p.dstSubresource, p.dstOffset, p.extent)) return false;
             }
         }
         return RunBlit(src.device, [&](id<MTLBlitCommandEncoder> encoder) {
@@ -333,6 +339,65 @@ bool CopyImages(void* source, void* destination, std::span<const VkImageCopy> co
                         sourceSize:MTLSizeMake(c.extent.width, c.extent.height, 1) toTexture:dst
                         destinationSlice:c.dstSubresource.baseArrayLayer + layer destinationLevel:c.dstSubresource.mipLevel
                         destinationOrigin:MTLOriginMake(c.dstOffset.x, c.dstOffset.y, 0)];
+        });
+    }
+}
+
+bool CopyBufferImage(void* buffer, void* image, std::span<const VkBufferImageCopy> copies, bool upload) {
+    @autoreleasepool {
+        id<MTLBuffer> b = (__bridge id<MTLBuffer>)buffer;
+        id<MTLTexture> t = (__bridge id<MTLTexture>)image;
+        if (!b || !t || b.device != t.device || copies.empty()) return false;
+        uint64_t pixel_bytes;
+        switch (t.pixelFormat) {
+        case MTLPixelFormatR8Unorm: pixel_bytes = 1; break;
+        case MTLPixelFormatRG8Unorm: case MTLPixelFormatR16Float: pixel_bytes = 2; break;
+        case MTLPixelFormatRGBA8Unorm: case MTLPixelFormatRGBA8Unorm_sRGB:
+        case MTLPixelFormatBGRA8Unorm: case MTLPixelFormatBGRA8Unorm_sRGB:
+        case MTLPixelFormatRG16Float: pixel_bytes = 4; break;
+        case MTLPixelFormatRGBA16Float: pixel_bytes = 8; break;
+        default: return false;
+        }
+        struct Layout { uint64_t row, slice, end; };
+        std::vector<Layout> layouts;
+        for (size_t i = 0; i < copies.size(); ++i) {
+            const auto& c = copies[i];
+            if (!ValidImageRegion(t, c.imageSubresource, c.imageOffset, c.imageExtent) ||
+                c.bufferOffset % pixel_bytes || c.bufferOffset > b.length) return false;
+            const uint64_t width = c.bufferRowLength ? c.bufferRowLength : c.imageExtent.width;
+            const uint64_t height = c.bufferImageHeight ? c.bufferImageHeight : c.imageExtent.height;
+            // ponytail: Apple-Silicon 2D row limit; wider padding falls back to Vulkan.
+            if (width < c.imageExtent.width || width > 16384 || height < c.imageExtent.height) return false;
+            const uint64_t row = width * pixel_bytes, slice = row * height;
+            const uint64_t tail = (c.imageExtent.height - 1) * row + c.imageExtent.width * pixel_bytes;
+            const uint64_t remaining = b.length - c.bufferOffset;
+            if (tail > remaining || c.imageSubresource.layerCount - 1 > (remaining - tail) / slice) return false;
+            const uint64_t end = c.bufferOffset + (c.imageSubresource.layerCount - 1) * slice + tail;
+            for (size_t j = 0; j < i; ++j) {
+                const auto& p = copies[j];
+                if (upload ? ImageRegionsOverlap(c.imageSubresource, c.imageOffset, c.imageExtent,
+                                                p.imageSubresource, p.imageOffset, p.imageExtent) :
+                    c.bufferOffset < layouts[j].end && p.bufferOffset < end) return false;
+            }
+            layouts.push_back({row, slice, end});
+        }
+        return RunBlit(b.device, [&](id<MTLBlitCommandEncoder> encoder) {
+            for (size_t i = 0; i < copies.size(); ++i) {
+                const auto& c = copies[i];
+                for (uint32_t layer = 0; layer < c.imageSubresource.layerCount; ++layer) {
+                    const auto offset = c.bufferOffset + layer * layouts[i].slice;
+                    const auto origin = MTLOriginMake(c.imageOffset.x, c.imageOffset.y, 0);
+                    const auto size = MTLSizeMake(c.imageExtent.width, c.imageExtent.height, 1);
+                    if (upload)
+                        [encoder copyFromBuffer:b sourceOffset:offset sourceBytesPerRow:layouts[i].row sourceBytesPerImage:0
+                            sourceSize:size toTexture:t destinationSlice:c.imageSubresource.baseArrayLayer + layer
+                            destinationLevel:c.imageSubresource.mipLevel destinationOrigin:origin];
+                    else
+                        [encoder copyFromTexture:t sourceSlice:c.imageSubresource.baseArrayLayer + layer
+                            sourceLevel:c.imageSubresource.mipLevel sourceOrigin:origin sourceSize:size toBuffer:b
+                            destinationOffset:offset destinationBytesPerRow:layouts[i].row destinationBytesPerImage:0];
+                }
+            }
         });
     }
 }

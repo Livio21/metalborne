@@ -20,6 +20,24 @@ caches, native buffer copies, Vulkan image copies and conservative draw
 preparation. The renderer still uses Vulkan for game draws. Actual output size
 is recorded in `game.log`.
 
+Before launch, the runner waits for 30 seconds of nominal macOS thermal pressure
+(`--cooldown 0` skips that wait). It samples Foundation's `NSProcessInfo.thermalState`
+and Low Power Mode every five seconds through startup, warmup and measurement.
+Results retain the samples and flag comparisons if any run sample is above
+nominal, unknown, or Low Power Mode is on/unavailable. Power-source/settings
+information is also retained. Cooldown uses the startup-timeout value as its own
+separate deadline; a timeout launches no game.
+
+This is OS thermal pressure, not a temperature or CPU/GPU frequency trace.
+Nominal samples do not prove clocks were constant or exclude competing work.
+Keep the same power source, display size, power mode and background workload;
+alternate settings across repeated runs before attributing small FPS changes.
+Elevated thermal pressure is evidence of a confounder, not proof of its exact
+contribution. Earlier benchmark reports have no thermal samples and cannot be
+retrospectively cleared of this confounder. Apple's
+[thermal-state guidance](https://developer.apple.com/library/archive/documentation/Performance/Conceptual/power_efficiency_guidelines_osx/RespondToThermalStateChanges.html)
+describes the API and its limits.
+
 Each run copies the existing save directory into its own output folder. Game
 save writes and settings changes go to that copy. The existing shader cache is
 reused by default, making this a warm-cache benchmark. `BB_GPU_USER_DIR` can be
@@ -42,6 +60,7 @@ Other examples:
 ```bash
 python3 tools/benchmark_macos.py --seconds 60 --label serial-preload --env BB_PRELOAD_THREADS=1
 python3 tools/benchmark_macos.py --seconds 60 --label vulkan --env BB_PRESENT_BACKEND=vulkan --env BB_METALFX=off
+python3 tools/benchmark_macos.py --seconds 60 --label metal-transfers --env BB_METAL_IMAGE_TRANSFER=1
 python3 tools/benchmark_macos.py --manual --seconds 30
 python3 tools/benchmark_macos.py --self-check
 ```
@@ -78,6 +97,12 @@ Raw logs and any available measurements are retained. Benchmark duration does
 not include preparation, pipeline warmup, menu navigation or workload warmup.
 
 ## Verified automatic run — 2026-10-06
+
+The original run below predates thermal monitoring. Its FPS is a record of that
+session; heat-related throttling cannot be ruled out retrospectively. Two later
+30-second runs with monitoring enabled recorded fair pressure during measurement
+and were correctly flagged for comparison. Both kept Low Power Mode off and
+AC power attached. See the native Metal runbook for their results.
 
 On this Apple M5 / 16 GiB machine, the script automatically reached the saved
 Hunter's Dream scene, passed the workload gate, warmed up for 15 seconds,

@@ -2,6 +2,7 @@
 """Launch an isolated macOS benchmark using bbport's existing pad-file controls."""
 import argparse
 import csv
+import ctypes
 from datetime import datetime
 import hashlib
 import json
@@ -21,6 +22,52 @@ NEUTRAL = "lx=128 ly=128 rx=128 ry=128"
 FLIP = re.compile(r"Guest flip stats: ([\d.]+) FPS.*?; (\d+) shader/pipeline compiles, ([\d.]+) ms;.*? (\d+) draws/frame")
 PACE = re.compile(r"Frame pacing: median ([\d.]+) ms, stddev ([\d.]+) ms, p99 ([\d.]+) ms, (\d+) frames over")
 HOST = re.compile(r"Host present calls: interval p50 ([\d.]+) / p95 ([\d.]+) / p99 ([\d.]+) ms")
+THERMAL_STATES = ("nominal", "fair", "serious", "critical")
+
+
+def thermal_reader():
+    """Read the public Foundation properties without sudo or an extra dependency."""
+    foundation = ctypes.CDLL("/System/Library/Frameworks/Foundation.framework/Foundation")
+    objc = ctypes.CDLL("/usr/lib/libobjc.A.dylib")
+    objc.objc_getClass.argtypes, objc.objc_getClass.restype = [ctypes.c_char_p], ctypes.c_void_p
+    objc.sel_registerName.argtypes, objc.sel_registerName.restype = [ctypes.c_char_p], ctypes.c_void_p
+    send_id = ctypes.CFUNCTYPE(ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p)(("objc_msgSend", objc))
+    send_int = ctypes.CFUNCTYPE(ctypes.c_long, ctypes.c_void_p, ctypes.c_void_p)(("objc_msgSend", objc))
+    send_bool = ctypes.CFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)(("objc_msgSend", objc))
+    responds = ctypes.CFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p)(("objc_msgSend", objc))
+    selector = objc.sel_registerName
+    process = send_id(objc.objc_getClass(b"NSProcessInfo"), selector(b"processInfo"))
+    thermal, power = selector(b"thermalState"), selector(b"isLowPowerModeEnabled")
+    responds_selector = selector(b"respondsToSelector:")
+    if not process or not responds(process, responds_selector, thermal):
+        raise ValueError("Foundation thermal monitoring is unavailable")
+    has_power = responds(process, responds_selector, power)
+    objc.objc_autoreleasePoolPush.restype = ctypes.c_void_p
+    objc.objc_autoreleasePoolPush.argtypes = []
+    objc.objc_autoreleasePoolPop.argtypes = [ctypes.c_void_p]
+    objc.objc_autoreleasePoolPop.restype = None
+
+    def read():
+        pool = objc.objc_autoreleasePoolPush()
+        try:
+            state = send_int(process, thermal)
+            return dict(state=THERMAL_STATES[state] if 0 <= state < 4 else "unknown",
+                        low_power_mode=send_bool(process, power) if has_power else None)
+        finally:
+            objc.objc_autoreleasePoolPop(pool)
+    return read
+
+
+def summarize_thermals(samples, measurement_start, seconds):
+    running = [s for s in samples if s["at"] >= 0]
+    measured = [s for s in running if measurement_start is not None and measurement_start <= s["at"] <= measurement_start + seconds]
+    def worst(rows):
+        if not rows or any(s["state"] not in THERMAL_STATES for s in rows):
+            return "unknown"
+        return max((s["state"] for s in rows), key=THERMAL_STATES.index)
+    return dict(run_worst_state=worst(running), measurement_worst_state=worst(measured),
+                comparison_flagged=not measured or any(s["state"] != "nominal" or s["low_power_mode"] is not False for s in running),
+                caveat="Five-second OS thermal-pressure samples, not temperatures or CPU/GPU clocks. Nominal does not prove absence of throttling or other load.")
 
 
 class Stats:
@@ -100,6 +147,23 @@ def benchmark(args):
         if previous < 0 or previous < args.seconds * 1000:
             raise ValueError("Replay must cover the entire measurement interval")
 
+    read_thermal = thermal_reader()
+    thermal_origin = time.monotonic()
+    thermal_samples = []
+    nominal_since = None
+    if args.cooldown:
+        print(f"Waiting for {args.cooldown:g} seconds of nominal thermal pressure", flush=True)
+    while True:
+        now = time.monotonic()
+        sample = dict(at=now - thermal_origin, **read_thermal())
+        thermal_samples.append(sample)
+        nominal_since = (nominal_since if nominal_since is not None else now) if sample["state"] == "nominal" else None
+        if not args.cooldown or (nominal_since is not None and now - nominal_since >= args.cooldown):
+            break
+        if now - thermal_origin > args.startup_timeout:
+            raise ValueError(f"Cooldown timed out with thermal state {sample['state']}; no game launched")
+        time.sleep(min(5, args.cooldown))
+
     run = ROOT / "out/benchmarks" / (datetime.now().strftime("%Y%m%d-%H%M%S-%f") + "-" + args.label)
     run.mkdir(parents=True)
     shutil.copytree(args.save_dir, run / "user")
@@ -116,7 +180,7 @@ def benchmark(args):
                BB_UPSCALER="off", BB_FSR1="0", BB_RCAS="0", BB_FPS="30", BB_FPS_LIMIT="0",
                BB_VBLANK_HZ="60", BB_PRESENT_MODE="Fifo", BB_PREP_WORKERS="0",
                BB_MACOS_CONSERVATIVE_GPU="1", BB_METAL_BUFFER_CACHE="1", BB_METAL_BUFFER_COPY="1",
-               BB_METAL_IMAGE_CACHE="1", BB_METAL_IMAGE_COPY="0", BB_FULLSCREEN="0")
+               BB_METAL_IMAGE_CACHE="1", BB_METAL_IMAGE_COPY="0", BB_METAL_IMAGE_TRANSFER="0", BB_FULLSCREEN="0")
     env.update(args.overrides)
     env.setdefault("BB_GPU_USER_DIR", str(ROOT / "out/macos-run/user"))
     env.update(BB_DATA_DIR=str(run), BB_USER_DIR=str(run / "user"), BB_CONFIG=str(config),
@@ -138,16 +202,21 @@ def benchmark(args):
                     working_tree=command_output("git", "status", "--short"),
                     chip=command_output("sysctl", "-n", "machdep.cpu.brand_string"),
                     macos=command_output("sw_vers", "-productVersion"),
+                    power_source=command_output("pmset", "-g", "batt"),
+                    power_settings=command_output("pmset", "-g"),
                     probe_sha256=digest(args.probe),
                     workspace_gpu_sha256=digest(ROOT / "out/macos/gpu/libbbgpu.dylib"),
                     save_hashes={str(p.relative_to(args.save_dir)): digest(p) for p in sorted((args.save_dir / "savedata").rglob("*")) if p.is_file()},
                     environment={k: v for k, v in env.items() if k.startswith(("BB_", "VK_", "MESA_", "SDL_"))},
-                    seconds=args.seconds, warmup=args.warmup, min_draws=args.min_draws,
+                    seconds=args.seconds, warmup=args.warmup, cooldown=args.cooldown, min_draws=args.min_draws,
                     readiness="Three consecutive timing windows above the draw threshold; heuristic, not a game-state API")
     (run / "metadata.json").write_text(json.dumps(metadata, indent=2) + "\n")
     print(f"Benchmark artifacts: {run}", flush=True)
     stats, log_buffer, all_log = Stats(), "", ""
     started = time.monotonic()
+    for sample in thermal_samples:
+        sample["at"] -= started - thermal_origin
+    next_thermal = 0
     measurement_start = None
     error = None
     forced = False
@@ -156,7 +225,11 @@ def benchmark(args):
                                    stdout=output, stderr=subprocess.STDOUT, start_new_session=True)
 
         def poll():
-            nonlocal log_buffer, all_log
+            nonlocal log_buffer, all_log, next_thermal
+            at = time.monotonic() - started
+            if at >= next_thermal:
+                thermal_samples.append(dict(at=at, **read_thermal()))
+                next_thermal = at + 5
             chunk = reader.read()
             all_log += chunk
             log_buffer += chunk
@@ -225,6 +298,7 @@ def benchmark(args):
         except (RuntimeError, KeyboardInterrupt) as failure:
             error = str(failure) or "Interrupted"
         finally:
+            thermal_samples.append(dict(at=time.monotonic() - started, **read_thermal()))
             write_pad(pad, NEUTRAL)
             quit_file.touch()
             try:
@@ -250,12 +324,18 @@ def benchmark(args):
                   measurement_start=measurement_start, guest_windows=guest, host_windows=host,
                   summary=summarize(guest, host) if guest else None,
                   caveat="Guest flip throughput and host API timings, not display scanout. Window p99 values are not pooled percentiles.")
+    result["thermal_samples"] = thermal_samples
+    result["thermal"] = summarize_thermals(thermal_samples, measurement_start, args.seconds)
+    result["power_source_end"] = command_output("pmset", "-g", "batt")
+    if result["summary"]:
+        result["summary"]["thermal_comparison_flagged"] = result["thermal"]["comparison_flagged"]
     (run / "results.json").write_text(json.dumps(result, indent=2) + "\n")
     with (run / "windows.csv").open("w", newline="") as output:
         writer = csv.DictWriter(output, fieldnames=["at", "fps", "compiles", "compile_ms", "draws", "median_ms", "stddev_ms", "p99_ms", "slow_frames"])
         writer.writeheader()
         writer.writerows(guest)
     print(json.dumps(result["summary"], indent=2), flush=True)
+    print(json.dumps(result["thermal"], indent=2), flush=True)
     if error:
         print(f"Benchmark failed: {error}", file=sys.stderr)
         return 1
@@ -266,6 +346,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--seconds", type=float, default=30)
     parser.add_argument("--warmup", type=float, default=15)
+    parser.add_argument("--cooldown", type=float, default=30, help="Seconds of nominal thermal pressure before launch; 0 skips waiting")
     parser.add_argument("--startup-timeout", type=float, default=180)
     parser.add_argument("--menu-delay", type=float, default=12)
     parser.add_argument("--min-draws", type=int, default=500)
@@ -291,15 +372,22 @@ def main():
         assert result["mean_window_fps"] == 25 and result["compiles"] == 1
         assert result["workload_changed"] and result["worst_window_p99_ms"] == 50
         assert result["worst_host_window_p99_ms"] == 55
+        cool = [dict(at=t, state="nominal", low_power_mode=False) for t in (0, 5, 10)]
+        assert not summarize_thermals(cool, 5, 10)["comparison_flagged"]
+        hot = cool + [dict(at=8, state="serious", low_power_mode=False)]
+        assert summarize_thermals(hot, 5, 10)["comparison_flagged"]
+        assert summarize_thermals(hot, 5, 10)["measurement_worst_state"] == "serious"
+        assert summarize_thermals([dict(at=5, state="nominal", low_power_mode=True)], 0, 10)["comparison_flagged"]
+        assert summarize_thermals([], 0, 10)["comparison_flagged"]
         try:
             summarize([], [])
             assert False, "empty measurements accepted"
         except ValueError:
             pass
-        print("Benchmark log parser and summary PASS")
+        print("Benchmark log parser, summary and thermal flags PASS")
         return 0
-    if not all(math.isfinite(v) and 0 <= v <= 3600 for v in (args.seconds, args.warmup, args.startup_timeout, args.menu_delay)) or args.seconds < 10 or args.startup_timeout < 15 or args.min_draws < 1:
-        parser.error("Use finite durations, seconds >= 10, startup-timeout >= 15, and min-draws >= 1")
+    if not all(math.isfinite(v) and 0 <= v <= 3600 for v in (args.seconds, args.warmup, args.cooldown, args.startup_timeout, args.menu_delay)) or args.seconds < 10 or args.startup_timeout < max(15, args.cooldown) or args.min_draws < 1:
+        parser.error("Use finite durations, seconds >= 10, startup-timeout >= max(15, cooldown), and min-draws >= 1")
     if not re.fullmatch(r"[A-Za-z0-9_.-]+", args.label):
         parser.error("Label must contain only letters, digits, dots, underscores or hyphens")
     args.overrides = {}

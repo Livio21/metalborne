@@ -110,6 +110,10 @@ public:
     }
 
 private:
+#ifdef __APPLE__
+    bool CopyBufferImage(VideoCore::Image* image, const VideoCore::Buffer* buffer,
+                         std::span<const vk::BufferImageCopy> copies, bool upload);
+#endif
     void (*image_access_hook)(void*) = nullptr;
     void* image_access_context = nullptr;
     const Instance& instance;

@@ -3,6 +3,9 @@
 Repeatable automatic gameplay measurements are available through
 `python3 tools/benchmark_macos.py --seconds 30`; see
 [the benchmark runbook](MACOS_BENCHMARK.md) for settings, results and caveats.
+The runner now records OS thermal pressure and Low Power Mode, waits for a
+nominal-pressure cooldown, and flags potentially confounded comparisons. Earlier
+measurements have no thermal trace and cannot rule out heat-related throttling.
 
 ## Reused bbport-mac optimizations (2026-10-06)
 

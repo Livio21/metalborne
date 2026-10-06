@@ -283,6 +283,9 @@ void Runtime::UploadImage(VideoCore::Image* dst, const VideoCore::Buffer* src,
         FlushBarriers();
     }
 
+#ifdef __APPLE__
+    if (!CopyBufferImage(dst, src, upload_copies, true))
+#endif
     scheduler.Record([src_handle = src->Handle(), image = dst->GetImage(),
                       regions = scheduler.RecordData(upload_copies)](vk::CommandBuffer cmdbuf) {
         cmdbuf.copyBufferToImage(src_handle, image, vk::ImageLayout::eTransferDstOptimal,
@@ -315,6 +318,9 @@ void Runtime::DownloadImage(VideoCore::Image* src, const VideoCore::Buffer* dst,
         FlushBarriers();
     }
 
+#ifdef __APPLE__
+    if (!CopyBufferImage(src, dst, download_copies, false))
+#endif
     scheduler.Record([image = src->GetImage(), buffer = dst->Handle(),
                       regions = scheduler.RecordData(download_copies)](vk::CommandBuffer cmdbuf) {
         cmdbuf.copyImageToBuffer(image, vk::ImageLayout::eTransferSrcOptimal, buffer,
@@ -327,6 +333,56 @@ void Runtime::DownloadImage(VideoCore::Image* src, const VideoCore::Buffer* dst,
                      vk::AccessFlagBits2::eTransferWrite);
     }
 }
+
+#ifdef __APPLE__
+bool Runtime::CopyBufferImage(VideoCore::Image* image, const VideoCore::Buffer* buffer,
+                              std::span<const vk::BufferImageCopy> copies, bool upload) {
+    static const char* enabled = std::getenv("BB_METAL_IMAGE_TRANSFER");
+    if (!enabled || std::strcmp(enabled, "1") || !image->backing->image.metal || !buffer->buffer.metal || copies.empty())
+        return false;
+    const auto image_handle = image->GetImage();
+    const auto buffer_handle = buffer->Handle();
+    const auto layout = upload ? vk::ImageLayout::eTransferDstOptimal : vk::ImageLayout::eTransferSrcOptimal;
+    const vk::ImageSubresourceRange range{vk::ImageAspectFlagBits::eColor, 0, image->info.resources.levels, 0, image->info.resources.layers};
+    const u32 family = instance.GetGraphicsQueueFamilyIndex();
+    const auto ownership = [&](bool release) {
+        scheduler.Record([image_handle, buffer_handle, layout, range, family, release](vk::CommandBuffer command) {
+            const vk::BufferMemoryBarrier2 b{
+                .srcStageMask = release ? vk::PipelineStageFlagBits2::eAllCommands : vk::PipelineStageFlagBits2::eNone,
+                .srcAccessMask = release ? vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite : vk::AccessFlags2{},
+                .dstStageMask = release ? vk::PipelineStageFlagBits2::eNone : vk::PipelineStageFlagBits2::eAllCommands,
+                .dstAccessMask = release ? vk::AccessFlags2{} : vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
+                .srcQueueFamilyIndex = release ? family : VK_QUEUE_FAMILY_EXTERNAL,
+                .dstQueueFamilyIndex = release ? VK_QUEUE_FAMILY_EXTERNAL : family,
+                .buffer = buffer_handle, .offset = 0, .size = VK_WHOLE_SIZE};
+            const vk::ImageMemoryBarrier2 t{
+                .srcStageMask = b.srcStageMask, .srcAccessMask = b.srcAccessMask,
+                .dstStageMask = b.dstStageMask, .dstAccessMask = b.dstAccessMask,
+                .oldLayout = release ? layout : vk::ImageLayout::eGeneral,
+                .newLayout = release ? vk::ImageLayout::eGeneral : layout,
+                .srcQueueFamilyIndex = b.srcQueueFamilyIndex, .dstQueueFamilyIndex = b.dstQueueFamilyIndex,
+                .image = image_handle, .subresourceRange = range};
+            command.pipelineBarrier2(vk::DependencyInfo{.bufferMemoryBarrierCount = 1, .pBufferMemoryBarriers = &b,
+                .imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &t});
+        });
+    };
+    ownership(true);
+    scheduler.FinishForExternal();
+    std::vector<VkBufferImageCopy> regions;
+    for (const auto& c : copies) regions.push_back(static_cast<VkBufferImageCopy>(c));
+    const bool copied = BbMetalFX::CopyBufferImage(buffer->buffer.metal->NativeHandle(),
+        image->backing->image.metal->NativeHandle(), regions, upload);
+    ownership(false); // Fallback also needs both Vulkan resources acquired.
+    if (copied) {
+        static std::atomic<u64> counts[2]{};
+        const auto count = counts[upload].fetch_add(1, std::memory_order_relaxed) + 1;
+        if (count <= 3 || count % 300 == 0)
+            std::fprintf(stderr, "Native Metal image %s #%llu: %zu regions; shared storage, no bridge copies.\n",
+                         upload ? "upload" : "download", static_cast<unsigned long long>(count), regions.size());
+    }
+    return copied;
+}
+#endif
 
 void Runtime::CopyImage(VideoCore::Image* src, VideoCore::Image* dst) {
     const u32 num_mips = std::min(src->info.resources.levels, dst->info.resources.levels);
