@@ -22,7 +22,7 @@ NEUTRAL = "lx=128 ly=128 rx=128 ry=128"
 FLIP = re.compile(r"Guest flip stats: ([\d.]+) FPS.*?; (\d+) shader/pipeline compiles, ([\d.]+) ms;.*? (\d+) draws/frame")
 PACE = re.compile(r"Frame pacing: median ([\d.]+) ms, stddev ([\d.]+) ms, p99 ([\d.]+) ms, (\d+) frames over")
 HOST = re.compile(r"Host present calls: interval p50 ([\d.]+) / p95 ([\d.]+) / p99 ([\d.]+) ms")
-METAL_SCENE = re.compile(r"MetalFX scene #(\d+): (\d+)x(\d+) -> (\d+)x(\d+) before HUD; Vulkan release ([\d.]+) ms, Metal/completion ([\d.]+) ms, GPU upscale\+copy ([\d.]+|nan) ms")
+METAL_SCENE = re.compile(r"MetalFX scene #(\d+): (\d+)x(\d+) -> (\d+)x(\d+) before HUD; Vulkan release ([\d.]+) ms, Metal/completion ([\d.]+) ms, GPU upscale\+copy ([\d.]+|nan) ms(?: async=(\d+))?")
 METAL_PRESENT = re.compile(r"Native Metal GPU #(\d+): ([\d.]+) ms; post=(\d+) spatial=(\d+), frame=(\d+)x(\d+) target=(\d+)x(\d+) drawable=(\d+)x(\d+)(?: direct_post=(\d+))?")
 THERMAL_STATES = ("nominal", "fair", "serious", "critical")
 
@@ -97,7 +97,8 @@ class Stats:
             self.native.append(dict(at=at, stage="scene", frame=int(match[1]),
                                     input=[int(match[2]), int(match[3])], output=[int(match[4]), int(match[5])],
                                     vulkan_release_ms=float(match[6]), metal_completion_ms=float(match[7]),
-                                    gpu_ms=gpu if math.isfinite(gpu) else None))
+                                    gpu_ms=gpu if math.isfinite(gpu) else None,
+                                    asynchronous=bool(int(match[9])) if match[9] else False))
         elif match := METAL_PRESENT.search(line):
             self.native.append(dict(at=at, stage="presentation", frame=int(match[1]), gpu_ms=float(match[2]),
                                     post=bool(int(match[3])), spatial=bool(int(match[4])),
@@ -196,7 +197,7 @@ def benchmark(args):
                BB_VBLANK_HZ="60", BB_PRESENT_MODE="Fifo", BB_PREP_WORKERS="0",
                BB_MACOS_CONSERVATIVE_GPU="1", BB_METAL_BUFFER_CACHE="1", BB_METAL_BUFFER_COPY="1",
                BB_METAL_IMAGE_CACHE="1", BB_METAL_IMAGE_COPY="0", BB_METAL_IMAGE_TRANSFER="0",
-               BB_METAL_IMAGE_CLEAR="0", BB_METAL_POST_PROCESS="0", BB_METALFX_SCENE="0", BB_FULLSCREEN="0")
+               BB_METAL_IMAGE_CLEAR="0", BB_METAL_POST_PROCESS="0", BB_METALFX_SCENE="0", BB_METALFX_SCENE_ASYNC="0", BB_FULLSCREEN="0")
     env.update(args.overrides)
     env.setdefault("BB_PATCHES", "Skip Intro + warning message")
     env.setdefault("BB_GPU_USER_DIR", str(ROOT / "out/macos-run/user"))
@@ -343,7 +344,7 @@ def benchmark(args):
                   summary=summarize(guest, host) if guest else None,
                   caveat="Guest flip throughput and host API timings, not display scanout. Window p99 values are not pooled percentiles.")
     result["native_gpu_samples"] = [r for r in stats.native if measurement_start is not None and measurement_start <= r["at"] <= measurement_start + args.seconds]
-    result["native_gpu_caveat"] = "Sparse completed Metal command-buffer samples, not per-frame or isolated shader timings. Scene includes private-output copy; presentation includes optional post/scaler/overlay. Vulkan release and Metal completion are CPU wall time."
+    result["native_gpu_caveat"] = "Sparse completed Metal command-buffer samples, not per-frame or isolated shader timings. Scene includes private-output copy; presentation includes optional post/scaler/overlay. Vulkan release and Metal completion are CPU wall time; asynchronous scene samples measure the worker, not command-thread blocking."
     result["thermal_samples"] = thermal_samples
     result["thermal"] = summarize_thermals(thermal_samples, measurement_start, args.seconds)
     result["power_source_end"] = command_output("pmset", "-g", "batt")
@@ -402,6 +403,9 @@ def main():
         assert stats.native[1]["direct_post"] is None
         stats.feed("Native Metal GPU #1200: 0.302 ms; post=1 spatial=0, frame=1920x1080 target=1710x961 drawable=1710x1041 direct_post=1", 14)
         assert stats.native[-1]["direct_post"] and stats.native[-1]["post"]
+        assert not stats.native[0]["asynchronous"]
+        stats.feed("MetalFX scene #300: 1280x720 -> 1920x1080 before HUD; Vulkan release 33.805 ms, Metal/completion 0.966 ms, GPU upscale+copy 0.593 ms async=1", 15)
+        assert stats.native[-1]["asynchronous"] and stats.native[-1]["gpu_ms"]==0.593
         json.dumps(stats.native, allow_nan=False)
         cool = [dict(at=t, state="nominal", low_power_mode=False) for t in (0, 5, 10)]
         assert not summarize_thermals(cool, 5, 10)["comparison_flagged"]

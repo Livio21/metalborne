@@ -3,7 +3,7 @@
 During graphics work, update [the game rendering and handling register](GAME_RENDERING_ISSUES.md)
 with visual issues, direct game optimization candidates and their evidence.
 
-Updated 2026-10-06. This is the first native Metal presentation stage of the
+Updated 2026-10-07. This is the first native Metal presentation stage of the
 renderer transition. The game and host CPU code still run under Rosetta;
 PS4 draw/compute commands and shader recompilation still use bbport's Vulkan
 renderer through KosmicKrisp. Host SDR post-processing now has an opt-in native
@@ -304,7 +304,8 @@ reads encoded tonemapped bytes through UNORM views in perceptual mode, writes a
 cached private output, then GPU-blits into the shared UI attachment. Both images
 return to Vulkan ownership even if scaling fails. Subsequent HUD/text draws stay
 at 1920x1080. The driver still needs a synchronous command-thread completion
-bridge here; pixels never pass through CPU memory.
+bridge in the default scene mode; the optional worker bridge below changes that
+CPU scheduling. Pixels never pass through CPU memory.
 
 The existing headless check covers four RGBA/BGRA UNORM/sRGB source formats,
 changed input, two output sizes, constant-color quadrants for orientation/color/
@@ -341,6 +342,85 @@ retains its samples in `game.log`. Timing is read after command completion using
 The integration follows Apple's guidance to cache the scaler and upscale the
 tonemapped scene in perceptual space
 [before drawing the UI](https://developer.apple.com/videos/play/wwdc2022/10103/).
+
+### Asynchronous scene completion bridge: 2026-10-07
+
+Add `BB_METALFX_SCENE_ASYNC=1` to the scene command above. It remains off by
+default and requires `BB_METALFX_SCENE=1 BB_METALFX=spatial`.
+
+The installed driver reports `VK_EXT_metal_objects=0` in the headless check;
+that extension's [Metal shared-event export](https://docs.vulkan.org/refpages/latest/refpages/source/VkExportMetalSharedEventInfoEXT.html)
+is unavailable. This path uses a [host-signaled Vulkan timeline semaphore](https://docs.vulkan.org/samples/latest/samples/extensions/timeline_semaphore/README.html)
+instead. The game thread submits the release without closing its current GPU
+tick, then continues recording the HUD. A worker waits for the release fence,
+runs MetalFX and its output copy, waits for Metal completion and signals the
+dedicated timeline. Every subsequent draw-scheduler submission waits at
+ALL_COMMANDS before acquiring or reusing those resources. The dependency is
+installed under the submission lock and retained across partial buffer/image
+handoffs. Staging reservations and deferred callbacks stay on the unfinished
+tick until dependent Vulkan work completes.
+
+The prepared operation retains both Metal textures. There is one outstanding
+job per renderer; the next UI boundary collects its result and shutdown drains
+both the job and dependent Vulkan work. Standard `std::async` starts a thread
+per job; a persistent worker is warranted only if profiling finds that startup
+cost significant. Thread/allocation exhaustion executes the same job inline.
+An unavailable/failed MetalFX operation uses a linear Metal background pass and
+disables scene scaling on subsequent frames. If both native operations fail,
+the process stops before signaling an invalid background. This preserves an
+explicit failure instead of stranding Vulkan on a semaphore that never signals.
+
+The existing headless check gates the host signal until Vulkan submission has
+returned. It verifies that the tick/callbacks remain pending, queues the image
+acquire/readback before the signal, then checks the completed output. The
+external dependency is the third wait in that submission, exercising the
+ALL_COMMANDS stage mask for image transfers. Four
+RGBA/BGRA UNORM/sRGB formats, changed input and two output sizes pass; the forced
+linear fallback is compared across all bytes against Vulkan within one LSB.
+Direct, deferred-recording and original Vulkan checks passed. Logs:
+`out/macos-native-metal/scene-async-{check,threaded-check,vulkan-check}.log`.
+The bridge relocates CPU waiting; it does not remove scene GPU work or establish
+a gameplay speedup by itself.
+
+Matching stationary Hunter's Dream runs used the same executable/GPU hashes,
+copied save, 720p scene / 1080p HUD, original 30 FPS timing, 30-second warmup,
+45-second measurement and no host post-process option:
+
+| Scene completion | Guest FPS | Median / worst-window p99 | Draws/frame | Sampled pressure |
+| --- | --- | --- | --- | --- |
+| Synchronous | 20.9 (20.8-20.9) | 50.00 / 50.02 ms | 784-800 | nominal |
+| Asynchronous | 26.1 (25.8-26.2) | 33.33 / 50.02 ms | 789-796 | nominal |
+
+No game shader/pipeline compilation occurred during measurement. Both runs
+exited normally and retained all 15 source-save hashes. Their only functional
+environment difference was `BB_METALFX_SCENE_ASYNC`; private run paths differed
+as expected. The observed throughput increase is approximately 25%; the
+median interval improved while worst-window p99 remained 50.02 ms. This does
+not establish display scanout pacing or stable 30 FPS, and nominal OS pressure
+does not prove equal CPU/GPU clocks. Async GPU samples were 0.437-1.163 ms;
+release waits remained on the worker instead of blocking scene recording.
+Evidence: `out/benchmarks/20261006-223011-534177-pre-hud-async-bridge/` and
+`out/benchmarks/20261006-223352-300327-pre-hud-sync-reference/`.
+
+The final build also completed a 90-second warmup / 45-second measurement in
+`20261006-223947-142017-pre-hud-async-long-warmup`, with 27.7 FPS, 33.33 ms
+median, 50.02 ms worst-window p99, zero compilation and normal shutdown.
+Thermal pressure became **fair**, and the settings overlay remained visible
+during measurement after a computer-control interruption. Exclude this run
+from the matched speedup comparison. It establishes continued scene/overlay
+operation on the final library, not a sustained-performance improvement.
+
+A separate final-build UI check, `20261007-090807-000054-pre-hud-async-ui-resize-check`,
+opened/closed the settings overlay and resized/restored the window through its
+native zoom action. The scene and 1080p HUD remained visible. Completed native
+presentation samples recorded target/drawable changes from 1710x961/1710x1041
+to 1690x950/1690x1021 and back; scene MetalFX continued at 1280x720 -> 1920x1080.
+The process exited normally and all 15 source-save hashes remained unchanged.
+Its short 15-second measurement averaged 20.2 FPS despite nominal pressure.
+UI interaction and the different run conditions exclude it from the matched
+comparison; this variation also shows why nominal pressure alone is inadequate
+for attributing performance. Sustained 30 FPS and a repeatable gain across
+longer alternating runs remain open.
 
 ## Next transition steps
 

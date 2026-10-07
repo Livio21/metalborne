@@ -1,6 +1,6 @@
 # Experimental MetalFX spatial integration
 
-Updated 2026-10-06. The target remains the original game's **30 FPS**, with
+Updated 2026-10-07. The target remains the original game's **30 FPS**, with
 consistent delivery at roughly **33.33 ms per game frame**.
 
 ## Current status
@@ -9,6 +9,9 @@ An additional opt-in `BB_METALFX_SCENE=1` path now upscales the tonemapped scene
 before the 1080p HUD. Its gameplay completion evidence, thermal limitations and
 synchronous bridge cost are recorded in the [native Metal runbook](MACOS_NATIVE_METAL.md#scene-metalfx-before-the-hud-2026-10-06).
 It remains off by default; the presentation integration below is still available.
+`BB_METALFX_SCENE_ASYNC=1` additionally selects the worker/timeline completion
+bridge, with the [matched gameplay comparison](MACOS_NATIVE_METAL.md#asynchronous-scene-completion-bridge-2026-10-07)
+and its validation limits recorded in the same runbook.
 
 An opt-in [native Metal presentation path](MACOS_NATIVE_METAL.md) can now sample
 MetalFX's private output directly into a drawable, removing the shared-output

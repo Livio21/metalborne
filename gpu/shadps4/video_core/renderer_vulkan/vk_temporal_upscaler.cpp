@@ -212,6 +212,10 @@ TemporalUpscaler::TemporalUpscaler(const Instance& instance_, Scheduler& schedul
 }
 
 TemporalUpscaler::~TemporalUpscaler() {
+#ifdef __APPLE__
+    if (metal_scene_work.valid()) metal_scene_work.wait();
+    if (metal_scene_value) scheduler.Finish(); // Drain Vulkan acquisitions before UI images die.
+#endif
     if (resources_ready) scheduler.Finish();
     if (context) {
         scheduler.Finish();
@@ -1444,6 +1448,10 @@ void TemporalUpscaler::PrepareUiDepth(VideoCore::ImageId depth_id) {
 }
 
 void TemporalUpscaler::RunUiOnly(VideoCore::ImageId color_id, VideoCore::ImageId depth_id) {
+#ifdef __APPLE__
+    // ponytail: one outstanding scene job; persistent worker if thread startup profiles hot.
+    if (metal_scene_work.valid() && !metal_scene_work.get()) metal_scene_failed = true;
+#endif
     if (auto* profiler = GpuProfiler::Get()) {
         profiler->Mark(0xF5A1'0000ull, [] { return std::string{"upscaler RunUiOnly"}; });
     }
@@ -1512,23 +1520,78 @@ void TemporalUpscaler::RunUiOnly(VideoCore::ImageId color_id, VideoCore::ImageId
             scheduler.CommandBuffer().pipelineBarrier2({.imageMemoryBarrierCount = 2,
                                                          .pImageMemoryBarriers = barriers.data()});
         };
-        ownership(true);
-        scheduler.FinishForExternal();
-        const auto released = std::chrono::steady_clock::now();
-        float gpu_ms = NAN;
-        scaled = BbMetalFX::UpscaleScene(metal_source, ui_image.metal->NativeHandle(), &gpu_ms);
-        ownership(false); // Failure must also return both images to Vulkan before the blit.
-        if (!scaled) {
-            metal_scene_failed = true;
-            std::printf("MetalFX scene unavailable: scaler/command failed; keeping Vulkan background blit\n");
-        }
-        static u64 completed = 0;
-        if (scaled && (++completed <= 3 || completed % 300 == 0)) {
-            const auto now = std::chrono::steady_clock::now();
-            std::printf("MetalFX scene #%llu: %ux%u -> %ux%u before HUD; Vulkan release %.3f ms, Metal/completion %.3f ms, GPU upscale+copy %.3f ms\n",
-                static_cast<unsigned long long>(completed), source_width, source_height, ui_width, ui_height,
-                std::chrono::duration<double, std::milli>(released-start).count(),
-                std::chrono::duration<double, std::milli>(now-released).count(), gpu_ms);
+        static const bool asynchronous = [] {
+            const char* opt = std::getenv("BB_METALFX_SCENE_ASYNC");
+            return opt && opt[0] == '1';
+        }();
+        auto work = asynchronous ? BbMetalFX::PrepareScene(metal_source, ui_image.metal->NativeHandle())
+                                 : std::function<BbMetalFX::SceneResult()>{};
+        if (work) {
+            const auto device = instance.GetDevice();
+            const auto semaphore = scheduler.ExternalSemaphore();
+            const auto value = ++metal_scene_value;
+            auto fence = std::make_shared<vk::UniqueFence>(Check(device.createFenceUnique({})));
+            const auto run = [device,semaphore,value,fence,work,source_width,source_height,
+                              ow=ui_width,oh=ui_height] {
+                try {
+                    const auto begin = std::chrono::steady_clock::now();
+                    Check(device.waitForFences(**fence,true,UINT64_MAX));
+                    const auto released = std::chrono::steady_clock::now();
+                    const auto result = work();
+                    // Never unblock Vulkan with an uninitialized background after a device error.
+                    ASSERT_MSG(result.ready, "Metal scene and linear fallback both failed");
+                    Check(device.signalSemaphore({.semaphore=semaphore,.value=value}));
+                    if (!result.scaled) {
+                        std::printf("MetalFX async scene: linear fallback completed; keeping Vulkan on subsequent frames\n");
+                        return false;
+                    }
+                    static std::atomic<u64> completed{0};
+                    const auto number = ++completed;
+                    if (number <= 3 || number % 300 == 0) {
+                        const auto now = std::chrono::steady_clock::now();
+                        std::printf("MetalFX scene #%llu: %ux%u -> %ux%u before HUD; Vulkan release %.3f ms, Metal/completion %.3f ms, GPU upscale+copy %.3f ms async=1\n",
+                            static_cast<unsigned long long>(number),source_width,source_height,ow,oh,
+                            std::chrono::duration<double,std::milli>(released-begin).count(),
+                            std::chrono::duration<double,std::milli>(now-released).count(),result.gpu_ms);
+                    }
+                    return true;
+                } catch (...) {
+                    // An exception must not strand the GPU on an unsignaled timeline value.
+                    std::fprintf(stderr,"Metal scene worker failed; stopping before an invalid frame\n");
+                    std::abort();
+                }
+            };
+            ownership(true);
+            SubmitInfo release{};
+            release.fence = **fence;
+            scheduler.FlushForExternal(release,value);
+            try {
+                metal_scene_work = std::async(std::launch::async,run);
+            } catch (...) {
+                // Worker allocation/thread exhaustion keeps the synchronous completion contract.
+                metal_scene_failed = !run();
+            }
+            scaled = true; // Vulkan waits for the worker's initialized output before the HUD.
+            ownership(false);
+        } else {
+            ownership(true);
+            scheduler.FinishForExternal();
+            const auto released = std::chrono::steady_clock::now();
+            float gpu_ms = NAN;
+            scaled = BbMetalFX::UpscaleScene(metal_source, ui_image.metal->NativeHandle(), &gpu_ms);
+            ownership(false); // Failure must also return both images to Vulkan before the blit.
+            if (!scaled) {
+                metal_scene_failed = true;
+                std::printf("MetalFX scene unavailable: scaler/command failed; keeping Vulkan background blit\n");
+            }
+            static u64 completed = 0;
+            if (scaled && (++completed <= 3 || completed % 300 == 0)) {
+                const auto now = std::chrono::steady_clock::now();
+                std::printf("MetalFX scene #%llu: %ux%u -> %ux%u before HUD; Vulkan release %.3f ms, Metal/completion %.3f ms, GPU upscale+copy %.3f ms\n",
+                    static_cast<unsigned long long>(completed), source_width, source_height, ui_width, ui_height,
+                    std::chrono::duration<double, std::milli>(released-start).count(),
+                    std::chrono::duration<double, std::milli>(now-released).count(), gpu_ms);
+            }
         }
     }
 #endif

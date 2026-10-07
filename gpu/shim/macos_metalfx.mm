@@ -438,29 +438,35 @@ bool PostProcess(void* source, VkFormat view_format, void* destination, float ga
     return PostProcessImpl(source, view_format, destination, gamma, srgb_input, nil, region);
 }
 
+static MTLPixelFormat SceneFormat(MTLPixelFormat f) {
+    if (f == MTLPixelFormatRGBA8Unorm_sRGB) return MTLPixelFormatRGBA8Unorm;
+    if (f == MTLPixelFormatBGRA8Unorm_sRGB) return MTLPixelFormatBGRA8Unorm;
+    return f;
+}
+
+static bool CompatibleScene(id<MTLTexture> src, id<MTLTexture> dst) {
+    const auto valid = [](id<MTLTexture> t) {
+        return t && t.textureType == MTLTextureType2D && t.sampleCount == 1 &&
+               t.mipmapLevelCount == 1 && t.arrayLength == 1;
+    };
+    if (!valid(src) || !valid(dst) || src == dst || src.device != dst.device ||
+        dst.width <= src.width || dst.height <= src.height ||
+        SceneFormat(src.pixelFormat) != SceneFormat(dst.pixelFormat) ||
+        (SceneFormat(src.pixelFormat) != MTLPixelFormatRGBA8Unorm &&
+         SceneFormat(src.pixelFormat) != MTLPixelFormatBGRA8Unorm) ||
+        ![MTLFXSpatialScalerDescriptor supportsDevice:src.device]) return false;
+    return true;
+}
+
 bool UpscaleScene(void* source, void* destination, float* gpu_ms) {
     if (gpu_ms) *gpu_ms = NAN;
     @autoreleasepool {
         id<MTLTexture> src = (__bridge id<MTLTexture>)source, dst = (__bridge id<MTLTexture>)destination;
-        const auto format = [](MTLPixelFormat f) {
-            if (f == MTLPixelFormatRGBA8Unorm_sRGB) return MTLPixelFormatRGBA8Unorm;
-            if (f == MTLPixelFormatBGRA8Unorm_sRGB) return MTLPixelFormatBGRA8Unorm;
-            return f;
-        };
-        const auto valid = [](id<MTLTexture> t) {
-            return t && t.textureType == MTLTextureType2D && t.sampleCount == 1 &&
-                   t.mipmapLevelCount == 1 && t.arrayLength == 1;
-        };
-        if (!valid(src) || !valid(dst) || src == dst || src.device != dst.device ||
-            dst.width <= src.width || dst.height <= src.height ||
-            format(src.pixelFormat) != format(dst.pixelFormat) ||
-            (format(src.pixelFormat) != MTLPixelFormatRGBA8Unorm &&
-             format(src.pixelFormat) != MTLPixelFormatBGRA8Unorm) ||
-            ![MTLFXSpatialScalerDescriptor supportsDevice:src.device]) return false;
+        if (!CompatibleScene(src,dst)) return false;
         // The game has already tonemapped these encoded bytes. Avoid an extra sRGB
         // view decode/encode before the subsequent sRGB HUD attachment uses them.
-        id<MTLTexture> input = [src newTextureViewWithPixelFormat:format(src.pixelFormat)];
-        id<MTLTexture> output = [dst newTextureViewWithPixelFormat:format(dst.pixelFormat)];
+        id<MTLTexture> input = [src newTextureViewWithPixelFormat:SceneFormat(src.pixelFormat)];
+        id<MTLTexture> output = [dst newTextureViewWithPixelFormat:SceneFormat(dst.pixelFormat)];
         if (!input || !output) return false;
         // ponytail: one synchronous scene scaler; per-renderer cache if multiple games share a process.
         static std::mutex mutex;
@@ -505,6 +511,32 @@ bool UpscaleScene(void* source, void* destination, float* gpu_ms) {
         // Never retain a borrowed guest/shared texture after the synchronous call returns.
         scaler.colorTexture = nil; scaler.outputTexture = nil; scaler.fence = nil;
         return ok;
+    }
+}
+
+std::function<SceneResult()> PrepareScene(void* source, void* destination, bool linear_only) {
+    @autoreleasepool {
+        id<MTLTexture> src = (__bridge id<MTLTexture>)source, dst = (__bridge id<MTLTexture>)destination;
+        if (!CompatibleScene(src,dst) || !(src.usage & MTLTextureUsageShaderRead) ||
+            !(dst.usage & MTLTextureUsageRenderTarget)) return {};
+        // ARC retains both textures in the copied C++ closure until the worker retires it.
+        return [src,dst,linear_only] {
+            @autoreleasepool {
+                SceneResult result{.gpu_ms = NAN};
+                result.scaled = !linear_only && UpscaleScene((__bridge void*)src,(__bridge void*)dst,&result.gpu_ms);
+                result.ready = result.scaled;
+                if (!result.ready) {
+                    const bool srgb = src.pixelFormat != SceneFormat(src.pixelFormat);
+                    const bool rgba = SceneFormat(src.pixelFormat) == MTLPixelFormatRGBA8Unorm;
+                    const auto view = rgba ? (srgb ? VK_FORMAT_R8G8B8A8_SRGB : VK_FORMAT_R8G8B8A8_UNORM)
+                                           : (srgb ? VK_FORMAT_B8G8R8A8_SRGB : VK_FORMAT_B8G8R8A8_UNORM);
+                    id<MTLTexture> output = [dst newTextureViewWithPixelFormat:SceneFormat(dst.pixelFormat)];
+                    // Preserve encoded UNORM bytes; sRGB views filter in linear space like Vulkan.
+                    result.ready = output && PostProcessImpl((__bridge void*)src,view,(__bridge void*)output,1,!srgb);
+                }
+                return result;
+            }
+        };
     }
 }
 

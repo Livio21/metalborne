@@ -1,6 +1,7 @@
 // Experimental shared Metal resources, presentation and MetalFX.
 #pragma once
 #include <memory>
+#include <functional>
 #include <span>
 #include <vulkan/vulkan_core.h>
 
@@ -52,6 +53,10 @@ bool PostProcess(void* source, VkFormat view_format, void* destination, float ga
 // Tonemapped SDR scene, before UI; matching RGBA/BGRA8 storage, base mip/layer only.
 // Caller releases both images and completes Vulkan first, then acquires even on failure.
 bool UpscaleScene(void* source, void* destination, float* gpu_ms = nullptr);
+struct SceneResult { bool ready{}, scaled{}; float gpu_ms{}; };
+// Retains textures for a worker. Run only after Vulkan release; failed MetalFX
+// uses a linear Metal background pass. linear_only exercises that fallback.
+std::function<SceneResult()> PrepareScene(void* source, void* destination, bool linear_only = false);
 // One-shot shadow dispatch: clones buffers and leaves the live Vulkan resources untouched.
 bool CheckCompute(std::span<const ComputeBuffer> buffers, std::span<const uint8_t> push,
                   uint32_t groups, uint32_t threads);

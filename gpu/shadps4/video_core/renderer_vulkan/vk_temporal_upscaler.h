@@ -17,6 +17,9 @@
 #include <mutex>
 #include <unordered_map>
 #include <vector>
+#ifdef __APPLE__
+#include <future>
+#endif
 
 #include "common/types.h"
 #include "video_core/renderer_vulkan/vk_common.h"
@@ -188,6 +191,8 @@ private:
     bool failed = false;
 #ifdef __APPLE__
     bool metal_scene_failed = false;
+    u64 metal_scene_value = 0;
+    std::future<bool> metal_scene_work;
 #endif
     u64 trigger_hash = 0x9a9cf8a9;
     VideoCore::ImageId scene_color{};

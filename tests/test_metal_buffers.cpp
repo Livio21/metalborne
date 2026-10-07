@@ -7,6 +7,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <cmath>
+#include <future>
 #include <vector>
 #include <limits>
 #include "video_core/buffer_cache/buffer.h"
@@ -35,6 +36,13 @@ int main(int argc, char** argv) {
     dispatch.init(instance.GetInstance());
     dispatch.init(instance.GetDevice());
     const bool threaded = argc > 1 && !std::strcmp(argv[1], "--threaded");
+    if(native) {
+        const auto extensions=Vulkan::Check(instance.GetPhysicalDevice().enumerateDeviceExtensionProperties(nullptr,dispatch));
+        const bool metal_objects=std::any_of(extensions.begin(),extensions.end(),[](const auto& ext) {
+            return !std::strcmp(ext.extensionName,"VK_EXT_metal_objects");
+        });
+        std::printf("Driver shared-event API: VK_EXT_metal_objects=%u; host-signaled timeline bridge checked below\n",unsigned(metal_objects));
+    }
     Vulkan::Scheduler scheduler(instance, threaded);
     assert(scheduler.IsRecordingDeferred() == threaded);
     Vulkan::Runtime runtime(instance, scheduler);
@@ -363,6 +371,7 @@ int main(int argc, char** argv) {
     std::puts("PASS: nine-format render-pass clears match Vulkan bytes, selected mips/layers, untouched subresources and preserved staging/callbacks");
     if (native) {
         // Asymmetric constant quadrants expose orientation, channel and extra sRGB conversion.
+        u64 external_value = 0;
         constexpr std::array<std::array<uint8_t,4>,4> colors{{
             {17,63,149,255}, {215,90,33,255}, {32,185,67,255}, {179,48,201,255}}};
         for (const auto format : {vk::Format::eR8G8B8A8Unorm, vk::Format::eR8G8B8A8Srgb,
@@ -409,13 +418,49 @@ int main(int argc, char** argv) {
                             cmd.pipelineBarrier2(vk::DependencyInfo{.imageMemoryBarrierCount=2,.pImageMemoryBarriers=barriers.data()},dispatch);
                         });
                     };
-                    ownership(true); scheduler.FinishForExternal();
                     auto src=input.backing->image.metal->NativeHandle(), dst=target.backing->image.metal->NativeHandle();
+                    assert(!BbMetalFX::PrepareScene(src,src));
+                    const bool asynchronous=phase==0 || width==128;
+                    const bool linear_only=phase==1 && width==128;
+                    std::future<BbMetalFX::SceneResult> task;
+                    std::array<vk::UniqueSemaphore,2> other_waits;
+                    std::promise<void> queued;
+                    bool retired=false;
+                    const auto tick=scheduler.CurrentTick();
+                    scheduler.DeferOperation([&] { retired=true; });
+                    ownership(true);
+                    if(asynchronous) {
+                        const vk::SemaphoreTypeCreateInfo timeline{.semaphoreType=vk::SemaphoreType::eTimeline};
+                        for(auto& wait : other_waits)
+                            wait=Vulkan::Check(instance.GetDevice().createSemaphoreUnique({.pNext=&timeline},nullptr,dispatch));
+                        auto work=BbMetalFX::PrepareScene(src,dst,linear_only);
+                        assert(work);
+                        const auto semaphore=scheduler.ExternalSemaphore();
+                        const auto value=++external_value;
+                        auto fence=Vulkan::Check(instance.GetDevice().createFenceUnique({},nullptr,dispatch));
+                        Vulkan::SubmitInfo release{}; release.fence=*fence;
+                        scheduler.FlushForExternal(release,value);
+                        assert(scheduler.CurrentTick()==tick);
+                        task=std::async(std::launch::async,[work,semaphore,value,fence=std::move(fence),
+                            gate=queued.get_future(),device=instance.GetDevice(),&dispatch]() mutable {
+                            assert(device.waitForFences(*fence,true,UINT64_MAX,dispatch)==vk::Result::eSuccess);
+                            const bool submitted=gate.wait_for(std::chrono::seconds(1))==std::future_status::ready;
+                            const auto result=work();
+                            assert(result.ready);
+                            assert(device.signalSemaphore({.semaphore=semaphore,.value=value},dispatch)==vk::Result::eSuccess);
+                            assert(submitted && "Driver blocked queue submission on a future host signal");
+                            return result;
+                        });
+                    } else scheduler.FinishForExternal();
+                    scheduler.PopPendingOperations();
+                    assert(!retired && scheduler.CurrentTick()==tick);
                     float gpu_ms=0;
                     assert(!BbMetalFX::UpscaleScene(src,src,&gpu_ms) && std::isnan(gpu_ms));
                     assert(!BbMetalFX::UpscaleScene(dst,src)); // Equal/downscaled input stays Vulkan.
-                    assert(BbMetalFX::UpscaleScene(src,dst,&gpu_ms));
-                    assert(std::isfinite(gpu_ms) && gpu_ms>=0);
+                    if(!asynchronous) {
+                        assert(BbMetalFX::UpscaleScene(src,dst,&gpu_ms));
+                        assert(std::isfinite(gpu_ms) && gpu_ms>=0);
+                    }
                     const bool boxed=width==96 && phase==1;
                     const VkRect2D region{{8,4},{width-16,width/2-8}};
                     if(boxed) {
@@ -436,7 +481,42 @@ int main(int argc, char** argv) {
                     scheduler.Record([image=target.GetImage(),buffer=readback.Handle(),download,&dispatch](vk::CommandBuffer cmd) {
                         cmd.copyImageToBuffer(image,vk::ImageLayout::eTransferSrcOptimal,buffer,download,dispatch);
                     });
-                    scheduler.Finish(); readback.Invalidate(0,readback.SizeBytes());
+                    if(asynchronous) {
+                        Vulkan::SubmitInfo ready{};
+                        for(const auto& wait : other_waits) ready.AddWait(*wait,0);
+                        scheduler.Flush(ready); // External completion is the third ALL_COMMANDS wait.
+                        assert(!retired);
+                        queued.set_value();
+                        scheduler.Wait(tick);
+                        const auto result=task.get();
+                        assert(result.scaled!=linear_only);
+                        assert(linear_only ? std::isnan(result.gpu_ms) : std::isfinite(result.gpu_ms));
+                    } else scheduler.Finish();
+                    scheduler.PopPendingOperations();
+                    assert(retired);
+                    readback.Invalidate(0,readback.SizeBytes());
+                    if(linear_only) {
+                        VideoCore::Image reference(instance,runtime,views,output_info);
+                        Buffer expected(instance,0,readback.SizeBytes(),MemoryType::HostCached);
+                        runtime.Transit(&input,vk::ImageLayout::eTransferSrcOptimal,vk::PipelineStageFlagBits2::eBlit,vk::AccessFlagBits2::eTransferRead);
+                        runtime.Transit(&reference,vk::ImageLayout::eTransferDstOptimal,vk::PipelineStageFlagBits2::eBlit,vk::AccessFlagBits2::eTransferWrite);
+                        runtime.FlushBarriers();
+                        scheduler.Record([source=input.GetImage(),target=reference.GetImage(),width,&dispatch](vk::CommandBuffer cmd) {
+                            const vk::ImageBlit blit{.srcSubresource={vk::ImageAspectFlagBits::eColor,0,0,1},
+                                .srcOffsets=std::array{vk::Offset3D{0,0,0},vk::Offset3D{64,32,1}},
+                                .dstSubresource={vk::ImageAspectFlagBits::eColor,0,0,1},
+                                .dstOffsets=std::array{vk::Offset3D{0,0,0},vk::Offset3D{s32(width),s32(width/2),1}}};
+                            cmd.blitImage(source,vk::ImageLayout::eTransferSrcOptimal,target,vk::ImageLayout::eTransferDstOptimal,blit,vk::Filter::eLinear,dispatch);
+                        });
+                        runtime.Transit(&reference,vk::ImageLayout::eTransferSrcOptimal,vk::PipelineStageFlagBits2::eCopy,vk::AccessFlagBits2::eTransferRead);
+                        runtime.FlushBarriers();
+                        scheduler.Record([image=reference.GetImage(),buffer=expected.Handle(),download,&dispatch](vk::CommandBuffer cmd) {
+                            cmd.copyImageToBuffer(image,vk::ImageLayout::eTransferSrcOptimal,buffer,download,dispatch);
+                        });
+                        scheduler.Finish(); expected.Invalidate(0,expected.SizeBytes());
+                        for(size_t i=0;i<readback.SizeBytes();++i)
+                            assert(std::abs(int(readback.mapped_data[i])-int(expected.mapped_data[i]))<=1);
+                    }
                     for (u32 q=0;q<4;++q) {
                         const u32 x=boxed?8+region.extent.width*(q%2?3:1)/4:width*(q%2?3:1)/4;
                         const u32 y=boxed?4+region.extent.height*(q/2?3:1)/4:(width/2)*(q/2?3:1)/4;
@@ -457,7 +537,7 @@ int main(int argc, char** argv) {
                 }
             }
         }
-        std::puts("PASS: pre-HUD MetalFX, four RGBA/BGRA/sRGB formats, changed input, resize, orientation/color/alpha, GPU timing, letterboxed post-process and rejected fallback");
+        std::puts("PASS: pre-HUD MetalFX, async host-signal ordering, preserved reservations/callbacks, four RGBA/BGRA/sRGB formats, forced linear fallback versus Vulkan, resize/color/alpha/GPU timing and letterboxed post-process");
     }
     if (native) {
         size_t compared = 0, rounding = 0;

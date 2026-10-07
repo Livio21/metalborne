@@ -71,6 +71,7 @@ python3 tools/benchmark_macos.py --seconds 60 --label vulkan --env BB_PRESENT_BA
 python3 tools/benchmark_macos.py --seconds 60 --label metal-transfers --env BB_METAL_IMAGE_TRANSFER=1
 python3 tools/benchmark_macos.py --seconds 60 --label metal-host-pass --env BB_METAL_POST_PROCESS=1
 python3 tools/benchmark_macos.py --seconds 60 --label metal-scene --env BB_METALFX_SCENE=1
+python3 tools/benchmark_macos.py --seconds 60 --label metal-scene-async --env BB_METALFX_SCENE=1 --env BB_METALFX_SCENE_ASYNC=1
 python3 tools/benchmark_macos.py --manual --seconds 30
 python3 tools/benchmark_macos.py --self-check
 ```
@@ -117,6 +118,9 @@ the measurement interval. Scene samples include the upscale and private-output
 copy; presentation samples include the selected post/scaler/overlay passes.
 Their release/completion wall times include CPU waits. Missing GPU timestamps
 remain `null`; do not treat these sparse samples as per-frame percentiles.
+Scene records with `asynchronous=true` measure release/completion on the worker;
+those times do not describe blocking on the game command thread. The benchmark
+sets the async option to zero unless explicitly overridden.
 
 Startup timeout, an early exit, lack of timing progress, insufficient workload
 windows or forced shutdown produce a failed result and nonzero runner exit.

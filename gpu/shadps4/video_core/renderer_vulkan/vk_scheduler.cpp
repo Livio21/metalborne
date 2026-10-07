@@ -344,6 +344,20 @@ void Scheduler::FinishForExternal() {
     Check(device.waitForFences(*fence, true, UINT64_MAX));
 }
 
+vk::Semaphore Scheduler::ExternalSemaphore() {
+    std::scoped_lock lock{submit_mutex};
+    if (!external_semaphore) {
+        const vk::SemaphoreTypeCreateInfo type{.semaphoreType = vk::SemaphoreType::eTimeline};
+        external_semaphore = Check(instance.GetDevice().createSemaphoreUnique({.pNext = &type}));
+    }
+    return *external_semaphore;
+}
+
+void Scheduler::FlushForExternal(SubmitInfo& info, u64 completion_value) {
+    ASSERT(info.fence && completion_value && external_semaphore);
+    SubmitExecution(info, false, completion_value);
+}
+
 void Scheduler::Wait(u64 tick) {
     if (tick >= work_semaphore.CurrentTick()) {
         // Make sure we are not waiting for the current tick without signalling
@@ -399,8 +413,9 @@ void Scheduler::AllocateWorkerCommandBuffers() {
 #endif
 }
 
-void Scheduler::SubmitExecution(SubmitInfo& info, bool complete_tick) {
+void Scheduler::SubmitExecution(SubmitInfo& info, bool complete_tick, u64 external_value) {
     std::unique_lock lk{submit_mutex};
+    ASSERT(!external_value || external_value > external_wait_value);
     const u64 signal_value = complete_tick ? work_semaphore.NextTick() : CurrentTick();
 
 #if TRACY_GPU_ENABLED
@@ -428,10 +443,10 @@ void Scheduler::SubmitExecution(SubmitInfo& info, bool complete_tick) {
     const vk::Semaphore timeline = work_semaphore.Handle();
     if (complete_tick) info.AddSignal(timeline, signal_value);
 
-    static constexpr std::array<vk::PipelineStageFlags, 2> wait_stage_masks = {
-        vk::PipelineStageFlagBits::eAllCommands,
-        vk::PipelineStageFlagBits::eColorAttachmentOutput,
-    };
+    std::array<vk::PipelineStageFlags, 4> wait_stage_masks;
+    wait_stage_masks.fill(vk::PipelineStageFlagBits::eAllCommands);
+    if (info.num_wait_semas > 1) wait_stage_masks[1] = vk::PipelineStageFlagBits::eColorAttachmentOutput;
+    if (external_wait_value) info.AddWait(*external_semaphore, external_wait_value);
 
     const vk::TimelineSemaphoreSubmitInfo timeline_si = {
         .waitSemaphoreValueCount = info.num_wait_semas,
@@ -453,7 +468,10 @@ void Scheduler::SubmitExecution(SubmitInfo& info, bool complete_tick) {
 
     ImGui::Core::TextureManager::Submit();
     auto submit_result = instance.GetGraphicsQueue().submit(submit_info, info.fence);
-    ASSERT_MSG(submit_result != vk::Result::eErrorDeviceLost, "Device lost during submit");
+    ASSERT_MSG(submit_result == vk::Result::eSuccess, "Queue submission failed: {}", vk::to_string(submit_result));
+    // Install the dependency under the submission lock, before another thread can flush.
+    // Keep it on all later submissions, including partial native-buffer/image handoffs.
+    if (external_value) external_wait_value = external_value;
 
     work_semaphore.Refresh();
     AllocateWorkerCommandBuffers();

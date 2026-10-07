@@ -74,11 +74,13 @@ struct SubmitInfo {
     u32 num_signal_semas;
 
     void AddWait(vk::Semaphore semaphore, u64 tick = 1) {
+        ASSERT(num_wait_semas < wait_semas.size());
         wait_semas[num_wait_semas] = semaphore;
         wait_ticks[num_wait_semas++] = tick;
     }
 
     void AddSignal(vk::Semaphore semaphore, u64 tick = 1) {
+        ASSERT(num_signal_semas < signal_semas.size());
         signal_semas[num_signal_semas] = semaphore;
         signal_ticks[num_signal_semas++] = tick;
     }
@@ -685,6 +687,11 @@ public:
     /// Completes recorded GPU work for an external API without retiring current reservations.
     void FinishForExternal();
 
+    /// Submit a release without retiring reservations; later submissions wait for the
+    /// caller to signal ExternalSemaphore() at completion_value from the host.
+    void FlushForExternal(SubmitInfo& info, u64 completion_value);
+    vk::Semaphore ExternalSemaphore();
+
     /// Waits for the given tick to trigger on the GPU.
     void Wait(u64 tick);
 
@@ -879,13 +886,15 @@ private:
 
     void RecorderThread(std::stop_token stoken);
 
-    void SubmitExecution(SubmitInfo& info, bool complete_tick = true);
+    void SubmitExecution(SubmitInfo& info, bool complete_tick = true, u64 external_value = 0);
 
     void PriorityPendingOpsThread(std::stop_token stoken);
 
 private:
     const Instance& instance;
     Semaphore work_semaphore;
+    vk::UniqueSemaphore external_semaphore;
+    u64 external_wait_value = 0;
     CommandPool command_pool;
     DynamicState dynamic_state;
     SubmitFunc on_submit{};
