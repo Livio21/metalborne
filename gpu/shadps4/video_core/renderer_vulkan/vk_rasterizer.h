@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <map>
+
 #include "common/recursive_lock.h"
 #include "common/shared_first_mutex.h"
 #include "video_core/buffer_cache/buffer_cache.h"
@@ -236,7 +238,12 @@ private:
     bool DispatchMetal(const ComputePipeline* pipeline, std::array<u32, 3> groups);
     bool ExecuteMetal(const Pipeline* pipeline, std::array<u32, 3> groups,
                       const RenderState* render = nullptr, bool indexed = false);
-    std::vector<std::pair<u64, std::shared_ptr<BbMetalFX::SharedBuffer>>> metal_clone_pool;
+    struct MetalBufferMirror {
+        std::shared_ptr<BbMetalFX::SharedBuffer> buffer;
+        u64 generation = UINT64_MAX;
+    };
+    std::map<std::pair<u64, u64>, MetalBufferMirror> metal_buffer_mirrors;
+    u64 metal_buffer_mirror_bytes = 0;
     bool metal_async_issued = false;
 #endif
     /// The compute registers of the dispatch being recorded.

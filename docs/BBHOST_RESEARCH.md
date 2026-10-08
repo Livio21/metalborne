@@ -63,14 +63,16 @@ by its optional 60 FPS work. We continue to target 30 FPS.
 
 ## Next use in this port
 
-1. Extend the compiled async shared-resource graphics path beyond its passing
-   direct/threaded Vulkan comparison fixture. It removes caller-side completion
-   waits only for already shared resources; it does not eliminate per-draw
-   submissions or make sparse clone draws asynchronous.
+1. Extend the passing async graphics path by batching consecutive native draws.
+   Persistent sparse mirrors now allow queued refreshes and writeback; each
+   draw still crosses the Vulkan/Metal ownership boundary. Preserve the same
+   logical guest tick and ordered completion when reducing submissions.
 2. Use the resource hooks/layouts as references to verify stable vertex/index
    ranges, dynamic constants, aliases and map/discard behavior in our dump.
-   Replace pooled per-draw sparse clones with persistent native ownership only
-   after those writes and retirements are accounted for.
+   Persistent mirrors track sparse writes in 64 KiB pages, invalidate all on
+   unbounded DMA, and keep the existing guest alias tracking. Direct shared ownership
+   still requires a different allocation contract; sparse export is rejected
+   by the installed driver.
 3. Capture one GX draw alongside the existing decoded draw and compare its
    shaders, bindings, constants and render state before replacing construction.
    Reuse bbport's draw preparation/cache work where it already gives the same

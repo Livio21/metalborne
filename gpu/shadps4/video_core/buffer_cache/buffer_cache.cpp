@@ -383,6 +383,10 @@ void BufferCache::ProcessFaultBuffer() {
 }
 
 void BufferCache::SynchronizeDmaBuffers() {
+#ifdef __APPLE__
+    // DMA addresses bypass descriptor access tracking and may write any resident page.
+    runtime.InvalidateSparseBuffers();
+#endif
     for (const auto& range : resident_ranges) {
         const u64 page = range.start >> (ARENA_PAGE_BITS - block_shift);
         const VAddr device_addr = range.start << block_shift;

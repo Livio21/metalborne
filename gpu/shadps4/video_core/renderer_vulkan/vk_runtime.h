@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <algorithm>
+
 #include "common/types.h"
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/renderer_vulkan/vk_barrier_tracker.h"
@@ -97,6 +99,28 @@ public:
 
     void FlushBarriers();
 
+#ifdef __APPLE__
+    u64 SparseBufferGeneration() const { return sparse_buffer_generation; }
+    u64 SparseBufferGeneration(VAddr addr, u64 size) const {
+        ASSERT(size && addr <= UINT64_MAX - (size - 1));
+        u64 generation = sparse_unbounded_generation;
+        const u64 first = addr >> 16;
+        const u64 pages = std::min<u64>(((addr + size - 1) >> 16) - first + 1, sparse_page_generations.size());
+        for (u64 i = 0; i < pages; ++i)
+            generation = std::max(generation, sparse_page_generations[(first + i) % sparse_page_generations.size()]);
+        return generation;
+    }
+    void InvalidateSparseBuffers() { sparse_unbounded_generation = ++sparse_buffer_generation; }
+    void InvalidateSparseBuffers(VAddr addr, u64 size) {
+        ASSERT(size && addr <= UINT64_MAX - (size - 1));
+        const u64 generation = ++sparse_buffer_generation;
+        const u64 first = addr >> 16;
+        const u64 pages = std::min<u64>(((addr + size - 1) >> 16) - first + 1, sparse_page_generations.size());
+        for (u64 i = 0; i < pages; ++i)
+            sparse_page_generations[(first + i) % sparse_page_generations.size()] = generation;
+    }
+#endif
+
     /// bbport: runs before this thread changes image state (layouts, pending image
     /// barriers): the rasterizer joins its texture binding helper there (BindHelper).
     void SetImageAccessHook(void (*hook)(void*), void* context) {
@@ -134,6 +158,12 @@ private:
     };
     std::array<AccessMemo, 512> access_memo{};
     u32 access_epoch = 1;
+#ifdef __APPLE__
+    u64 sparse_buffer_generation = 0;
+    u64 sparse_unbounded_generation = 0;
+    // ponytail: 64 KiB hash collisions cause extra uploads; use interval versions if refresh cost remains high.
+    std::array<u64, 4096> sparse_page_generations{};
+#endif
 };
 
 } // namespace Vulkan

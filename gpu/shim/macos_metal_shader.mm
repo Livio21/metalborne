@@ -118,8 +118,12 @@ struct ShaderFunction::Impl {
                 add(reflection.separate_images, ShaderResourceKind::Texture);
                 add(reflection.storage_images, ShaderResourceKind::Texture);
                 add(reflection.separate_samplers, ShaderResourceKind::Sampler);
-                for (const auto& input : reflection.stage_inputs)
+                for (const auto& input : reflection.stage_inputs) {
                     flat_inputs |= compiler.has_decoration(input.id, spv::DecorationFlat);
+                    const auto& type = compiler.get_type(input.base_type_id);
+                    for (uint32_t member = 0; member < type.member_types.size(); ++member)
+                        flat_inputs |= compiler.has_member_decoration(input.base_type_id, member, spv::DecorationFlat);
+                }
                 if (!reflection.sampled_images.empty() || !reflection.subpass_inputs.empty())
                     throw std::runtime_error("Combined sampler/input attachment requires native binding support");
                 if (!resources.empty()) argument_slot = 0;
@@ -351,6 +355,18 @@ struct RenderPipeline::Impl {
                 if (info.pStages[i].stage != VK_SHADER_STAGE_VERTEX_BIT && info.pStages[i].stage != VK_SHADER_STAGE_FRAGMENT_BIT) {
                     error = "Native geometry/tessellation lowering required"; return;
                 }
+            const auto& samples = *info.pMultisampleState;
+            if (samples.sampleShadingEnable) { error = "Native minimum sample shading is unsupported"; return; }
+            if (samples.pSampleMask) {
+                const uint32_t count = samples.rasterizationSamples;
+                for (uint32_t first = 0; first < count; first += 32) {
+                    const uint32_t bits = std::min(32u, count - first);
+                    const uint32_t enabled = UINT32_MAX >> (32 - bits);
+                    if ((samples.pSampleMask[first / 32] & enabled) != enabled) {
+                        error = "Native fixed sample masks are unsupported"; return;
+                    }
+                }
+            }
             topology = info.pInputAssemblyState->topology;
             polygon = info.pRasterizationState->polygonMode;
             clamp = info.pRasterizationState->depthClampEnable;
@@ -416,6 +432,9 @@ CommandResult RenderPipeline::Draw(const Vulkan::RenderState& state, const Vulka
             !state.width || !state.height || state.num_color_attachments > 8 ||
             (dynamic.primitive_restart_enable && impl->topology != VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP &&
              impl->topology != VK_PRIMITIVE_TOPOLOGY_LINE_STRIP)) return CommandResult::Unavailable;
+        if (draw.index_buffer && !dynamic.primitive_restart_enable &&
+            (impl->topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP || impl->topology == VK_PRIMITIVE_TOPOLOGY_LINE_STRIP))
+            return CommandResult::Unavailable; // Metal always treats the strip's sentinel index as restart.
         auto& vs = *impl->vertex->impl;
         ShaderFunction::Impl* fs = impl->fragment ? impl->fragment->impl.get() : nullptr;
         ShaderFunction::Impl::Arguments vertex_args, fragment_args;

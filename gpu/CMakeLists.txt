@@ -194,14 +194,15 @@ if(APPLE)
     set_source_files_properties(../tests/test_metal_buffers.cpp PROPERTIES
         COMPILE_OPTIONS "-fvisibility=hidden;-fvisibility-inlines-hidden")
     target_link_libraries(metal-buffer-test PRIVATE bbgpu)
-    foreach(STAGE IN ITEMS vert frag)
-        set(HEADER ${CMAKE_CURRENT_BINARY_DIR}/test_shaders/metal_draw_${STAGE}.h)
-        string(TOUPPER METAL_DRAW_${STAGE} SYMBOL)
+    foreach(SHADER IN ITEMS metal_draw.vert metal_draw.frag metal_flat.frag)
+        string(REPLACE "." "_" NAME ${SHADER})
+        set(HEADER ${CMAKE_CURRENT_BINARY_DIR}/test_shaders/${NAME}.h)
+        string(TOUPPER ${NAME} SYMBOL)
         add_custom_command(OUTPUT ${HEADER}
             COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_CURRENT_BINARY_DIR}/test_shaders
             COMMAND ${GLSLANG_COMPILER} --target-env vulkan1.3 --vn ${SYMBOL} -o ${HEADER}
-                ${CMAKE_CURRENT_SOURCE_DIR}/../tests/shaders/metal_draw.${STAGE}
-            DEPENDS ../tests/shaders/metal_draw.${STAGE} VERBATIM)
+                ${CMAKE_CURRENT_SOURCE_DIR}/../tests/shaders/${SHADER}
+            DEPENDS ../tests/shaders/${SHADER} VERBATIM)
         target_sources(metal-buffer-test PRIVATE ${HEADER})
     endforeach()
     target_include_directories(metal-buffer-test PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/test_shaders)

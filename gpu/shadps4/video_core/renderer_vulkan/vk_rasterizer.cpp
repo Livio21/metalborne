@@ -1360,6 +1360,9 @@ bool Rasterizer::ExecuteMetal(const Pipeline* pipeline, std::array<u32, 3> group
         u64 begin, end;
         std::vector<Input> inputs;
         std::shared_ptr<BbMetalFX::SharedBuffer> buffer;
+        MetalBufferMirror* mirror = nullptr;
+        bool current = false;
+        u64 generation = 0;
     };
     struct Copy {
         vk::Buffer source, destination;
@@ -1499,27 +1502,38 @@ bool Rasterizer::ExecuteMetal(const Pipeline* pipeline, std::array<u32, 3> group
         clone.inputs.push_back(input);
     }
     std::vector<Copy> uploads, downloads;
-    if (metal_clone_pool.size() < clones.size()) metal_clone_pool.resize(clones.size());
-    u64 retained = 0;
-    for (size_t i = 0; i < metal_clone_pool.size(); ++i)
-        retained += std::max(metal_clone_pool[i].first, i < clones.size() ? clones[i].end - clones[i].begin : u64{0});
-    if (retained > 512 * 1024 * 1024) {
-        metal_clone_pool.clear();
-        metal_clone_pool.resize(clones.size());
-    }
-    u64 total_cloned = 0;
-    for (size_t slot = 0; slot < clones.size(); ++slot) {
-        auto& clone = clones[slot];
+    constexpr u64 MirrorBudget = 512 * 1024 * 1024;
+    u64 total_cloned = 0, additional = 0;
+    for (const auto& clone : clones) {
         const u64 size = clone.end - clone.begin;
         total_cloned += size;
-        if (total_cloned > 512 * 1024 * 1024) return false;
-        auto& cached = metal_clone_pool[slot];
-        if (!cached.second || cached.first < size) {
-            cached = {size, std::make_shared<BbMetalFX::SharedBuffer>(instance.GetDevice(),
+        if (total_cloned > MirrorBudget) return false;
+        if (!metal_buffer_mirrors.contains({clone.begin, size})) additional += size;
+    }
+    if (metal_buffer_mirror_bytes + additional > MirrorBudget) {
+        // Finish both APIs before freeing buffers referenced by queued copies and draws.
+        scheduler.EndRendering();
+        runtime.FlushBarriers();
+        scheduler.FinishForExternal();
+        metal_buffer_mirrors.clear();
+        metal_buffer_mirror_bytes = 0;
+    }
+    size_t reused = 0;
+    for (auto& clone : clones) {
+        const u64 size = clone.end - clone.begin;
+        auto& cached = metal_buffer_mirrors[{clone.begin, size}];
+        if (!cached.buffer) {
+            cached.buffer = std::make_shared<BbMetalFX::SharedBuffer>(instance.GetDevice(),
                 static_cast<VkPhysicalDeviceMemoryProperties>(instance.GetMemoryProperties()), size,
-                VULKAN_HPP_DEFAULT_DISPATCHER.vkGetDeviceProcAddr)};
+                VULKAN_HPP_DEFAULT_DISPATCHER.vkGetDeviceProcAddr);
+            metal_buffer_mirror_bytes += size;
         }
-        clone.buffer = cached.second;
+        ASSERT(metal_buffer_mirror_bytes <= MirrorBudget);
+        clone.buffer = cached.buffer;
+        clone.mirror = &cached;
+        clone.generation = runtime.SparseBufferGeneration(clone.begin, size);
+        clone.current = cached.generation == clone.generation;
+        reused += clone.current;
         if (!clone.buffer->Handle()) return false;
         share(clone.buffer->Handle());
         std::vector<u64> points;
@@ -1543,7 +1557,7 @@ bool Rasterizer::ExecuteMetal(const Pipeline* pipeline, std::array<u32, 3> group
                 }
             }
             if (!source) return false;
-            uploads.push_back({source->descriptor.buffer, clone.buffer->Handle(),
+            if (!clone.current) uploads.push_back({source->descriptor.buffer, clone.buffer->Handle(),
                 {source->descriptor.offset + first - source->guest, first - clone.begin, last - first}});
             if (written) downloads.push_back({clone.buffer->Handle(), written->descriptor.buffer,
                 {first - clone.begin, written->descriptor.offset + first - written->guest, last - first}});
@@ -1620,7 +1634,6 @@ bool Rasterizer::ExecuteMetal(const Pipeline* pipeline, std::array<u32, 3> group
         result = native_draw->Draw(*render, scheduler.GetDynamicState(), attributes, vertices, bindings, push, draw, &gpu_ms, &work);
         if (result != BbMetalFX::CommandResult::Prepared) return false;
     }
-    // ponytail: sparse clones stay synchronous until native arena ownership removes per-draw copies and bounds in-flight memory.
     static const bool asynchronous = [] {
         const char* value = std::getenv("BB_METAL_GRAPHICS_ASYNC");
         return value && std::string_view(value) == "1";
@@ -1628,7 +1641,7 @@ bool Rasterizer::ExecuteMetal(const Pipeline* pipeline, std::array<u32, 3> group
     scheduler.EndRendering();
     runtime.FlushBarriers();
     ownership(true, std::move(uploads));
-    const bool queued = render && asynchronous && clones.empty();
+    const bool queued = render && asynchronous;
     if (queued) {
         scheduler.ExternalSemaphore();
         const auto value = scheduler.NextExternalValue();
@@ -1646,7 +1659,7 @@ bool Rasterizer::ExecuteMetal(const Pipeline* pipeline, std::array<u32, 3> group
                     static_cast<unsigned long long>(count), timing);
             return complete;
         });
-        ownership(false, {});
+        ownership(false, std::move(downloads));
         metal_async_issued = true;
     } else {
         scheduler.FinishForExternal();
@@ -1658,6 +1671,7 @@ bool Rasterizer::ExecuteMetal(const Pipeline* pipeline, std::array<u32, 3> group
         scheduler.FinishForExternal(); // Retire clones without retiring the guest tick.
         if (result != BbMetalFX::CommandResult::Complete) return false;
     }
+    for (auto& clone : clones) clone.mirror->generation = clone.generation;
     for (const auto& bound : bound_buffers) runtime.AccessBuffer(bound.buffer, bound.offset, bound.size,
         vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eMemoryRead |
         (bound.is_written ? vk::AccessFlagBits2::eMemoryWrite : vk::AccessFlags2{}));
@@ -1666,9 +1680,10 @@ bool Rasterizer::ExecuteMetal(const Pipeline* pipeline, std::array<u32, 3> group
     const auto count = ++completed[render ? 1 : 0];
     const auto& shader = pipeline->GetStage(render ? Shader::SwStage::Vertex : Shader::SwStage::Compute);
     if (count <= 3 || count % 300 == 0)
-        std::fprintf(stderr, "Native Metal guest %s #%llu: shader %016llx, %zu textures, %zu sparse clones, %s GPU %.3f ms.\n",
+        std::fprintf(stderr, "Native Metal guest %s #%llu: shader %016llx, %zu textures, %zu sparse mirrors (%zu reused; %llu bytes retained), %s GPU %.3f ms.\n",
             render ? "draw" : "dispatch", static_cast<unsigned long long>(count), static_cast<unsigned long long>(shader.pgm_hash),
-            images.size(), clones.size(), queued ? "queued;" : "completed;", gpu_ms);
+            images.size(), clones.size(), reused, static_cast<unsigned long long>(metal_buffer_mirror_bytes),
+            queued ? "queued;" : "completed;", gpu_ms);
     return true;
 }
 #endif

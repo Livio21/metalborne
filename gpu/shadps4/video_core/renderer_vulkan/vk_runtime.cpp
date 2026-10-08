@@ -970,6 +970,11 @@ void Runtime::AccessBuffer(const VideoCore::Buffer* handle, u64 offset, u64 size
         vk::AccessFlagBits2::eDepthStencilAttachmentWrite | vk::AccessFlagBits2::eTransferWrite |
         vk::AccessFlagBits2::eMemoryWrite | vk::AccessFlagBits2::eTransformFeedbackWriteEXT;
 
+#ifdef __APPLE__
+    if (handle->mem_type == VideoCore::MemoryType::Sparse && (src_access & WRITE_MASK))
+        InvalidateSparseBuffers(handle->cpu_addr + offset, size);
+#endif
+
     // bbport: reads are tracked at 4 KiB granularity. Constant data comes from ring allocations
     // at a new offset every draw; rounded, they land in ranges already present and the
     // insert returns early instead of growing the tree until the next barrier flush.

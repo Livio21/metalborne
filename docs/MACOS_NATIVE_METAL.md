@@ -10,9 +10,10 @@ It also has native host post-processing, presentation, scene MetalFX,
 shared resources/transfers and buffer-only guest compute. Unsupported guest
 work still uses bbport's Vulkan backend through KosmicKrisp. Guest shader
 recompilation still produces SPIR-V; the native path translates it to MSL.
-Sparse guest arenas retain Vulkan ownership and require copies for native draws.
+Sparse guest arenas retain Vulkan ownership. Persistent Metal mirrors reuse
+unchanged bytes and support queued refreshes/writeback for native draws.
 The synchronous graphics proof is very slow and stays off by default.
-The async shared-resource graphics path also passes headless comparison;
+The async graphics path, including persistent sparse mirrors, passes comparison;
 its gameplay/performance evidence is recorded below.
 See [the latest graphics evidence](#native-guest-graphics-2026-10-08) and
 [the bbhost source comparison](BBHOST_RESEARCH.md).
@@ -801,10 +802,12 @@ tessellation, fan/adjacency/patch topology and unsupported draw/state contracts
 remain on Vulkan. Direct draws are covered; indirect draws are not replaced.
 
 Ordinary exportable buffers bind their shared storage directly. Sparse arenas
-use pooled placement buffers populated by Vulkan copies. Overlapping guest
-ranges share a clone even if Vulkan arenas have merged, preserving aliases.
-Only written segments are copied back. The pool is capped at 512 MiB and
-retains unused slots to avoid allocating again after each zero-clone draw.
+use persistent placement-buffer mirrors populated by Vulkan copies. Overlapping
+guest ranges share one mirror within a draw even if Vulkan arenas have merged.
+Mirrors use absolute guest ranges and skip uploads only while their sparse
+page write versions are unchanged. Only written segments are copied back. Retained
+mirror storage is capped at 512 MiB; budget reclamation waits for both APIs
+before freeing queued resources.
 Images transfer only the used mip/layer subresources with their tracked
 layouts, then reacquire the original layouts. This proof still performs
 per-command ownership transfers and waits.
@@ -844,14 +847,15 @@ per-command ownership transfers and waits.
 ### Async shared-resource graphics
 
 Native graphics encoding can now return a prepared command without committing
-it. With `BB_METAL_GRAPHICS_ASYNC=1`, a draw whose buffers already share storage
-releases Vulkan ownership without advancing the guest tick. A persistent
+it. With `BB_METAL_GRAPHICS_ASYNC=1`, supported draws, including persistent
+sparse mirrors, release Vulkan ownership without advancing the guest tick. A persistent
 scheduler worker waits for that release, commits/completes the Metal command
 and host-signals a timeline semaphore. Subsequent Vulkan work waits on that
 value before acquiring the resources. Scene MetalFX and graphics use the same
 timeline value allocator. Shutdown drains draws/jobs before cache destruction.
-Sparse clone draws stay synchronous so queued draws cannot multiply their
-retained copy buffers.
+The initial shared-only checkpoint kept sparse clones synchronous. The
+persistent mirror update below removes that restriction without allocating
+a separate copy buffer for every queued draw.
 
 The existing fixture prepares two consecutive draws, checks increasing
 completion values and the unchanged pending guest tick/callback, then compares
@@ -883,3 +887,129 @@ is not a matched speedup comparison: the previous synchronous run used an
 earlier library and became thermally fair. Nominal pressure is not a measurement
 of temperatures or sustained clocks. Persistent native buffers and submission
 batching remain necessary work, and this path remains off by default.
+
+### Persistent sparse mirrors and queued refresh: 2026-10-08
+
+The installed driver exposes external-memory features for ordinary buffers,
+but none for sparse buffers. Exporting their backing allocations alone does
+not establish a valid interop contract: sparse binds require the exported
+handle type to be declared on the sparse buffer as well.
+[Vulkan sparse binding requirements](https://docs.vulkan.org/refpages/latest/refpages/source/VkSparseMemoryBind.html),
+[Metal external memory](https://docs.vulkan.org/refpages/latest/refpages/source/VK_EXT_external_memory_metal.html).
+Canonical sparse storage therefore remains on Vulkan; this checkpoint avoids
+repeated mirror allocation and copying of unchanged ranges.
+
+Mirrors are keyed by absolute guest range, with aliases merged within a draw.
+A bounded 32 KiB table records write versions for hashed 64 KiB guest pages.
+Uploads, shader writes, fills and other tracked writes invalidate overlapping
+pages; unbounded physical DMA invalidates every mirror. Hash collisions cause
+extra refreshes, never acceptance of stale data. A queued refresh becomes
+logically current only after its native command has been prepared and queued
+on the ordered worker. Written segments return to canonical sparse storage
+before dependent Vulkan work. The 512 MiB cache budget drains both APIs before
+reclaiming buffers. Supported sparse draws can now use the asynchronous
+completion bridge previously restricted to directly shared buffers.
+
+Additional state guards keep unsupported fixed sample masks, minimum sample
+shading and indexed strips without restart on Vulkan. Reflection now detects
+flat interpolation on interface-block members, including the existing
+last-vertex provoking restriction. These are reviewed contract defects; a
+specific game visual artifact has not been attributed to them.
+
+The library built successfully. Direct and threaded fixtures passed
+page-version/read/write/alias/collision checks, two ordered mirror refreshes,
+native writeback, unchanged guest tick/callback retirement and the indexed
+textured draw comparison. Native output matched all 4,096 fixture bytes within
+one UNORM LSB; 512 writeback bytes matched exactly. State rejection, the original
+Vulkan fallback and the real buffer-copy guest shader also passed. Logs:
+
+- `out/macos-native-metal/persistent-page-final-check.log`
+- `out/macos-native-metal/persistent-page-final-threaded-check.log`
+- `out/macos-native-metal/persistent-page-final-vulkan-check.log`
+- `out/macos-native-metal/persistent-page-compute-check.log`
+
+Stationary Hunter's Dream benchmarks used the same probe, private source save,
+game settings, scene/camera, original 30 FPS timing and AC power. Both graphics
+flags were enabled, guest compute and MetalFX disabled. These compare stages
+of the experimental native guest renderer, not the normal Vulkan renderer.
+
+| Build / local artifact under `out/benchmarks/` | Mean window FPS | Window median interval | Worst window p99 | Thermal pressure |
+| --- | ---: | ---: | ---: | --- |
+| Previous shared-only async build: `20261008-154929-756991-persistent-baseline` | 4.80 | 199.99–216.67 ms | 283.35 ms | Nominal |
+| Persistent mirrors, global write version: `20261008-155231-164195-persistent-mirrors-async` | 7.05 | 133.33–150.00 ms | 183.34 ms | Nominal |
+| Page versions and state guards: `20261008-160752-619062-persistent-pages-async` | 9.00 | 116.66–116.67 ms | 200.01 ms | Became fair; exclude from speedup claim |
+| Cooled page-version check: `20261008-161952-569604-persistent-pages-cooled` | 8.60 | 116.67 ms | 150.01 ms | Nominal |
+
+The first pair used identical 35-second measurements, 15-second warmups and
+20-second nominal cooldowns. Its observed throughput increased about 47%; the
+two sequential runs are not a sustained or alternating-run performance result.
+The cooled page-version check used a longer 60-second cooldown and a shorter
+20-second measurement/8-second warmup, so it is separate evidence for that
+build. Draw workload stayed near 790/frame. The cooled run logged at least
+32,400 queued native draws with repeated mirror reuse; about 46 MiB of mirrors
+were retained in its last sampled draw. The page build retained visible
+character geometry, foliage, lighting, shadows and HUD in a UI inspection.
+All four runs exited normally; the 15 original source-save hashes remained
+unchanged. OS pressure samples are not temperatures or sustained GPU clocks.
+Window p99 is not a pooled percentile or display scanout measurement. Zero
+reported compilation covers Vulkan/game pipelines, not native Metal PSOs.
+
+Per-draw Vulkan/Metal ownership submissions remain a performance limitation.
+Batching consecutive draws, full native resource ownership, geometry and
+tessellation lowering, physical-address/DMA shaders and compared texture
+compute remain unfinished. Keep native guest graphics opt-in; stable 30 FPS
+and improved display scanout pacing have not been established.
+
+### Graphics and scene MetalFX queue dependency: 2026-10-08
+
+The first combined run, `20261008-174403-381502-persistent-pages-scene-metalfx`,
+completed MetalFX upscales but stalled for about four seconds at a time and
+averaged 0.55 FPS despite nominal pressure. Its diagnostic repeat,
+`20261008-175118-799721-scene-queue-stall-capture`, reproduced the stalls and
+failed the benchmark's required number of timing windows. Both exited normally.
+The local `out/macos-native-metal/scene-queue-stall.sample.txt` caught the GPU
+command thread blocked in Metal command-buffer creation while holding the
+`RunCommands` mutex; the scene worker was waiting for that mutex.
+
+Deferred graphics preparation and synchronous helpers shared one queue.
+[Apple documents a capacity of 64 uncompleted commands](https://developer.apple.com/documentation/metal/mtldevice/makecommandqueue%28%29?language=objc).
+Prepared draws could fill that capacity while awaiting the scene worker's
+external completion, preventing the worker from creating its own command.
+`RunCommands` now keeps separate persistent queues and mutexes for deferred
+graphics and synchronous helpers. Vulkan release fences and the external
+timeline retain resource order across those queues.
+
+A regression fixture holds 64 prepared graphics commands and requires an
+independent native copy to finish before those draws are committed. It drains
+all draws before reporting a timeout, so a regression unwinds safely. The old
+library failed exactly that assertion (`queue-capacity-before-check.log`);
+the corrected library passes direct/threaded graphics, scene MetalFX, Vulkan
+fallback and the real buffer-copy shader. Final logs are
+`out/macos-native-metal/queue-split-{direct,threaded,vulkan,compute}-check.log`.
+The build log is `queue-split-build.log`; only existing FFmpeg assembly linker
+warnings remain.
+
+The corrected combined run,
+`out/benchmarks/20261008-175808-693457-queue-split-scene-metalfx/`, used a
+60-second nominal cooldown, 15-second warmup and 35-second measurement. Six
+windows averaged **8.73 FPS** (8.2–9.2), with 100.00–116.68 ms medians and
+worst-window p99 **150.02 ms**. All pressure samples were nominal. It logged
+at least 44,400 native draws and 300 successful asynchronous scene upscales
+from 1280x720 to 1920x1080 before the HUD, with no scaler fallback. The sampled
+upscale at scene 300 took 0.659 ms on the GPU; its 99.049 ms Vulkan release wait
+includes preceding rendering and is not scaler execution time. A UI inspection
+showed the character, scene geometry, foliage, lighting and HUD. The run exited
+normally without forced termination. These observations verify removal of the
+recurring stalls in this scene; they do not establish full-game stability.
+
+The same final GPU/probe binaries, save, settings and 60/15/35-second
+cooldown/warmup/measurement configuration were then checked with native guest
+graphics disabled. `out/benchmarks/20261008-225259-787130-queue-split-vulkan-reference/`
+averaged **27.15 FPS** (26.8–27.3), with 33.33 ms window medians and worst-window
+p99 **66.66 ms**. Scene MetalFX remained active and logged 1,800 completed
+upscales. Pressure remained nominal, the process exited normally and all 15
+source-save hashes stayed unchanged. Apart from private run paths, the only
+environment differences were the two native graphics flags. This sequential
+reference confirms the native path is still substantially slower in the tested
+scene. Use Vulkan guest rendering while native submission/ownership work
+continues; neither run demonstrates stable 30 FPS or actual scanout pacing.

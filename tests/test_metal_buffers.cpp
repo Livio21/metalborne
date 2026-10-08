@@ -25,6 +25,7 @@
 #include "video_core/texture_cache/image.h"
 #include "metal_draw_vert.h"
 #include "metal_draw_frag.h"
+#include "metal_flat_frag.h"
 #include <vulkan/vulkan_format_traits.hpp>
 
 int main(int argc, char** argv) {
@@ -94,6 +95,39 @@ int main(int argc, char** argv) {
     Buffer source(std::move(original));
     assert(!original.Handle() && source.Handle() == handle && source.BufferDeviceAddress() == address);
     assert(source.mapped_data.size() == 4096);
+    {
+        Buffer arena(instance, 0x100000000, 131072, MemoryType::Sparse);
+        Buffer alias(instance, arena.cpu_addr, arena.SizeBytes(), MemoryType::Sparse);
+        const auto generation = runtime.SparseBufferGeneration();
+        runtime.AccessBuffer(&arena, 0, 4096, vk::PipelineStageFlagBits2::eVertexShader, vk::AccessFlagBits2::eShaderRead);
+        runtime.AccessBuffer(&destination, 0, 4096, vk::PipelineStageFlagBits2::eCopy, vk::AccessFlagBits2::eTransferWrite);
+        assert(runtime.SparseBufferGeneration() == generation);
+        const auto untouched = runtime.SparseBufferGeneration(arena.cpu_addr + 65536, 4096);
+        for (const auto write : {vk::AccessFlagBits2::eTransferWrite, vk::AccessFlagBits2::eShaderWrite,
+                                vk::AccessFlagBits2::eMemoryWrite, vk::AccessFlagBits2::eTransformFeedbackWriteEXT}) {
+            const auto before = runtime.SparseBufferGeneration();
+            runtime.AccessBuffer(&arena, 16, 16, vk::PipelineStageFlagBits2::eAllCommands, write);
+            assert(runtime.SparseBufferGeneration() == before + 1);
+            // Repeated writes and a merged arena alias must also invalidate cached bytes.
+            runtime.AccessBuffer(&alias, 16, 16, vk::PipelineStageFlagBits2::eAllCommands, write);
+            assert(runtime.SparseBufferGeneration() == before + 2);
+            assert(runtime.SparseBufferGeneration(arena.cpu_addr, 4096) == before + 2);
+            assert(runtime.SparseBufferGeneration(arena.cpu_addr + 65536, 4096) == untouched);
+        }
+        auto before = runtime.SparseBufferGeneration();
+        runtime.InvalidateSparseBuffers(arena.cpu_addr + 65532, 8);
+        assert(runtime.SparseBufferGeneration(arena.cpu_addr, 4) == before + 1);
+        assert(runtime.SparseBufferGeneration(arena.cpu_addr + 65536, 4) == before + 1);
+        runtime.InvalidateSparseBuffers(arena.cpu_addr + 4096 * 65536, 4);
+        assert(runtime.SparseBufferGeneration(arena.cpu_addr, 4) == before + 2); // A hash collision safely refreshes extra data.
+        runtime.InvalidateSparseBuffers(arena.cpu_addr, 4097ULL * 65536);
+        assert(runtime.SparseBufferGeneration(arena.cpu_addr + 4095 * 65536, 65536) == before + 3);
+        runtime.InvalidateSparseBuffers();
+        assert(runtime.SparseBufferGeneration() == before + 4);
+        assert(runtime.SparseBufferGeneration(arena.cpu_addr + 12345ULL * 65536, 4) == before + 4);
+        runtime.FlushBarriers(); scheduler.FinishForExternal();
+        std::puts("PASS: sparse mirror page versions, read/disjoint-range preservation, upload/shader/memory/transform-feedback writes, repeated writes, arena aliases, page crossings, hash collisions, full-table writes and unbounded DMA invalidation");
+    }
     if (native) {
         assert(source.buffer.metal && destination.buffer.metal && readback.buffer.metal);
         assert(source.buffer.metal->MappedData() == source.mapped_data.data());
@@ -814,6 +848,19 @@ int main(int argc, char** argv) {
         Buffer upload(instance, 0, 1024, MemoryType::HostUncached), actual(instance, 0, 4096, MemoryType::HostCached),
             expected(instance, 0, 4096, MemoryType::HostCached), vertex_data(instance, 0, 512, MemoryType::HostUncached),
             index_data(instance, 0, 64, MemoryType::HostUncached);
+        Buffer vertex_mirror(instance, 0, 512, MemoryType::DeviceLocal), native_written(instance, 0, 512, MemoryType::DeviceLocal),
+            mirror_readback(instance, 0, 512, MemoryType::HostCached);
+        const auto refresh_mirror = [&] {
+            scheduler.Record([source = vertex_data.Handle(), mirror = vertex_mirror.Handle(), &dispatch](vk::CommandBuffer command) {
+                const vk::MemoryBarrier2 before{.srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+                    .srcAccessMask = vk::AccessFlagBits2::eMemoryWrite, .dstStageMask = vk::PipelineStageFlagBits2::eCopy,
+                    .dstAccessMask = vk::AccessFlagBits2::eTransferRead | vk::AccessFlagBits2::eTransferWrite};
+                command.pipelineBarrier2(vk::DependencyInfo{.memoryBarrierCount = 1, .pMemoryBarriers = &before}, dispatch);
+                command.fillBuffer(mirror, 0, 512, 0xcccccccc, dispatch);
+                command.pipelineBarrier2(vk::DependencyInfo{.memoryBarrierCount = 1, .pMemoryBarriers = &before}, dispatch);
+                command.copyBuffer(source, mirror, vk::BufferCopy{0, 0, 512}, dispatch);
+            });
+        };
         std::vector<vk::BufferImageCopy> regions;
         u64 offset = 0;
         for (u32 mip = 0; mip < 3; ++mip) {
@@ -895,9 +942,38 @@ int main(int argc, char** argv) {
             .location = 0, .binding = 0, .format = VK_FORMAT_R32G32B32_SFLOAT, .offset = 0};
         BbMetalFX::VertexBufferBinding native_vertex{{.sType = VK_STRUCTURE_TYPE_VERTEX_INPUT_BINDING_DESCRIPTION_2_EXT,
             .binding = 0, .stride = 16, .inputRate = VK_VERTEX_INPUT_RATE_VERTEX, .divisor = 1},
-            vertex_data.buffer.metal->NativeHandle(), 0, 512};
+            vertex_mirror.buffer.metal->NativeHandle(), 0, 512};
         const BbMetalFX::DrawCommand draw{6, 1, 0, 1, index_data.buffer.metal->NativeHandle(), 4, VK_INDEX_TYPE_UINT16};
         assert(metal_pipeline.Draw(state, dynamic, {&native_attribute, 1}, {&native_vertex, 1}, shader_bindings, {}, draw) == BbMetalFX::CommandResult::Unavailable);
+        {
+            auto info = static_cast<VkGraphicsPipelineCreateInfo>(pipeline_info);
+            auto unsupported_samples = static_cast<VkPipelineMultisampleStateCreateInfo>(samples);
+            info.pMultisampleState = &unsupported_samples;
+            uint32_t sample_mask = 0;
+            unsupported_samples.pSampleMask = &sample_mask;
+            assert(!BbMetalFX::RenderPipeline(METAL_DRAW_VERT, METAL_DRAW_FRAG, info).Available());
+            sample_mask = 1; // Only the active sample bit matters.
+            assert(BbMetalFX::RenderPipeline(METAL_DRAW_VERT, METAL_DRAW_FRAG, info).Available());
+            unsupported_samples.sampleShadingEnable = true;
+            assert(!BbMetalFX::RenderPipeline(METAL_DRAW_VERT, METAL_DRAW_FRAG, info).Available());
+            auto strip = static_cast<VkPipelineInputAssemblyStateCreateInfo>(assembly);
+            strip.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP;
+            unsupported_samples.sampleShadingEnable = false;
+            info.pInputAssemblyState = &strip;
+            BbMetalFX::RenderPipeline strip_pipeline(METAL_DRAW_VERT, METAL_DRAW_FRAG, info);
+            assert(strip_pipeline.Available());
+            assert(strip_pipeline.Draw(state, dynamic, {&native_attribute, 1}, {&native_vertex, 1}, shader_bindings, push, draw) == BbMetalFX::CommandResult::Unavailable);
+            const VkPipelineRasterizationProvokingVertexStateCreateInfoEXT provoking{
+                .sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_PROVOKING_VERTEX_STATE_CREATE_INFO_EXT,
+                .provokingVertexMode = VK_PROVOKING_VERTEX_MODE_LAST_VERTEX_EXT};
+            auto flat_raster = static_cast<VkPipelineRasterizationStateCreateInfo>(raster);
+            flat_raster.pNext = &provoking;
+            info.pRasterizationState = &flat_raster;
+            BbMetalFX::RenderPipeline flat_pipeline(METAL_DRAW_VERT, METAL_FLAT_FRAG, info);
+            assert(!flat_pipeline.Available());
+            assert(flat_pipeline.Error() == "Flat inputs require last-vertex index expansion");
+            std::puts("PASS: unsupported sample mask/minimum sample shading, indexed strip restart-disabled and flat struct-member last-vertex states rejected before submission");
+        }
         const auto ownership = [&](bool release, Vulkan::SubmitInfo* external = nullptr, u64 value = 0) {
             std::vector<vk::ImageMemoryBarrier2> images;
             for (auto* image : {&texture, &output, &target_depth}) {
@@ -916,10 +992,23 @@ int main(int argc, char** argv) {
             scheduler.Record([images, &dispatch](vk::CommandBuffer command) {
                 command.pipelineBarrier2(vk::DependencyInfo{.imageMemoryBarrierCount = u32(images.size()), .pImageMemoryBarriers = images.data()}, dispatch);
             });
+            const std::array handles{vertex_mirror.Handle(), index_data.Handle(), native_written.Handle()};
+            scheduler.Record([handles, release, family = instance.GetGraphicsQueueFamilyIndex(), &dispatch](vk::CommandBuffer command) {
+                std::array<vk::BufferMemoryBarrier2, 3> barriers;
+                for (size_t i = 0; i < handles.size(); ++i) barriers[i] = {
+                    .srcStageMask = release ? vk::PipelineStageFlagBits2::eAllCommands : vk::PipelineStageFlagBits2::eNone,
+                    .srcAccessMask = release ? vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite : vk::AccessFlags2{},
+                    .dstStageMask = release ? vk::PipelineStageFlagBits2::eNone : vk::PipelineStageFlagBits2::eAllCommands,
+                    .dstAccessMask = release ? vk::AccessFlags2{} : vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
+                    .srcQueueFamilyIndex = release ? family : VK_QUEUE_FAMILY_EXTERNAL,
+                    .dstQueueFamilyIndex = release ? VK_QUEUE_FAMILY_EXTERNAL : family,
+                    .buffer = handles[i], .offset = 0, .size = VK_WHOLE_SIZE};
+                command.pipelineBarrier2(vk::DependencyInfo{.bufferMemoryBarrierCount = 3, .pBufferMemoryBarriers = barriers.data()}, dispatch);
+            });
             if (external && release) scheduler.FlushForExternal(*external, value);
             else if (!external) scheduler.FinishForExternal();
         };
-        ownership(true);
+        refresh_mirror(); ownership(true);
         const auto drawn = metal_pipeline.Draw(state, dynamic, {&native_attribute, 1}, {&native_vertex, 1}, shader_bindings, push, draw);
         if (drawn != BbMetalFX::CommandResult::Complete) std::fprintf(stderr, "native graphics unavailable: %.*s\n", int(metal_pipeline.Error().size()), metal_pipeline.Error().data());
         assert(drawn == BbMetalFX::CommandResult::Complete);
@@ -958,7 +1047,7 @@ int main(int argc, char** argv) {
         for (size_t i = 0; i < points.size(); ++i) std::memcpy(vertex_data.mapped_data.data() + i * 32, points[i].data(), 16);
         vertex_data.Flush(0, 512); native_vertex.input.stride = 32;
         state.color_attachments[0].image_view = *output_view.image_view;
-        ownership(true);
+        refresh_mirror(); ownership(true);
         assert(metal_pipeline.Draw(state, dynamic, {&native_attribute, 1}, {&native_vertex, 1}, shader_bindings, push, draw) == BbMetalFX::CommandResult::Complete);
         ownership(false);
         runtime.DownloadImage(&output, &actual, {&whole, 1}); scheduler.Finish(); actual.Invalidate(0, 4096);
@@ -980,22 +1069,48 @@ int main(int argc, char** argv) {
             auto fence = std::make_shared<vk::UniqueFence>(Vulkan::Check(instance.GetDevice().createFenceUnique({}, nullptr, dispatch)));
             Vulkan::SubmitInfo release{};
             release.fence = **fence;
-            ownership(true, &release, value);
-            scheduler.EnqueueExternal(std::move(fence), value, [work = std::move(work), &completed] {
+            refresh_mirror(); ownership(true, &release, value);
+            scheduler.EnqueueExternal(std::move(fence), value, [work = std::move(work), &completed,
+                    input = vertex_mirror.buffer.metal->NativeHandle(), output = native_written.buffer.metal->NativeHandle()] {
                 if (!work(nullptr)) return false;
+                const VkBufferCopy bytes{0, 0, 512};
+                if (!BbMetalFX::CopyBuffers(input, output, {&bytes, 1})) return false;
                 completed.fetch_add(1, std::memory_order_release);
                 return true;
             });
             ownership(false, &release, value); // Only record the acquire; Vulkan waits on the native completion.
+            scheduler.Record([source = native_written.Handle(), destination = mirror_readback.Handle(), &dispatch](vk::CommandBuffer command) {
+                command.copyBuffer(source, destination, vk::BufferCopy{0, 0, 512}, dispatch);
+            });
             assert(scheduler.CurrentTick() == tick);
             assert(!retired);
         }
         runtime.DownloadImage(&output, &actual, {&whole, 1}); scheduler.Finish(); scheduler.PopPendingOperations();
         assert(completed.load(std::memory_order_acquire) == 2 && retired);
+        mirror_readback.Invalidate(0, 512);
+        assert(std::memcmp(mirror_readback.mapped_data.data(), vertex_data.mapped_data.data(), 512) == 0);
         actual.Invalidate(0, 4096);
         for (u32 i = 0; i < 4096; ++i) assert(std::abs(int(actual.mapped_data[i])-int(expected.mapped_data[i])) <= 1);
+        ownership(true);
+        std::array<std::function<bool(float*)>, 64> prepared;
+        // Apple's default queue allows 64 uncompleted commands. Helpers must progress while it is full.
+        for (auto& work : prepared)
+            assert(metal_pipeline.Draw(state, dynamic, {&native_attribute, 1}, {&native_vertex, 1}, shader_bindings,
+                push, draw, nullptr, &work) == BbMetalFX::CommandResult::Prepared);
+        auto helper = std::async(std::launch::async, [&] {
+            const VkBufferCopy bytes{0, 0, 512};
+            return BbMetalFX::CopyBuffers(vertex_mirror.buffer.metal->NativeHandle(),
+                native_written.buffer.metal->NativeHandle(), {&bytes, 1});
+        });
+        const bool helper_ready = helper.wait_for(std::chrono::seconds(2)) == std::future_status::ready;
+        // Drain even on timeout so a shared-queue regression can unwind instead of hanging the check.
+        for (auto& work : prepared) assert(work(nullptr));
+        assert(helper.get());
+        ownership(false);
+        assert(helper_ready);
+        std::puts("PASS: synchronous native helper completes while 64 deferred graphics commands fill their queue");
         instance.GetDevice().destroyShaderModule(vs, nullptr, dispatch); instance.GetDevice().destroyShaderModule(fs, nullptr, dispatch);
-        std::puts("PASS: native indexed textured graphics versus Vulkan, mip/layer/swizzle views, sampler LOD bias, base vertex/index offset, dynamic stride, blend/channel mask, depth, viewport/scissor, untouched pixels and ordered async completion preserving the guest tick");
+        std::puts("PASS: native indexed textured graphics versus Vulkan, mip/layer/swizzle views, sampler LOD bias, base vertex/index offset, dynamic stride, blend/channel mask, depth, viewport/scissor, untouched pixels, queued mirror refresh/native writeback and ordered async completion preserving the guest tick");
     }
     std::puts("PASS: nine color formats, native uploads/downloads, Vulkan reference, padded rows/layers, untouched bytes/pixels, preserved staging tick, rejected copies and shared depth allocation");
     std::puts(native ? "PASS: shared cache ownership, BDA, moves, 128 MiB stream, native copies, untouched bytes, preserved staging tick and callbacks" :

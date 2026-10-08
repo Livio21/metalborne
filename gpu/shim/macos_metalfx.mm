@@ -151,9 +151,15 @@ bool RunCommands(id<MTLDevice> device,
     if (submitted) *submitted = false;
     @autoreleasepool {
         // ponytail: one command per call; batch with guest submissions once ownership is native.
-        static std::mutex mutex;
-        std::lock_guard lock{mutex};
-        static id<MTLCommandQueue> queue;
+        struct Queue {
+            std::mutex mutex;
+            id<MTLCommandQueue> queue;
+        };
+        // Deferred draws may fill their queue before a helper signals their Vulkan dependency.
+        static Queue queues[2];
+        auto& context = queues[deferred != nullptr];
+        std::lock_guard lock{context.mutex};
+        auto& queue = context.queue;
         if (!queue || queue.device != device) queue = [device newCommandQueue];
         id<MTLCommandBuffer> command = [queue commandBuffer];
         id<MTLFence> fence = [device newFence];
