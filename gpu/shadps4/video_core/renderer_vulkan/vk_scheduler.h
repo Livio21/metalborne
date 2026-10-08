@@ -691,6 +691,9 @@ public:
     /// caller to signal ExternalSemaphore() at completion_value from the host.
     void FlushForExternal(SubmitInfo& info, u64 completion_value);
     vk::Semaphore ExternalSemaphore();
+    u64 NextExternalValue();
+    void EnqueueExternal(std::shared_ptr<vk::UniqueFence> release, u64 value,
+                         std::function<bool()> work);
 
     /// Waits for the given tick to trigger on the GPU.
     void Wait(u64 tick);
@@ -895,6 +898,11 @@ private:
     Semaphore work_semaphore;
     vk::UniqueSemaphore external_semaphore;
     u64 external_wait_value = 0;
+    u64 external_next_value = 0;
+    std::jthread external_worker;
+    std::mutex external_jobs_mutex;
+    std::condition_variable_any external_jobs_cv;
+    std::deque<std::function<void()>> external_jobs;
     CommandPool command_pool;
     DynamicState dynamic_state;
     SubmitFunc on_submit{};

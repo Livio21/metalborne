@@ -10,7 +10,7 @@ export BB_GAME_DIR=${BB_GAME_DIR:-$PWD/out/game/CUSA03173}
 export BB_DATA_DIR=${BB_DATA_DIR:-$PWD/out/macos-run}
 export BB_PROBE=${BB_PROBE:-$PWD/out/bb-probe}
 export BB_PREBUILT=1
-export BB_MODS_ENABLED=${BB_MODS_ENABLED:-0}
+export BB_MODS_ENABLED=${BB_MODS_ENABLED:-1}
 export BB_FPS=${BB_FPS:-30}
 export BB_PATCHES="${BB_PATCHES-Skip Intro + warning message}"
 # Vsync queue for the 30 FPS target. An explicit mode still overrides it.

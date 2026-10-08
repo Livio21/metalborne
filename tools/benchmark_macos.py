@@ -199,12 +199,17 @@ def benchmark(args):
                BB_METAL_IMAGE_CACHE="1", BB_METAL_IMAGE_COPY="0", BB_METAL_IMAGE_TRANSFER="0",
                BB_METAL_IMAGE_CLEAR="0", BB_METAL_POST_PROCESS="0", BB_METALFX_SCENE="0", BB_METALFX_SCENE_ASYNC="0", BB_FULLSCREEN="0")
     env.update(args.overrides)
+    # Debug runs use only the installed debug assets. Ordinary benchmarks omit the menu.
+    lines = [line for line in config.read_text().splitlines() if not line.startswith("debug_menu=")]
+    config.write_text("\n".join([*lines, f"debug_menu={int(args.debug_menu)}"]) + "\n")
+    if args.debug_menu:
+        env["BB_MODS_DIR"] = str(ROOT / "out/macos-run/mods/Debug Menu")
     env.setdefault("BB_PATCHES", "Skip Intro + warning message")
     env.setdefault("BB_GPU_USER_DIR", str(ROOT / "out/macos-run/user"))
     env.update(BB_DATA_DIR=str(run), BB_USER_DIR=str(run / "user"), BB_CONFIG=str(config),
                BB_PAD_FILE=str(pad), BB_QUIT_FILE=str(quit_file), BB_TIMEOUT="0",
                BB_GAME_DIR=str(args.game), BB_PROBE=str(args.probe), BB_PREBUILT="1",
-               BB_FRAME_STATS="1", BB_PRESENT_STATS="1", BB_MODS_ENABLED="0",
+               BB_FRAME_STATS="1", BB_PRESENT_STATS="1", BB_MODS_ENABLED="1" if args.debug_menu else "0",
                BB_INPUT_MODE="auto" if args.manual else "gamepad", BB_MOUSE_CAPTURE="0")
     if not args.manual:
         env["SDL_GAMECONTROLLER_IGNORE_DEVICES_EXCEPT"] = "0xffff/0xffff"
@@ -373,6 +378,7 @@ def main():
     parser.add_argument("--min-draws", type=int, default=500)
     parser.add_argument("--label", default="metal-spatial")
     parser.add_argument("--manual", action="store_true", help="Skip scripted title-menu navigation")
+    parser.add_argument("--debug-menu", action="store_true", help="Enable the installed debug menu assets and startup patch in the isolated run")
     parser.add_argument("--replay", type=Path, help="Recorded BB_PAD_RECORD route covering the measurement interval")
     parser.add_argument("--game", type=Path, default=ROOT / "out/game/CUSA03173")
     parser.add_argument("--probe", type=Path, default=ROOT / "out/bb-probe")

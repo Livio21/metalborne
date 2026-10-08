@@ -1529,7 +1529,8 @@ void TemporalUpscaler::RunUiOnly(VideoCore::ImageId color_id, VideoCore::ImageId
         if (work) {
             const auto device = instance.GetDevice();
             const auto semaphore = scheduler.ExternalSemaphore();
-            const auto value = ++metal_scene_value;
+            const auto value = scheduler.NextExternalValue();
+            metal_scene_value = value;
             auto fence = std::make_shared<vk::UniqueFence>(Check(device.createFenceUnique({})));
             const auto run = [device,semaphore,value,fence,work,source_width,source_height,
                               ow=ui_width,oh=ui_height] {

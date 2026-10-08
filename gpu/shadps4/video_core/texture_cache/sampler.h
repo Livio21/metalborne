@@ -6,6 +6,9 @@
 #include "video_core/amdgpu/regs_texture.h"
 #include "video_core/amdgpu/resource.h"
 #include "video_core/renderer_vulkan/vk_common.h"
+#ifdef __APPLE__
+#include "macos_metalfx.h"
+#endif
 
 namespace Vulkan {
 class Instance;
@@ -34,6 +37,9 @@ public:
 
 private:
     vk::UniqueSampler handle;
+#ifdef __APPLE__
+    std::unique_ptr<BbMetalFX::Sampler> metal;
+#endif
 };
 
 } // namespace VideoCore

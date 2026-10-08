@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <cstdlib>
+#include <cstring>
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/texture_cache/sampler.h"
@@ -67,6 +69,11 @@ Sampler::Sampler(const Vulkan::Instance& instance, const AmdGpu::Sampler& sample
     ASSERT_MSG(sampler_result == vk::Result::eSuccess, "Failed to create sampler: {}",
                vk::to_string(sampler_result));
     handle = std::move(smplr);
+#ifdef __APPLE__
+    static const char* native = std::getenv("BB_METAL_IMAGE_CACHE");
+    if (native && std::strcmp(native, "1") == 0)
+        metal = std::make_unique<BbMetalFX::Sampler>(*handle, static_cast<VkSamplerCreateInfo>(sampler_ci));
+#endif
 }
 
 Sampler::~Sampler() = default;

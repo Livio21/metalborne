@@ -8,6 +8,7 @@
 #include <unordered_map>
 #include <dlfcn.h>
 #include <functional>
+#include <system_error>
 
 #include "bbport_copy.h"
 #include "video_core/renderer_vulkan/vk_gpu_profiler.h"
@@ -41,6 +42,12 @@ Scheduler::Scheduler(const Instance& instance, bool threaded_recording)
 }
 
 Scheduler::~Scheduler() {
+    if (external_worker.joinable()) {
+        Finish();
+        external_worker.request_stop();
+        external_jobs_cv.notify_all();
+        external_worker.join();
+    }
     if (recorder_thread.joinable()) {
         SyncRecording();
         recorder_thread.request_stop();
@@ -351,6 +358,48 @@ vk::Semaphore Scheduler::ExternalSemaphore() {
         external_semaphore = Check(instance.GetDevice().createSemaphoreUnique({.pNext = &type}));
     }
     return *external_semaphore;
+}
+
+u64 Scheduler::NextExternalValue() {
+    std::scoped_lock lock{submit_mutex};
+    external_next_value = std::max(external_next_value, external_wait_value) + 1;
+    return external_next_value;
+}
+
+void Scheduler::EnqueueExternal(std::shared_ptr<vk::UniqueFence> release, u64 value,
+                               std::function<bool()> work) {
+    const auto device = instance.GetDevice();
+    const auto semaphore = ExternalSemaphore();
+    auto complete = [device, semaphore, release = std::move(release), value, work = std::move(work)] {
+        Check(device.waitForFences(**release, true, UINT64_MAX));
+        if (!work()) UNREACHABLE_MSG("Native command failed; refusing to signal incomplete guest output");
+        Check(device.signalSemaphore({.semaphore = semaphore, .value = value}));
+    };
+    if (!external_worker.joinable()) {
+        try {
+            external_worker = std::jthread([this](std::stop_token stop) {
+                for (;;) {
+                    std::function<void()> job;
+                    {
+                        std::unique_lock lock{external_jobs_mutex};
+                        external_jobs_cv.wait(lock, stop, [&] { return !external_jobs.empty(); });
+                        if (external_jobs.empty() && stop.stop_requested()) return;
+                        job = std::move(external_jobs.front());
+                        external_jobs.pop_front();
+                    }
+                    job();
+                }
+            });
+        } catch (const std::system_error&) {
+            complete(); // Preserve completion ordering if a worker cannot be started.
+            return;
+        }
+    }
+    {
+        std::lock_guard lock{external_jobs_mutex};
+        external_jobs.push_back(std::move(complete));
+    }
+    external_jobs_cv.notify_one();
 }
 
 void Scheduler::FlushForExternal(SubmitInfo& info, u64 completion_value) {

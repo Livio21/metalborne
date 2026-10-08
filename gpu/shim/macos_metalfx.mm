@@ -20,6 +20,31 @@
 #include <map>
 
 namespace BbMetalFX {
+static std::mutex resource_mutex;
+static std::map<VkBuffer, void*> native_buffers;
+static std::map<VkImage, void*> native_images;
+static std::map<VkImageView, NativeImageView> native_views;
+static std::map<VkSampler, void*> native_samplers;
+void* FindNativeBuffer(VkBuffer buffer) {
+    std::lock_guard lock{resource_mutex};
+    const auto found = native_buffers.find(buffer);
+    return found == native_buffers.end() ? nullptr : found->second;
+}
+void* FindNativeImage(VkImage image) {
+    std::lock_guard lock{resource_mutex};
+    const auto found = native_images.find(image);
+    return found == native_images.end() ? nullptr : found->second;
+}
+NativeImageView FindNativeImageView(VkImageView view) {
+    std::lock_guard lock{resource_mutex};
+    const auto found = native_views.find(view);
+    return found == native_views.end() ? NativeImageView{} : found->second;
+}
+void* FindNativeSampler(VkSampler sampler) {
+    std::lock_guard lock{resource_mutex};
+    const auto found = native_samplers.find(sampler);
+    return found == native_samplers.end() ? nullptr : found->second;
+}
 struct SharedBuffer::Impl {
     VkDevice device;
     VkBuffer buffer{};
@@ -94,8 +119,16 @@ struct SharedBuffer::Impl {
             address = vkGetBufferDeviceAddress(d, &info);
             if (!address) { metal = nil; fail("buffer device address unavailable", VK_ERROR_FEATURE_NOT_PRESENT); }
         }
+        if (metal) {
+            std::lock_guard lock{resource_mutex};
+            native_buffers[buffer] = (__bridge void*)metal;
+        }
     }
     ~Impl() {
+        {
+            std::lock_guard lock{resource_mutex};
+            native_buffers.erase(buffer);
+        }
         metal = nil;
         if (buffer) destroy(device, buffer, nullptr);
         if (memory) free(device, memory, nullptr);
@@ -111,12 +144,13 @@ void* SharedBuffer::NativeHandle() const { return (__bridge void*)impl->metal; }
 uint8_t* SharedBuffer::MappedData() const { return static_cast<uint8_t*>(impl->metal.contents); }
 uint64_t SharedBuffer::DeviceAddress() const { return impl->address; }
 
-static bool RunCommands(id<MTLDevice> device,
+bool RunCommands(id<MTLDevice> device,
                         const std::function<bool(id<MTLCommandBuffer>, id<MTLFence>)>& encode,
-                        float* gpu_ms = nullptr) {
+                        float* gpu_ms, bool* submitted, std::function<bool(float*)>* deferred) {
     if (gpu_ms) *gpu_ms = NAN;
+    if (submitted) *submitted = false;
     @autoreleasepool {
-        // ponytail: one device/queue and synchronous completion; batch with guest submissions later.
+        // ponytail: one command per call; batch with guest submissions once ownership is native.
         static std::mutex mutex;
         std::lock_guard lock{mutex};
         static id<MTLCommandQueue> queue;
@@ -128,16 +162,23 @@ static bool RunCommands(id<MTLDevice> device,
         [release updateFence:fence];
         [release endEncoding];
         if (!encode(command, fence)) return false;
-        [command commit];
-        [command waitUntilCompleted];
-        if (command.status != MTLCommandBufferStatusCompleted) {
-            std::fprintf(stderr, "Native Metal command failed: %s; falling back to Vulkan.\n",
-                         (command.error.localizedDescription ?: @"command failed").UTF8String);
-            return false;
-        }
-        if (gpu_ms && command.GPUStartTime > 0 && command.GPUEndTime >= command.GPUStartTime)
-            *gpu_ms = 1000 * (command.GPUEndTime - command.GPUStartTime);
-        return true;
+        const auto complete = [command](float* timing) {
+            @autoreleasepool {
+                [command commit];
+                [command waitUntilCompleted];
+                if (command.status != MTLCommandBufferStatusCompleted) {
+                    std::fprintf(stderr, "Native Metal command failed: %s.\n",
+                                 (command.error.localizedDescription ?: @"command failed").UTF8String);
+                    return false;
+                }
+                if (timing && command.GPUStartTime > 0 && command.GPUEndTime >= command.GPUStartTime)
+                    *timing = 1000 * (command.GPUEndTime - command.GPUStartTime);
+                return true;
+            }
+        };
+        if (deferred) { *deferred = complete; return true; }
+        if (submitted) *submitted = true;
+        return complete(gpu_ms);
     }
 }
 
@@ -173,19 +214,70 @@ bool CopyBuffers(void* source, void* destination, std::span<const VkBufferCopy> 
     }
 }
 
-static MTLPixelFormat ImageFormat(VkFormat format) {
+MTLPixelFormat ImageFormat(VkFormat format) {
     switch (format) {
     case VK_FORMAT_R8_UNORM: return MTLPixelFormatR8Unorm;
+    case VK_FORMAT_R8_SNORM: return MTLPixelFormatR8Snorm;
+    case VK_FORMAT_R8_UINT: return MTLPixelFormatR8Uint;
+    case VK_FORMAT_R8_SINT: return MTLPixelFormatR8Sint;
     case VK_FORMAT_R8G8_UNORM: return MTLPixelFormatRG8Unorm;
+    case VK_FORMAT_R8G8_SNORM: return MTLPixelFormatRG8Snorm;
+    case VK_FORMAT_R8G8_UINT: return MTLPixelFormatRG8Uint;
+    case VK_FORMAT_R8G8_SINT: return MTLPixelFormatRG8Sint;
     case VK_FORMAT_R8G8B8A8_UNORM: return MTLPixelFormatRGBA8Unorm;
     case VK_FORMAT_R8G8B8A8_SRGB: return MTLPixelFormatRGBA8Unorm_sRGB;
+    case VK_FORMAT_R8G8B8A8_SNORM: return MTLPixelFormatRGBA8Snorm;
+    case VK_FORMAT_R8G8B8A8_UINT: return MTLPixelFormatRGBA8Uint;
+    case VK_FORMAT_R8G8B8A8_SINT: return MTLPixelFormatRGBA8Sint;
     case VK_FORMAT_B8G8R8A8_UNORM: return MTLPixelFormatBGRA8Unorm;
     case VK_FORMAT_B8G8R8A8_SRGB: return MTLPixelFormatBGRA8Unorm_sRGB;
     case VK_FORMAT_R16_SFLOAT: return MTLPixelFormatR16Float;
+    case VK_FORMAT_R16_UNORM: return MTLPixelFormatR16Unorm;
+    case VK_FORMAT_R16_SNORM: return MTLPixelFormatR16Snorm;
+    case VK_FORMAT_R16_UINT: return MTLPixelFormatR16Uint;
+    case VK_FORMAT_R16_SINT: return MTLPixelFormatR16Sint;
     case VK_FORMAT_R16G16_SFLOAT: return MTLPixelFormatRG16Float;
+    case VK_FORMAT_R16G16_UNORM: return MTLPixelFormatRG16Unorm;
+    case VK_FORMAT_R16G16_SNORM: return MTLPixelFormatRG16Snorm;
+    case VK_FORMAT_R16G16_UINT: return MTLPixelFormatRG16Uint;
+    case VK_FORMAT_R16G16_SINT: return MTLPixelFormatRG16Sint;
     case VK_FORMAT_R16G16B16A16_SFLOAT: return MTLPixelFormatRGBA16Float;
+    case VK_FORMAT_R16G16B16A16_UNORM: return MTLPixelFormatRGBA16Unorm;
+    case VK_FORMAT_R16G16B16A16_SNORM: return MTLPixelFormatRGBA16Snorm;
+    case VK_FORMAT_R16G16B16A16_UINT: return MTLPixelFormatRGBA16Uint;
+    case VK_FORMAT_R16G16B16A16_SINT: return MTLPixelFormatRGBA16Sint;
+    case VK_FORMAT_R32_SFLOAT: return MTLPixelFormatR32Float;
+    case VK_FORMAT_R32_UINT: return MTLPixelFormatR32Uint;
+    case VK_FORMAT_R32_SINT: return MTLPixelFormatR32Sint;
+    case VK_FORMAT_R32G32_SFLOAT: return MTLPixelFormatRG32Float;
+    case VK_FORMAT_R32G32_UINT: return MTLPixelFormatRG32Uint;
+    case VK_FORMAT_R32G32_SINT: return MTLPixelFormatRG32Sint;
+    case VK_FORMAT_R32G32B32A32_SFLOAT: return MTLPixelFormatRGBA32Float;
+    case VK_FORMAT_R32G32B32A32_UINT: return MTLPixelFormatRGBA32Uint;
+    case VK_FORMAT_R32G32B32A32_SINT: return MTLPixelFormatRGBA32Sint;
     case VK_FORMAT_A2B10G10R10_UNORM_PACK32: return MTLPixelFormatRGB10A2Unorm;
     case VK_FORMAT_A2R10G10B10_UNORM_PACK32: return MTLPixelFormatBGR10A2Unorm;
+    case VK_FORMAT_A2B10G10R10_UINT_PACK32: return MTLPixelFormatRGB10A2Uint;
+    case VK_FORMAT_B10G11R11_UFLOAT_PACK32: return MTLPixelFormatRG11B10Float;
+    case VK_FORMAT_E5B9G9R9_UFLOAT_PACK32: return MTLPixelFormatRGB9E5Float;
+    case VK_FORMAT_D16_UNORM: return MTLPixelFormatDepth16Unorm;
+    case VK_FORMAT_D32_SFLOAT: return MTLPixelFormatDepth32Float;
+    case VK_FORMAT_D32_SFLOAT_S8_UINT: return MTLPixelFormatDepth32Float_Stencil8;
+    case VK_FORMAT_S8_UINT: return MTLPixelFormatStencil8;
+    case VK_FORMAT_BC1_RGBA_UNORM_BLOCK: return MTLPixelFormatBC1_RGBA;
+    case VK_FORMAT_BC1_RGBA_SRGB_BLOCK: return MTLPixelFormatBC1_RGBA_sRGB;
+    case VK_FORMAT_BC2_UNORM_BLOCK: return MTLPixelFormatBC2_RGBA;
+    case VK_FORMAT_BC2_SRGB_BLOCK: return MTLPixelFormatBC2_RGBA_sRGB;
+    case VK_FORMAT_BC3_UNORM_BLOCK: return MTLPixelFormatBC3_RGBA;
+    case VK_FORMAT_BC3_SRGB_BLOCK: return MTLPixelFormatBC3_RGBA_sRGB;
+    case VK_FORMAT_BC4_UNORM_BLOCK: return MTLPixelFormatBC4_RUnorm;
+    case VK_FORMAT_BC4_SNORM_BLOCK: return MTLPixelFormatBC4_RSnorm;
+    case VK_FORMAT_BC5_UNORM_BLOCK: return MTLPixelFormatBC5_RGUnorm;
+    case VK_FORMAT_BC5_SNORM_BLOCK: return MTLPixelFormatBC5_RGSnorm;
+    case VK_FORMAT_BC6H_UFLOAT_BLOCK: return MTLPixelFormatBC6H_RGBUfloat;
+    case VK_FORMAT_BC6H_SFLOAT_BLOCK: return MTLPixelFormatBC6H_RGBFloat;
+    case VK_FORMAT_BC7_UNORM_BLOCK: return MTLPixelFormatBC7_RGBAUnorm;
+    case VK_FORMAT_BC7_SRGB_BLOCK: return MTLPixelFormatBC7_RGBAUnorm_sRGB;
     default: return MTLPixelFormatInvalid;
     }
 }
@@ -212,13 +304,16 @@ struct SharedImage::Impl {
         auto get_memory = reinterpret_cast<PFN_vkGetPhysicalDeviceMemoryProperties>(
             ip(instance, "vkGetPhysicalDeviceMemoryProperties"));
         const auto format = ImageFormat(info.format);
-        constexpr VkImageCreateFlags allowed = VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT | VK_IMAGE_CREATE_EXTENDED_USAGE_BIT;
+        constexpr VkImageCreateFlags allowed = VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT | VK_IMAGE_CREATE_EXTENDED_USAGE_BIT |
+            VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT | VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT;
         constexpr VkImageUsageFlags allowed_usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
             VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
-            VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT | VK_IMAGE_USAGE_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT;
+            VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT | VK_IMAGE_USAGE_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT |
+            VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
         if (!vkGetMemoryMetalHandleEXT || !format_props || !get_memory || format == MTLPixelFormatInvalid ||
-            info.pNext || info.imageType != VK_IMAGE_TYPE_2D || info.tiling != VK_IMAGE_TILING_OPTIMAL ||
-            info.samples != VK_SAMPLE_COUNT_1_BIT || info.extent.depth != 1 || (info.flags & ~allowed) ||
+            info.pNext || info.imageType > VK_IMAGE_TYPE_3D || info.tiling != VK_IMAGE_TILING_OPTIMAL ||
+            !info.extent.width || !info.extent.height || !info.extent.depth || !info.mipLevels || !info.arrayLayers ||
+            !info.samples || (info.samples & (info.samples - 1)) || (info.flags & ~allowed) ||
             (info.usage & ~allowed_usage) ||
             info.sharingMode != VK_SHARING_MODE_EXCLUSIVE) return;
         const auto fail = [&](const char* stage, VkResult result = VK_ERROR_FEATURE_NOT_PRESENT) {
@@ -239,7 +334,8 @@ struct SharedImage::Impl {
         const auto& limits = props.imageFormatProperties;
         if (result != VK_SUCCESS || !(external_props.externalMemoryProperties.externalMemoryFeatures &
                 VK_EXTERNAL_MEMORY_FEATURE_EXPORTABLE_BIT) || info.extent.width > limits.maxExtent.width ||
-            info.extent.height > limits.maxExtent.height || info.mipLevels > limits.maxMipLevels ||
+            info.extent.height > limits.maxExtent.height || info.extent.depth > limits.maxExtent.depth ||
+            !(limits.sampleCounts & info.samples) || info.mipLevels > limits.maxMipLevels ||
             info.arrayLayers > limits.maxArrayLayers) { fail("external image format query/limits", result); return; }
         VkExternalMemoryImageCreateInfo external{.sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO,
             .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_MTLHEAP_BIT_EXT};
@@ -275,11 +371,14 @@ struct SharedImage::Impl {
         heap = (__bridge id<MTLHeap>)handle;
         if (heap.type != MTLHeapTypePlacement) { fail("requires a placement heap"); return; }
         MTLTextureDescriptor* desc = [MTLTextureDescriptor new];
-        desc.textureType = info.arrayLayers > 1 || (info.usage & VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT) ?
-            MTLTextureType2DArray : MTLTextureType2D;
+        const bool array = info.arrayLayers > 1 || (info.usage & VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT);
+        desc.textureType = info.imageType == VK_IMAGE_TYPE_3D ? MTLTextureType3D :
+            info.samples > 1 ? (array ? MTLTextureType2DMultisampleArray : MTLTextureType2DMultisample) :
+            array ? MTLTextureType2DArray : MTLTextureType2D;
         desc.pixelFormat = format;
         desc.width = info.extent.width; desc.height = info.extent.height;
-        desc.depth = 1; desc.mipmapLevelCount = info.mipLevels; desc.arrayLength = info.arrayLayers;
+        desc.depth = info.extent.depth; desc.mipmapLevelCount = info.mipLevels; desc.arrayLength = info.arrayLayers;
+        desc.sampleCount = info.samples;
         desc.storageMode = heap.storageMode; desc.cpuCacheMode = heap.cpuCacheMode;
         desc.hazardTrackingMode = heap.hazardTrackingMode;
         desc.usage = MTLTextureUsageUnknown;
@@ -288,16 +387,27 @@ struct SharedImage::Impl {
         if (info.usage & (VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT))
             desc.usage |= MTLTextureUsageShaderRead;
         if (info.usage & (VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_STORAGE_BIT)) desc.usage |= MTLTextureUsageShaderWrite;
-        if (info.usage & (VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT)) desc.usage |= MTLTextureUsageRenderTarget;
+        if (info.usage & (VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+                          VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT)) desc.usage |= MTLTextureUsageRenderTarget;
         if (info.flags & VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT) desc.usage |= MTLTextureUsagePixelFormatView;
+        if (format == MTLPixelFormatR32Uint || format == MTLPixelFormatR32Sint)
+            desc.usage |= MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite | MTLTextureUsageShaderAtomic;
         const auto layout = [heap.device heapTextureSizeAndAlignWithDescriptor:desc];
         if (!layout.size || layout.size > req.size || layout.size > heap.size || layout.align > req.alignment)
             { fail("Metal/Vulkan texture layout requirements differ"); return; }
+        // Metal requires a stencil view for the combined format, even without a mutable Vk image.
+        if (format == MTLPixelFormatDepth32Float_Stencil8) desc.usage |= MTLTextureUsagePixelFormatView;
         metal = [heap newTextureWithDescriptor:desc offset:0];
         if (!metal) { fail("newTextureWithDescriptor:offset:", VK_ERROR_OUT_OF_DEVICE_MEMORY); return; }
         size = req.size;
+        std::lock_guard lock{resource_mutex};
+        native_images[image] = (__bridge void*)metal;
     }
     ~Impl() {
+        {
+            std::lock_guard lock{resource_mutex};
+            native_images.erase(image);
+        }
         metal = nil;
         if (image) destroy(device, image, nullptr);
         if (memory) free(device, memory, nullptr);
@@ -311,6 +421,158 @@ SharedImage::~SharedImage() = default;
 VkImage SharedImage::Handle() const { return impl->metal ? impl->image : VK_NULL_HANDLE; }
 void* SharedImage::NativeHandle() const { return (__bridge void*)impl->metal; }
 uint64_t SharedImage::SizeBytes() const { return impl->size; }
+
+struct TextureView::Impl {
+    VkImageView view;
+    id<MTLTexture> sampled, storage, attachment;
+    Impl(VkImageView key, void* image, const VkImageViewCreateInfo& info, bool writable, float min_lod)
+        : view(key) {
+        @autoreleasepool {
+            id<MTLTexture> base = (__bridge id<MTLTexture>)image;
+            const auto& r = info.subresourceRange;
+            if (!base || !key || !r.levelCount || !r.layerCount || r.baseMipLevel >= base.mipmapLevelCount ||
+                r.levelCount > base.mipmapLevelCount-r.baseMipLevel || !std::isfinite(min_lod) || min_lod < 0)
+                return;
+            MTLTextureType type;
+            switch (info.viewType) {
+            case VK_IMAGE_VIEW_TYPE_1D:
+            case VK_IMAGE_VIEW_TYPE_2D: type = base.sampleCount > 1 ? MTLTextureType2DMultisample : MTLTextureType2D; break;
+            case VK_IMAGE_VIEW_TYPE_1D_ARRAY:
+            case VK_IMAGE_VIEW_TYPE_2D_ARRAY:
+                type = base.sampleCount > 1 ? MTLTextureType2DMultisampleArray : MTLTextureType2DArray; break;
+            case VK_IMAGE_VIEW_TYPE_3D: type = MTLTextureType3D; break;
+            case VK_IMAGE_VIEW_TYPE_CUBE: type = MTLTextureTypeCube; break;
+            case VK_IMAGE_VIEW_TYPE_CUBE_ARRAY: type = MTLTextureTypeCubeArray; break;
+            default: return;
+            }
+            if ((base.textureType == MTLTextureType3D) != (type == MTLTextureType3D) ||
+                r.baseArrayLayer >= base.arrayLength || r.layerCount > base.arrayLength-r.baseArrayLayer)
+                return; // A 2D view of a volume needs a separately aliased array allocation.
+            auto format = ImageFormat(info.format);
+            if (r.aspectMask == VK_IMAGE_ASPECT_DEPTH_BIT) format = base.pixelFormat;
+            if (r.aspectMask == VK_IMAGE_ASPECT_STENCIL_BIT)
+                format = base.pixelFormat == MTLPixelFormatDepth32Float_Stencil8 ? MTLPixelFormatX32_Stencil8 :
+                    base.pixelFormat == MTLPixelFormatStencil8 ? MTLPixelFormatStencil8 : MTLPixelFormatInvalid;
+            if (format == MTLPixelFormatInvalid) return;
+            const VkComponentSwizzle components[] = {
+                info.components.r, info.components.g, info.components.b, info.components.a};
+            constexpr MTLTextureSwizzle identity[] = {
+                MTLTextureSwizzleRed, MTLTextureSwizzleGreen, MTLTextureSwizzleBlue, MTLTextureSwizzleAlpha};
+            constexpr MTLTextureSwizzle mapping[] = {MTLTextureSwizzleZero, MTLTextureSwizzleZero,
+                MTLTextureSwizzleOne, MTLTextureSwizzleRed, MTLTextureSwizzleGreen,
+                MTLTextureSwizzleBlue, MTLTextureSwizzleAlpha};
+            MTLTextureSwizzle swizzle[4];
+            for (uint32_t i = 0; i < 4; ++i) {
+                if (uint32_t(components[i]) > VK_COMPONENT_SWIZZLE_A) return;
+                swizzle[i] = components[i] == VK_COMPONENT_SWIZZLE_IDENTITY ? identity[i] : mapping[components[i]];
+                if ((r.aspectMask & (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)) &&
+                    (swizzle[i] == MTLTextureSwizzleGreen || swizzle[i] == MTLTextureSwizzleBlue))
+                    swizzle[i] = MTLTextureSwizzleZero;
+            }
+            MTLTextureViewDescriptor* desc = [MTLTextureViewDescriptor new];
+            desc.pixelFormat = format; desc.textureType = type;
+            desc.levelRange = NSMakeRange(r.baseMipLevel, r.levelCount);
+            desc.sliceRange = NSMakeRange(r.baseArrayLayer, r.layerCount);
+            desc.swizzle = MTLTextureSwizzleChannelsMake(swizzle[0], swizzle[1], swizzle[2], swizzle[3]);
+            if (min_lod) {
+                if (@available(macOS 27.0, *)) desc.minLOD = min_lod;
+                else return;
+            }
+            @try {
+                if (base.usage & MTLTextureUsageShaderRead) sampled = [base newTextureViewWithDescriptor:desc];
+                if (writable && (base.usage & MTLTextureUsageShaderWrite)) {
+                    if (type == MTLTextureTypeCube || type == MTLTextureTypeCubeArray)
+                        desc.textureType = MTLTextureType2DArray;
+                    storage = [base newTextureViewWithDescriptor:desc];
+                }
+                if ((base.usage & MTLTextureUsageRenderTarget) &&
+                    (type == MTLTextureType2D || type == MTLTextureType2DArray ||
+                     type == MTLTextureType2DMultisample || type == MTLTextureType2DMultisampleArray)) {
+                    // Attachments have no sampling swizzle or min-LOD clamp.
+                    attachment = [base newTextureViewWithPixelFormat:ImageFormat(info.format) textureType:type
+                        levels:desc.levelRange slices:desc.sliceRange];
+                }
+            } @catch (NSException* error) {
+                sampled = storage = attachment = nil;
+            }
+            if (sampled || storage || attachment) {
+                std::lock_guard lock{resource_mutex};
+                native_views[view] = {(__bridge void*)sampled, (__bridge void*)storage,
+                    (__bridge void*)attachment, info.image, r};
+            }
+        }
+    }
+    ~Impl() {
+        std::lock_guard lock{resource_mutex};
+        native_views.erase(view);
+    }
+};
+TextureView::TextureView(VkImageView view, void* image, const VkImageViewCreateInfo& info,
+                         bool storage, float min_lod)
+    : impl(std::make_unique<Impl>(view, image, info, storage, min_lod)) {}
+TextureView::~TextureView() = default;
+
+struct Sampler::Impl {
+    VkSampler sampler;
+    id<MTLSamplerState> metal;
+    Impl(VkSampler key, const VkSamplerCreateInfo& info, void* native_device) : sampler(key) {
+        @autoreleasepool {
+            id<MTLDevice> device = native_device ? (__bridge id<MTLDevice>)native_device : MTLCreateSystemDefaultDevice();
+            if (!key || !device || info.flags || info.pNext || uint32_t(info.magFilter) > VK_FILTER_LINEAR ||
+                uint32_t(info.minFilter) > VK_FILTER_LINEAR || uint32_t(info.mipmapMode) > VK_SAMPLER_MIPMAP_MODE_LINEAR ||
+                (info.compareEnable && uint32_t(info.compareOp) > VK_COMPARE_OP_ALWAYS) ||
+                !std::isfinite(info.mipLodBias) || !std::isfinite(info.minLod) || !std::isfinite(info.maxLod) ||
+                info.maxLod < info.minLod || info.minLod < 0 ||
+                (info.anisotropyEnable && (!std::isfinite(info.maxAnisotropy) || info.maxAnisotropy < 1 ||
+                   info.maxAnisotropy > 16 || std::floor(info.maxAnisotropy) != info.maxAnisotropy))) return;
+            const auto address = [](VkSamplerAddressMode mode) {
+                switch (mode) {
+                case VK_SAMPLER_ADDRESS_MODE_REPEAT: return MTLSamplerAddressModeRepeat;
+                case VK_SAMPLER_ADDRESS_MODE_MIRRORED_REPEAT: return MTLSamplerAddressModeMirrorRepeat;
+                case VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE: return MTLSamplerAddressModeClampToEdge;
+                case VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER: return MTLSamplerAddressModeClampToBorderColor;
+                case VK_SAMPLER_ADDRESS_MODE_MIRROR_CLAMP_TO_EDGE: return MTLSamplerAddressModeMirrorClampToEdge;
+                default: return MTLSamplerAddressMode(NSUIntegerMax);
+                }
+            };
+            MTLSamplerDescriptor* desc = [MTLSamplerDescriptor new];
+            desc.sAddressMode = address(info.addressModeU); desc.tAddressMode = address(info.addressModeV);
+            desc.rAddressMode = address(info.addressModeW);
+            if (desc.sAddressMode == NSUIntegerMax || desc.tAddressMode == NSUIntegerMax ||
+                desc.rAddressMode == NSUIntegerMax) return;
+            switch (info.borderColor) {
+            case VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK:
+            case VK_BORDER_COLOR_INT_TRANSPARENT_BLACK: desc.borderColor = MTLSamplerBorderColorTransparentBlack; break;
+            case VK_BORDER_COLOR_FLOAT_OPAQUE_BLACK:
+            case VK_BORDER_COLOR_INT_OPAQUE_BLACK: desc.borderColor = MTLSamplerBorderColorOpaqueBlack; break;
+            case VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE:
+            case VK_BORDER_COLOR_INT_OPAQUE_WHITE: desc.borderColor = MTLSamplerBorderColorOpaqueWhite; break;
+            default: return;
+            }
+            desc.minFilter = MTLSamplerMinMagFilter(info.minFilter);
+            desc.magFilter = MTLSamplerMinMagFilter(info.magFilter);
+            desc.mipFilter = info.mipmapMode == VK_SAMPLER_MIPMAP_MODE_LINEAR ? MTLSamplerMipFilterLinear : MTLSamplerMipFilterNearest;
+            desc.maxAnisotropy = info.anisotropyEnable ? uint32_t(info.maxAnisotropy) : 1;
+            desc.compareFunction = info.compareEnable ? MTLCompareFunction(info.compareOp) : MTLCompareFunctionNever;
+            desc.normalizedCoordinates = !info.unnormalizedCoordinates;
+            desc.lodMinClamp = info.minLod; desc.lodMaxClamp = info.maxLod;
+            desc.lodBias = info.mipLodBias;
+            desc.supportArgumentBuffers = YES;
+            metal = [device newSamplerStateWithDescriptor:desc];
+            if (metal) {
+                std::lock_guard lock{resource_mutex};
+                native_samplers[key] = (__bridge void*)metal;
+            }
+        }
+    }
+    ~Impl() {
+        std::lock_guard lock{resource_mutex};
+        native_samplers.erase(sampler);
+    }
+};
+Sampler::Sampler(VkSampler sampler, const VkSamplerCreateInfo& info, void* device)
+    : impl(std::make_unique<Impl>(sampler, info, device)) {}
+Sampler::~Sampler() = default;
 
 static bool PostProcessImpl(void* source, VkFormat view_format, void* destination, float gamma,
                             bool srgb_input, id<MTLCommandBuffer> supplied = nil, VkRect2D region = {},

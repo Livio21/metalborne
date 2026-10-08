@@ -62,6 +62,8 @@ static int initialized, opened, sdl_ready;
 static SDL_Gamepad *gamepad;
 static size_t reads;
 static uint8_t connected_count;
+static PadTouch previous_touches[2];
+static uint8_t previous_touch_count, next_touch_id;
 
 static uint64_t now_us(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t); return (uint64_t)t.tv_sec*1000000u+(uint64_t)t.tv_nsec/1000u; }
 static uint8_t axis(int16_t v) { int x=(v+32768)>>8; return (uint8_t)(x<0 ? 0 : x>255 ? 255 : x); }
@@ -396,6 +398,20 @@ static ABI int32_t pad_read_state(int32_t handle, PadData *data) {
     if (!data) return ERR_INVALID_ARG;
     pthread_mutex_lock(&lock);
     sample(data); ++reads;
+    /* Contact IDs stay stable while held and change after release, including
+     * emulated clicks. The game uses them to distinguish new touch gestures. */
+    PadTouch contacts[2];
+    for (int i=0;i<data->touch_count;++i) {
+        contacts[i]=data->touches[i];
+        int old=0;
+        while (old<previous_touch_count && previous_touches[old].reserve[0]!=contacts[i].id) ++old;
+        if (old<previous_touch_count) contacts[i].id=previous_touches[old].id;
+        else { if (++next_touch_id>127) next_touch_id=1; contacts[i].id=next_touch_id; }
+        contacts[i].reserve[0]=data->touches[i].id;
+        data->touches[i].id=contacts[i].id;
+    }
+    previous_touch_count=data->touch_count;
+    memcpy(previous_touches,contacts,data->touch_count*sizeof(PadTouch));
     pthread_mutex_unlock(&lock);
     return 0;
 }

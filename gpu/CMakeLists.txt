@@ -154,8 +154,14 @@ target_compile_definitions(bbgpu PRIVATE BOOST_ASIO_STANDALONE NDEBUG)
 target_compile_options(bbgpu PRIVATE -Wno-deprecated-declarations -Wno-missing-field-initializers)
 # Runtime symbols (runtime_memory_*, runtime_process_*) resolve against bb-probe.
 if(APPLE)
-    target_sources(bbgpu PRIVATE shim/macos_metalfx.mm third_party/imgui/backends/imgui_impl_metal.mm)
-    set_source_files_properties(shim/macos_metalfx.mm third_party/imgui/backends/imgui_impl_metal.mm
+    find_path(BB_SPIRV_CROSS_INCLUDE spirv_cross/spirv_msl.hpp REQUIRED)
+    find_library(BB_SPIRV_CROSS_MSL spirv-cross-msl REQUIRED)
+    find_library(BB_SPIRV_CROSS_GLSL spirv-cross-glsl REQUIRED)
+    find_library(BB_SPIRV_CROSS_CORE spirv-cross-core REQUIRED)
+    target_include_directories(bbgpu PRIVATE ${BB_SPIRV_CROSS_INCLUDE})
+    target_link_libraries(bbgpu PRIVATE ${BB_SPIRV_CROSS_MSL} ${BB_SPIRV_CROSS_GLSL} ${BB_SPIRV_CROSS_CORE})
+    target_sources(bbgpu PRIVATE shim/macos_metalfx.mm shim/macos_metal_shader.mm third_party/imgui/backends/imgui_impl_metal.mm)
+    set_source_files_properties(shim/macos_metalfx.mm shim/macos_metal_shader.mm third_party/imgui/backends/imgui_impl_metal.mm
         PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
     target_link_libraries(bbgpu PRIVATE "-framework MetalFX")
     target_link_options(bbgpu PRIVATE -Wl,-undefined,dynamic_lookup)
@@ -188,6 +194,17 @@ if(APPLE)
     set_source_files_properties(../tests/test_metal_buffers.cpp PROPERTIES
         COMPILE_OPTIONS "-fvisibility=hidden;-fvisibility-inlines-hidden")
     target_link_libraries(metal-buffer-test PRIVATE bbgpu)
+    foreach(STAGE IN ITEMS vert frag)
+        set(HEADER ${CMAKE_CURRENT_BINARY_DIR}/test_shaders/metal_draw_${STAGE}.h)
+        string(TOUPPER METAL_DRAW_${STAGE} SYMBOL)
+        add_custom_command(OUTPUT ${HEADER}
+            COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_CURRENT_BINARY_DIR}/test_shaders
+            COMMAND ${GLSLANG_COMPILER} --target-env vulkan1.3 --vn ${SYMBOL} -o ${HEADER}
+                ${CMAKE_CURRENT_SOURCE_DIR}/../tests/shaders/metal_draw.${STAGE}
+            DEPENDS ../tests/shaders/metal_draw.${STAGE} VERBATIM)
+        target_sources(metal-buffer-test PRIVATE ${HEADER})
+    endforeach()
+    target_include_directories(metal-buffer-test PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/test_shaders)
 endif()
 
 add_executable(scene-resolution-test EXCLUDE_FROM_ALL ../tests/test_scene_resolution.cpp ../tests/test_gpu_runtime_stubs.cpp)

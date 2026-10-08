@@ -232,6 +232,13 @@ private:
                   const IndirectDraw* indirect = nullptr);
     /// Everything of a direct dispatch after the pipeline selection (GPU thread or stage B).
     void DispatchRecord(const ComputePipeline* pipeline);
+#ifdef __APPLE__
+    bool DispatchMetal(const ComputePipeline* pipeline, std::array<u32, 3> groups);
+    bool ExecuteMetal(const Pipeline* pipeline, std::array<u32, 3> groups,
+                      const RenderState* render = nullptr, bool indexed = false);
+    std::vector<std::pair<u64, std::shared_ptr<BbMetalFX::SharedBuffer>>> metal_clone_pool;
+    bool metal_async_issued = false;
+#endif
     /// The compute registers of the dispatch being recorded.
     const AmdGpu::ComputeProgram& CsRegs() const;
     static void RunDrawPacket(void* rasterizer, const u8* packet, u32 size);
@@ -427,12 +434,14 @@ private:
         VertexInputs<vk::DeviceSize> host_offsets;
         VertexInputs<vk::DeviceSize> host_sizes;
         VertexInputs<vk::DeviceSize> host_strides;
+        VertexInputs<u64> host_guests;
         u32 num_buffers = 0;
     } vertex_binds;
     struct IndexBind {
         vk::Buffer handle;
         u64 offset;
         vk::IndexType type;
+        u64 guest;
     } index_bind{};
     /// The direct draw whose vertex/index buffers BindResources may resolve early.
     struct DrawInputs {

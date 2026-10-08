@@ -7,6 +7,9 @@
 #include "video_core/amdgpu/resource.h"
 #include "video_core/renderer_vulkan/vk_common.h"
 #include "video_core/texture_cache/types.h"
+#ifdef __APPLE__
+#include "macos_metalfx.h"
+#endif
 
 namespace AmdGpu {
 struct ColorBuffer;
@@ -54,6 +57,9 @@ struct ImageView {
 
     ImageViewInfo info;
     vk::UniqueImageView image_view;
+#ifdef __APPLE__
+    std::unique_ptr<BbMetalFX::TextureView> metal;
+#endif
 };
 
 } // namespace VideoCore

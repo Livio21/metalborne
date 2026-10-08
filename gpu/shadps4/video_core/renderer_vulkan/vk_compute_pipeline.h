@@ -5,6 +5,9 @@
 
 #include "video_core/renderer_vulkan/vk_common.h"
 #include "video_core/renderer_vulkan/vk_pipeline_common.h"
+#ifdef __APPLE__
+#include "macos_metal_shader.h"
+#endif
 
 namespace VideoCore {
 class BufferCache;
@@ -51,6 +54,7 @@ public:
     ~ComputePipeline();
 #ifdef __APPLE__
     bool metal_reference{};
+    std::unique_ptr<BbMetalFX::ComputeKernel> metal_kernel;
 #endif
 
 private:

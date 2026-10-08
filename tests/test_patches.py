@@ -94,6 +94,10 @@ class NativeUiTests(unittest.TestCase):
 
 
 class DebugPatchTests(unittest.TestCase):
+    def test_debug_menu_keeps_builtin_font_backend(self):
+        writes = compile_patches(XML, ['Restore Debug Menu (READ NOTES)'], '01.09', SEGMENTS)
+        self.assertEqual(dict(writes)[0x136d90d-EBOOT_BASE], b'\x74')
+
     def test_camera_patch_is_optional_and_compatible_with_fps_and_debug_menu(self):
         self.assertEqual(effect_patches({'debug_camera': '0', 'debug_menu': '0'}), [])
         camera = effect_patches({'debug_camera': '1'})
@@ -113,7 +117,7 @@ class DebugPatchTests(unittest.TestCase):
             validate_patch_requirements(['Restore Debug Camera'], game)
             with self.assertRaisesRegex(ValueError, 'DbgFont14h.ccm.*DbgFont14h.tpf'):
                 validate_patch_requirements(names, game)
-            font = game / 'dvdroot_ps4/font'
+            font = game / 'dvdroot_ps4/adhoc/font'
             font.mkdir(parents=True)
             (font / 'DbgFont14h.ccm').write_bytes(b'test')
             (font / 'DbgFont14h.tpf').touch()
@@ -121,6 +125,10 @@ class DebugPatchTests(unittest.TestCase):
                 validate_patch_requirements(names, game)
             (font / 'DbgFont14h.tpf').write_bytes(b'test')
             validate_patch_requirements(names, game)
+            for name in ('DbgFont14h.ccm', 'DbgFont14h.tpf'):
+                (font / name).rename(font / (name + '.dcx'))
+            with self.assertRaisesRegex(ValueError, 'DbgFont14h.ccm.*DbgFont14h.tpf'):
+                validate_patch_requirements(names, game)
 
     def test_conflicting_enemy_control_patch_is_rejected(self):
         with self.assertRaisesRegex(ValueError, 'conflicts with Enemy Control'):

@@ -3,14 +3,19 @@
 During graphics work, update [the game rendering and handling register](GAME_RENDERING_ISSUES.md)
 with visual issues, direct game optimization candidates and their evidence.
 
-Updated 2026-10-07. This is the first native Metal presentation stage of the
-renderer transition. The game and host CPU code still run under Rosetta;
-PS4 draw/compute commands and shader recompilation still use bbport's Vulkan
-renderer through KosmicKrisp. Host SDR post-processing now has an opt-in native
-Metal graphics pipeline; unsupported inputs retain the Vulkan pass.
-Ordinary buffer storage/copies and selected color textures/copies/transfers now have
-opt-in native Metal paths
-described below; sparse guest arenas retain Vulkan ownership.
+Updated 2026-10-08. The game and host CPU code still run under Rosetta.
+The opt-in renderer now executes supported guest vertex/fragment pipelines
+directly on Metal, with actual textured, indexed gameplay draws observed.
+It also has native host post-processing, presentation, scene MetalFX,
+shared resources/transfers and buffer-only guest compute. Unsupported guest
+work still uses bbport's Vulkan backend through KosmicKrisp. Guest shader
+recompilation still produces SPIR-V; the native path translates it to MSL.
+Sparse guest arenas retain Vulkan ownership and require copies for native draws.
+The synchronous graphics proof is very slow and stays off by default.
+The async shared-resource graphics path also passes headless comparison;
+its gameplay/performance evidence is recorded below.
+See [the latest graphics evidence](#native-guest-graphics-2026-10-08) and
+[the bbhost source comparison](BBHOST_RESEARCH.md).
 
 ## Enable it
 
@@ -426,16 +431,18 @@ longer alternating runs remain open.
 
 The host frame renders directly into exportable storage, and the real game
 buffer-copy workload below passes on native Metal, including shared GPU buffers.
-Ordinary cache buffers and selected color images now have the opt-in shared
-ownership paths below. Guest
-sparse arenas still require a different allocation/binding contract before
-their shader bindings can move directly to Metal. Selected shared color-image
-uploads/downloads have the opt-in Metal path below. Depth, compressed, volume
-and multisample workloads still use Vulkan.
-The full backend still needs native resource/cache management, bindings,
-graphics/compute pipelines and command submission. Geometry/tessellation and
-guest completion semantics require their own proofs; presentation alone does
-not establish full native rendering.
+Ordinary cache buffers, selected images, canonical texture views/samplers and
+supported guest graphics/compute now have opt-in native paths. Shared depth
+storage and depth-tested graphics pass the headless comparison below.
+Guest sparse arenas still need a different allocation/binding contract before
+their shader bindings can move directly to Metal without clones.
+Compressed, volume and multisample allocation/view support is conditional;
+their complete workloads are not validated native renderer coverage.
+The full backend still needs native cache/arena ownership, submission batching,
+broader compute, indirect draws, geometry/tessellation and coverage of remaining
+resources/states. Guest completion ordering must remain correct across every
+replacement. Actual guest graphics is now evidenced; the full transition and
+sustained 30 FPS remain unfinished.
 
 ## Native game compute proof
 
@@ -772,3 +779,107 @@ timing but averaged 16.05 guest FPS across its two complete measurement windows.
 Thermal pressure rose to fair and the runner flagged the result. This single
 run does not isolate the clear-path cost or establish a speedup; the path stays
 off by default.
+
+## Native guest graphics (2026-10-08)
+
+`BB_METAL_GRAPHICS=1` captures the exact final guest SPIR-V modules, translates
+them through the installed SPIRV-Cross library and creates native Metal
+vertex/fragment pipelines. It does not distribute extracted game shaders.
+The existing `GraphicsPipeline` supplies canonical formats, blending and
+multisampling; `Rasterizer::DrawRecord` supplies actual descriptors, vertex/index
+bindings, push data, depth/stencil, viewport and scissor state. Supported draws
+replace the Vulkan draw. An unavailable shader, binding, resource or state
+returns to Vulkan before native submission. A failed submitted command stops
+the process instead of replaying partially written output.
+
+Native texture views use the canonical format, aspect, mip, layer and swizzle;
+native samplers preserve filters, addressing, comparison and LOD bias. Shader
+reflection checks sampled texture dimension, integer/float type and depth
+requirements. Dynamic vertex stride, index offset/base vertex, color masks,
+blending and depth/stencil share the existing Vulkan state. Geometry,
+tessellation, fan/adjacency/patch topology and unsupported draw/state contracts
+remain on Vulkan. Direct draws are covered; indirect draws are not replaced.
+
+Ordinary exportable buffers bind their shared storage directly. Sparse arenas
+use pooled placement buffers populated by Vulkan copies. Overlapping guest
+ranges share a clone even if Vulkan arenas have merged, preserving aliases.
+Only written segments are copied back. The pool is capped at 512 MiB and
+retains unused slots to avoid allocating again after each zero-clone draw.
+Images transfer only the used mip/layer subresources with their tracked
+layouts, then reacquire the original layouts. This proof still performs
+per-command ownership transfers and waits.
+
+### Compiled and observed evidence
+
+- The author-generated indexed textured fixture matched all 4,096 output bytes
+  against its Vulkan draw within one UNORM LSB. It checked mip/layer/swizzle
+  views, LOD bias, base vertex/index offset, blend/channel masks, shared depth,
+  viewport/scissor and untouched pixels, then repeated with a changed vertex
+  stride. Missing push data was rejected before submission. The existing
+  resource/copy/MetalFX checks also passed. Local log:
+  `out/macos-native-metal/graphics-check.log`. A texture type warning in that
+  log was corrected; the updated async and threaded checks pass without it.
+- The real game buffer-copy shader still passed its offset/push/output-guard
+  comparison: `out/macos-native-metal/guest-compute-regression-check.log`.
+- `out/benchmarks/20261008-123758-997428-native-graphics-isolated/` booted the
+  private save into Hunter's Dream, logged at least 34,800 native draws across
+  multiple gameplay shaders, and exited normally. Character, geometry,
+  foliage, lighting and HUD were visible in a UI inspection. This was partial
+  native guest rendering with Vulkan fallback, not a wholly native frame.
+- That 60-second measurement averaged **2.61 FPS** across ten windows, with
+  250–450.01 ms window medians and a worst-window p99 of 1,200.03 ms.
+  Thermal pressure became **fair** before measurement, so it cannot isolate
+  performance from heat. It demonstrates an unusably slow diagnostic path;
+  no speedup or stable 30 FPS is claimed. Per-draw waits/copies and first-use
+  Metal compilation need profiling. The reported zero compilation counter
+  covers Vulkan/game pipelines, not the lazy Metal PSOs.
+- An earlier mixed graphics/texture-compute run stopped on
+  `pm4_cmds.h:492 SignalFence` during loading:
+  `out/benchmarks/20261008-123510-597151-native-graphics-debug-font/`.
+  Graphics capture had inadvertently enabled compute despite
+  `BB_METAL_COMPUTE=0`; that activation bug was fixed. Texture compute is now
+  rejected until its outputs/order are compared. The packet fault's root cause
+  remains unproven; no command packet or completion assertion was bypassed.
+
+### Async shared-resource graphics
+
+Native graphics encoding can now return a prepared command without committing
+it. With `BB_METAL_GRAPHICS_ASYNC=1`, a draw whose buffers already share storage
+releases Vulkan ownership without advancing the guest tick. A persistent
+scheduler worker waits for that release, commits/completes the Metal command
+and host-signals a timeline semaphore. Subsequent Vulkan work waits on that
+value before acquiring the resources. Scene MetalFX and graphics use the same
+timeline value allocator. Shutdown drains draws/jobs before cache destruction.
+Sparse clone draws stay synchronous so queued draws cannot multiply their
+retained copy buffers.
+
+The existing fixture prepares two consecutive draws, checks increasing
+completion values and the unchanged pending guest tick/callback, then compares
+their completed output against Vulkan. The sources compile and this check
+passes in both direct and threaded recording; the Vulkan fallback check also
+passes. Logs: `out/macos-native-metal/graphics-async-check.log`,
+`graphics-async-threaded-check.log` and `graphics-async-vulkan-check.log`.
+The first fixture run caught a
+missing executable-local Vulkan dispatcher on its new fence; the fixture was
+corrected and rerun. That was a check failure before the gameplay run.
+
+Automatic approval review initially rejected the rebuild because its usage
+quota was exhausted. A later reviewed build executed successfully; the current
+library includes async graphics. Keep both graphics flags opt-in. Correctness
+checks do not establish fewer GPU submissions, complete resource coverage,
+better scanout pacing or sustained 30 FPS.
+
+The final async gameplay run,
+`out/benchmarks/20261008-150755-813709-native-graphics-async-shared/`, used
+`BB_METAL_GRAPHICS=1 BB_METAL_GRAPHICS_ASYNC=1 BB_METAL_COMPUTE=0` and MetalFX
+off. It reached Hunter's Dream, retained the visible scene/HUD, logged at least
+39,900 native draws and 16,500 async completions, and exited with status 0
+without forced termination. All 15 original source-save hashes were unchanged.
+
+Its 35-second measurement averaged **4.3 FPS** across six windows, with
+200–316.68 ms window medians and a worst-window p99 of **900.01 ms**.
+All recorded pressure samples were nominal. This remains far below 30 FPS and
+is not a matched speedup comparison: the previous synchronous run used an
+earlier library and became thermally fair. Nominal pressure is not a measurement
+of temperatures or sustained clocks. Persistent native buffers and submission
+batching remain necessary work, and this path remains off by default.

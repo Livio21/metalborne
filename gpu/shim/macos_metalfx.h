@@ -4,8 +4,48 @@
 #include <functional>
 #include <span>
 #include <vulkan/vulkan_core.h>
+#ifdef __OBJC__
+#import <Metal/Metal.h>
+#endif
 
 namespace BbMetalFX {
+#ifdef __OBJC__
+// Shared queue for native transfers, guest kernels and presentation helpers.
+bool RunCommands(id<MTLDevice> device,
+                 const std::function<bool(id<MTLCommandBuffer>, id<MTLFence>)>& encode,
+                 float* gpu_ms = nullptr, bool* submitted = nullptr,
+                 std::function<bool(float*)>* deferred = nullptr);
+MTLPixelFormat ImageFormat(VkFormat format);
+#endif
+void* FindNativeBuffer(VkBuffer buffer);
+void* FindNativeImage(VkImage image);
+struct NativeImageView {
+    void* sampled{};
+    void* storage{};
+    void* attachment{};
+    VkImage image{};
+    VkImageSubresourceRange range{};
+};
+NativeImageView FindNativeImageView(VkImageView view);
+void* FindNativeSampler(VkSampler sampler);
+// Owned by the existing image-view/sampler caches; borrowed handles follow their lifetimes.
+class TextureView {
+public:
+    TextureView(VkImageView view, void* image, const VkImageViewCreateInfo& info,
+                bool storage, float min_lod = 0);
+    ~TextureView();
+private:
+    struct Impl;
+    std::unique_ptr<Impl> impl;
+};
+class Sampler {
+public:
+    Sampler(VkSampler sampler, const VkSamplerCreateInfo& info, void* device = nullptr);
+    ~Sampler();
+private:
+    struct Impl;
+    std::unique_ptr<Impl> impl;
+};
 struct ComputeBuffer {
     std::span<const uint8_t> before, reference;
     void* native{}; // Optional GPU-populated shared clone; retained by SharedBuffer.

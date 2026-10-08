@@ -1198,7 +1198,9 @@
     </Metadata>
     <Metadata Title="Bloodborne" Name="Restore Debug Menu (READ NOTES)" Author="Whitehawkx, auser1337" Note="This patch requires debug font files, which is available from nexusmods. It will crash without them. Access the menu by pressing left side of touchpad. " PatchVer="1.0" AppVer="01.09" AppElf="eboot.bin" isEnabled="false">
         <PatchList>
-            <Line Type="bytes" Address="0x136D90D" Value="75"/>
+            <!-- bbport keeps the built-in GNM font backend. The shadPS4 JNE override
+                 selects missing title:/Font shaders and leaves the drawing context null. -->
+            <Line Type="bytes" Address="0x136D90D" Value="74"/>
             <Line Type="bytes" Address="0x2199EEE" Value="488D154318BA0290"/>
             <Line Type="bytes" Address="0x2199EF8" Value="0DC418"/>
             <Line Type="bytes" Address="0x2199EFE" Value="89DF9090909031F69090909090E8603D1DFF4C89F790909090EB0D9090"/>

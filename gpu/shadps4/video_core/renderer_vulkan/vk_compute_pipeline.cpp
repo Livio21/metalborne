@@ -2,6 +2,9 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <boost/container/small_vector.hpp>
+#include <cstdio>
+#include <cstdlib>
+#include <string_view>
 
 #include "shader_recompiler/info.h"
 #include "video_core/renderer_vulkan/vk_compute_pipeline.h"
@@ -20,6 +23,17 @@ ComputePipeline::ComputePipeline(const Instance& instance, Scheduler& scheduler,
       compute_key{compute_key_} {
 #ifdef __APPLE__
     metal_reference = IsMetalComputeReference(module);
+    const char* native = std::getenv("BB_METAL_COMPUTE");
+    if (native && std::string_view(native) == "1") {
+        if (auto code = MetalShaderCode(module, instance.GetDevice()); !code.empty()) {
+            metal_kernel = std::make_unique<BbMetalFX::ComputeKernel>(code);
+            if (!metal_kernel->Available()) {
+                std::fprintf(stderr, "Native Metal compute pipeline unavailable (%016llx): %.*s\n",
+                    static_cast<unsigned long long>(info_.pgm_hash), int(metal_kernel->Error().size()),
+                    metal_kernel->Error().data());
+            }
+        }
+    }
 #endif
     auto& info = stages[int(Shader::SwStage::Compute)];
     info = &info_;

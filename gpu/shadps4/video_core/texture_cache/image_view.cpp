@@ -140,6 +140,13 @@ ImageView::ImageView(const Vulkan::Instance& instance, const ImageViewInfo& info
     ASSERT_MSG(view_result == vk::Result::eSuccess, "Failed to create image view: {}",
                vk::to_string(view_result));
     image_view = std::move(view);
+#ifdef __APPLE__
+    if (image.backing->image.metal) {
+        metal = std::make_unique<BbMetalFX::TextureView>(*image_view,
+            image.backing->image.metal->NativeHandle(), static_cast<VkImageViewCreateInfo>(image_view_ci),
+            info.is_storage, min_lod_ci.minLod);
+    }
+#endif
 
     const auto view_aspect = aspect & vk::ImageAspectFlagBits::eDepth     ? "Depth"
                              : aspect & vk::ImageAspectFlagBits::eStencil ? "Stencil"

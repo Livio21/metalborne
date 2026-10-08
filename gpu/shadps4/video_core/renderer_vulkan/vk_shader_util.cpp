@@ -9,6 +9,8 @@
 #include <fstream>
 #include <mutex>
 #include <vector>
+#include <map>
+#include <cstring>
 #endif
 
 namespace Vulkan {
@@ -17,6 +19,15 @@ namespace Vulkan {
 // ponytail: one local reference per process; expand only when multiple proofs are needed.
 static std::mutex reference_mutex;
 static std::vector<vk::ShaderModule> reference_modules;
+// ponytail: retain module bytes for this renderer process; overwrite reused handles.
+static std::map<VkDevice, std::map<VkShaderModule, std::vector<u32>>> metal_modules;
+std::vector<u32> MetalShaderCode(vk::ShaderModule module, vk::Device device) {
+    std::lock_guard lock{reference_mutex};
+    const auto owner = metal_modules.find(device);
+    if (owner == metal_modules.end()) return {};
+    const auto found = owner->second.find(module);
+    return found == owner->second.end() ? std::vector<u32>{} : found->second;
+}
 static const std::vector<u32>& MetalComputeReference() {
     static const auto reference = [] {
         std::vector<u32> words;
@@ -50,6 +61,12 @@ vk::ShaderModule CompileSPV(std::span<const u32> code, vk::Device device) {
     ASSERT_MSG(module_result == vk::Result::eSuccess, "Failed to compile SPIR-V shader: {}",
                vk::to_string(module_result));
 #ifdef __APPLE__
+    static const char* native = std::getenv("BB_METAL_COMPUTE");
+    static const char* graphics = std::getenv("BB_METAL_GRAPHICS");
+    if ((native && std::strcmp(native, "1") == 0) || (graphics && std::strcmp(graphics, "1") == 0)) {
+        std::lock_guard lock{reference_mutex};
+        metal_modules[device][module] = std::vector<u32>(code.begin(), code.end());
+    }
     const auto& reference = MetalComputeReference();
     if (!reference.empty()) {
         std::lock_guard lock(reference_mutex);

@@ -11,6 +11,9 @@
 #include "video_core/amdgpu/regs_depth.h"
 #include "video_core/amdgpu/regs_primitive.h"
 #include "video_core/renderer_vulkan/vk_pipeline_common.h"
+#ifdef __APPLE__
+#include "macos_metal_shader.h"
+#endif
 
 namespace VideoCore {
 class BufferCache;
@@ -101,6 +104,9 @@ public:
     const GraphicsPipelineKey& GetGraphicsKey() const {
         return key;
     }
+#ifdef __APPLE__
+    std::unique_ptr<BbMetalFX::RenderPipeline> metal_pipeline;
+#endif
 
     /// Gets the attributes and bindings for vertex inputs.
     template <typename Attribute, typename Binding>

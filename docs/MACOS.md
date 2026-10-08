@@ -20,8 +20,13 @@ loader and driver must also contain an x86-64 slice.
 
 Requirements: Apple Silicon, Rosetta, macOS 26 or newer, current Xcode Command
 Line Tools, Git, Python 3, CMake, Ninja, and an x86-64 Vulkan loader and driver.
-The deployment target defaults to macOS 26. Dependencies are fetched at pinned
-revisions into `out/`; arm64 Homebrew graphics libraries are not linked.
+The native guest shader compiler also requires installed SPIRV-Cross headers
+and x86-64 `spirv-cross-msl`, `spirv-cross-glsl` and `spirv-cross-core` libraries.
+CMake finds these through its normal prefix search (`CMAKE_PREFIX_PATH` for a
+custom installation). In this workspace they are under `/usr/local/include`
+and `/usr/local/lib`. An arm64-only library cannot link into this renderer.
+The deployment target defaults to macOS 26. Other dependencies are fetched at
+pinned revisions into `out/`; arm64 Homebrew graphics libraries are not linked.
 
 ```bash
 git submodule update --init --recursive

@@ -53,6 +53,7 @@ under the ignored `out/` directory.
   pass and scene MetalFX before the HUD, with an optional worker/timeline
   completion bridge. These experimental options remain opt-in.
 - [GPU optimization and native Metal research](docs/MACOS_GPU_RESEARCH.md).
+- [bbhost engine hooks and game-side optimization references](docs/BBHOST_RESEARCH.md).
 
 Report macOS fork issues in [Metalborne's issue tracker](https://github.com/Livio21/metalborne/issues).
 Include your Mac, macOS version, Vulkan driver version, launch options and a

@@ -1,6 +1,6 @@
 # Game rendering and handling register
 
-Updated 2026-10-07. Keep this register alongside the native Metal transition.
+Updated 2026-10-08. Keep this register alongside the native Metal transition.
 For each new visual defect, rendering cost or game-behavior issue, record its
 scene/reproduction, build and settings, evidence, suspected owner, proposed
 change, visual/gameplay cost and validation result. Update existing entries
@@ -26,6 +26,11 @@ target and original gameplay behavior when evaluating optimizations.
 | PORT-06 / high | The 1920x1080 HUD exceeds the 1710x961 presentation target, so gameplay MetalFX now runs on the 1280x720 scene before HUD composition. Matched stationary Hunter's Dream runs with the same binary/save/settings recorded 20.9 FPS synchronously versus 26.1 FPS with the host-signaled timeline bridge, about 25% higher throughput. Median interval improved from 50.00 to 33.33 ms; worst-window p99 stayed 50.02 ms. Both sampled nominal pressure and compiled no game shaders/pipelines. The longer final-build run reached 27.7 FPS but became fair and retained the overlay. A separate short UI/resize check varied to 20.2 FPS despite nominal pressure. Both checks are excluded from the matched comparison. | Scene placement and command-thread wait addressed in the opt-in path. Shared-texture lifetime, pending staging/callbacks, three semaphore waits and fallback bytes passed headless checks. Visible overlay/resize and clean shutdown passed. Stable 30 FPS, scanout pacing and equal sustained clocks remain unproven. | Keep `BB_METALFX_SCENE=1 BB_METALFX_SCENE_ASYNC=1` opt-in. Profile remaining GPU submissions and raw-frame ownership waits, then repeat alternating runs under comparable thermals. Audit pixel density/drawable size separately. Use moving-camera/combat checks before broad enablement; worker release timing is not game-thread blocking. |
 | WATCH-01 / medium | Upstream reports a particle indirect-dispatch hang around shader `2da7fe60`, following `4ca76892`; it explicitly leaves the cause unresolved [4]. | Particle handling; upstream-only, not reproduced here. | If a freeze recurs, preserve last completed work, indirect arguments, shader IDs and device error. Check counters/barriers before considering shader-loop or dispatch changes. |
 | WATCH-02 / medium | The XML contains `Intel Black Tonemap Fix`; upstream reports approximate x86 floating-point differences in game tone mapping [4]. Rosetta relevance is unproven. | Guest CPU color calculations; candidate correctness issue. | Compare matched areas/exposure against a reference before patching. Separate CPU-generated color parameters, sRGB conversions and intentional game lighting. Never treat a darker capture alone as proof. |
+| PORT-07 / high | Direct guest graphics now replaces supported Vulkan draws. Hunter's Dream rendered with at least 34,800 native draws and clean exit, but the synchronous diagnostic averaged 2.61 FPS with fair pressure. Sparse resources still copy/wait per draw. Native PSO first-use compilation is not included in the existing compile counter. | Native submission/resource ownership; performance limitation observed, individual costs not isolated. Async shared-resource draws now pass direct/threaded output/order comparisons; sparse clones stay synchronous. | Keep `BB_METAL_GRAPHICS=1` and `BB_METAL_GRAPHICS_ASYNC=1` opt-in. Use stable GX resource/write information to replace clones, then batch submissions while preserving guest labels and cache lifetimes. Checks do not prove a sustained performance benefit. |
+| PORT-08 / high | A mixed native graphics/texture-compute loading run reached `pm4_cmds.h:492 SignalFence`. SPIR-V capture for graphics had incorrectly activated compute even with `BB_METAL_COMPUTE=0`. The flag bug was fixed; isolated native graphics reached gameplay. | Activation bug fixed; texture-compute output/order or packet fault cause remains unresolved. | Keep native guest compute buffer-only until texture outputs and completion order have a Vulkan comparison. Preserve the failed run, last shaders and packet context. Do not skip the assertion, invent a fence address or signal failed GPU work. |
+| GAME-07 / high | The community debug patch selected an unavailable external shader font branch: context remained null and font drawing wrote through it. Keeping the game's built-in GNM font branch (`0x136D90D`, JE `74`) rendered a readable debug root menu with the supplied literal `adhoc/font/DbgFont14h.ccm` and `.tpf`. | Debug patch/game initialization; branch fixed in `patches/Bloodborne.xml`. Touch contact ID zero also blocked the menu gesture; active IDs now stay nonzero/stable. | Permanent patch/font guards passed 13 tests, booted with native graphics and displayed the readable root categories on the final library in `20261008-151734-673403-debug-menu-font-visual`. The same left-touch also opened the normal gestures panel; this run is UI evidence, not a performance comparison. Never substitute compressed fonts when the guest requests the literal filenames. |
+| GAME-08 / medium | bbhost replaces the guest's flush-completion busy loop at analyzed function `0x15d7030` with pause/yield waiting and counters. Its reported stall was measured on other hardware [6]. | Game CPU scheduling; source reference, not a reproduced local bottleneck. | Verify hash/prologue/slide and sample this wait before adapting it. Preserve submitted/done semantics; measure CPU time, thermals and pacing. A source replacement stays x86-64/Rosetta in the current process. |
+| GAME-09 / high | bbhost records GX draws before PM4 construction and tracks resource creation, map/discard, release, IDs and writes [6]. Our graphics proof still derives draws from canonical Vulkan/decoded state and clones sparse ranges. | Engine-level native construction and persistent resources; candidate architecture work. | Compare one captured GX draw with the decoded path before replacing it. Publish immutable records before stream tokens, preserve chunk refill/fence order and alias/retirement behavior. Its discrete-GPU PCIe mirror savings do not establish a benefit on unified-memory M5. |
 
 ## Souls references and what transfers
 
@@ -70,6 +75,24 @@ target and original gameplay behavior when evaluating optimizations.
    bridge; it does not prove a particular Bloodborne pass is redundant.
    [Apple's implementation guidance](https://developer.apple.com/videos/play/wwdc2022/10103/).
 
+6. **bbhost engine hooks and source rewrites.** The pinned source supplies GX
+   objects/token construction, map/discard/resource tracking, native frame-time
+   source with a guest comparison mode, and a yielding flush wait. Windows/Linux
+   Vulkan support does not supply a macOS/Metal port. Our next adaptations and
+   limits are recorded in [the source comparison](BBHOST_RESEARCH.md), with
+   direct links to the inspected files. No bbhost source was imported.
+
+## Game changes and the later patcher
+
+For every game-side change made during the Metal work, record the region/version,
+original executable/file hash, expected original bytes, address convention and
+slide, exact replacement, dependency/assets, purpose and comparison evidence.
+Use private prepared game copies and preserve the original dump/save. The later
+patcher must identify the supported input, reject unexpected bytes, handle an
+already applied patch, and provide restoration from original data. It is deferred
+until after the Metal work as requested; do not turn unverified optimization
+ideas or third-party address lists into automatic patches.
+
 ## Evidence and evaluation
 
 - Local baseline: [performance investigation](MACOS_PERFORMANCE.md),
@@ -95,6 +118,15 @@ target and original gameplay behavior when evaluating optimizations.
 - Scene MetalFX: `20261006-212923-357699-pre-hud-metalfx`, repeated pre-HUD
   completions, visible Hunter's Dream/HUD and clean exit. Fair pressure flagged
   the 18.2 FPS measurement; reported waits and GPU samples are not a speedup claim.
+- Guest graphics: `20261008-123758-997428-native-graphics-isolated`, native draws,
+  visible Hunter's Dream and clean exit; fair pressure, 2.61 mean window FPS,
+  no isolated performance gain. Mixed failure retained as
+  `20261008-123510-597151-native-graphics-debug-font`.
+- Async shared-resource graphics: `20261008-150755-813709-native-graphics-async-shared`,
+  visible Hunter's Dream, 39,900 native draws, 16,500 async completions, clean
+  exit and unchanged source save. Six windows averaged 4.3 FPS with nominal
+  pressure, 200–316.68 ms medians and worst-window p99 900.01 ms. The different
+  binary/thermals exclude a matched comparison with the synchronous run.
 - Compare the same save, scene/camera and power state; alternate repeated runs.
   Record nominal/fair/serious/critical pressure, compilation and memory activity.
   Thermally flagged runs can verify correctness but do not isolate a speedup.

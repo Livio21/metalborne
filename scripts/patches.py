@@ -45,7 +45,8 @@ def validate_patch_requirements(names, game):
     if 'Restore Debug Camera' in names and 'Enemy Control' in names:
         raise ValueError('Restore Debug Camera conflicts with Enemy Control; enable only one')
     if 'Restore Debug Menu (READ NOTES)' in names:
-        font = game / 'dvdroot_ps4/font'
+        # The patch's literal paths are adhoc:/font/*.ccm and *.tpf, without DCX.
+        font = game / 'dvdroot_ps4/adhoc/font'
         missing = [name for name in ('DbgFont14h.ccm', 'DbgFont14h.tpf')
                    if not (font / name).is_file() or (font / name).stat().st_size == 0]
         if missing:

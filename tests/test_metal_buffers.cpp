@@ -8,6 +8,11 @@
 #include <cstring>
 #include <cmath>
 #include <future>
+#include <filesystem>
+#include <fstream>
+#include <map>
+#include "macos_metal_shader.h"
+#include "shader_recompiler/resource.h"
 #include <vector>
 #include <limits>
 #include "video_core/buffer_cache/buffer.h"
@@ -15,11 +20,44 @@
 #include "video_core/renderer_vulkan/vk_runtime.h"
 #include "video_core/renderer_vulkan/vk_presenter.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
+#include "video_core/renderer_vulkan/vk_shader_util.h"
 #include "video_core/texture_cache/blit_helper.h"
 #include "video_core/texture_cache/image.h"
+#include "metal_draw_vert.h"
+#include "metal_draw_frag.h"
 #include <vulkan/vulkan_format_traits.hpp>
 
 int main(int argc, char** argv) {
+    if (argc == 3 && !std::strcmp(argv[1], "--shaders")) {
+        std::map<uint32_t, std::pair<unsigned, unsigned>> counts;
+        for (const auto& file : std::filesystem::directory_iterator(argv[2])) {
+            if (file.path().extension() != ".spv") continue;
+            std::ifstream input(file.path(), std::ios::binary | std::ios::ate);
+            const auto size = input.tellg();
+            assert(size >= 20 && size <= 16 * 1024 * 1024 && size % 4 == 0);
+            std::vector<uint32_t> code(size / 4);
+            input.seekg(0);
+            assert(input.read(reinterpret_cast<char*>(code.data()), size));
+            BbMetalFX::ShaderFunction shader(code);
+            auto& count = counts[shader.Stage()];
+            bool ready = shader.Available();
+            if (!shader.Available()) std::fprintf(stderr, "Metal shader rejected %s: %.*s\n",
+                file.path().filename().c_str(), int(shader.Error().size()), shader.Error().data());
+            if (ready && shader.Stage() == 5) {
+                BbMetalFX::ComputeKernel kernel(code);
+                ready = kernel.Available();
+                if (!ready) std::fprintf(stderr, "Metal kernel rejected %s: %.*s\n",
+                    file.path().filename().c_str(), int(kernel.Error().size()), kernel.Error().data());
+            }
+            ++(ready ? count.first : count.second);
+        }
+        unsigned total = 0, failed = 0;
+        for (const auto& [stage, count] : counts) {
+            std::printf("Metal shader stage %u: %u compiled, %u rejected\n", stage, count.first, count.second);
+            total += count.first + count.second; failed += count.second;
+        }
+        return total && !failed ? 0 : 1;
+    }
     const bool native = argc == 1 || std::strcmp(argv[1], "--vulkan");
     setenv("BB_METAL_BUFFER_CACHE", native ? "1" : "0", 1);
     setenv("BB_METAL_BUFFER_COPY", native ? "1" : "0", 1);
@@ -76,6 +114,69 @@ int main(int argc, char** argv) {
         assert(!source.buffer.metal && !destination.buffer.metal && !readback.buffer.metal);
     }
     for (size_t i = 0; i < source.SizeBytes(); ++i) source.mapped_data[i] = (i * 37 + 11) & 255;
+    if (argc == 3 && !std::strcmp(argv[1], "--compute")) {
+        std::ifstream input(argv[2], std::ios::binary | std::ios::ate);
+        const auto bytes = input.tellg();
+        assert(bytes >= 20 && bytes <= 16 * 1024 * 1024 && bytes % 4 == 0);
+        std::vector<uint32_t> code(bytes / 4);
+        input.seekg(0);
+        assert(input.read(reinterpret_cast<char*>(code.data()), bytes));
+        BbMetalFX::ComputeKernel kernel(code);
+        assert(kernel.Available());
+        assert((kernel.WorkgroupSize() == std::array<uint32_t, 3>{64, 1, 1}));
+        assert(kernel.Resources().size() == 2);
+        for (uint32_t i = 0; i < 1024; ++i) {
+            const float value = float(i) + 0.25f;
+            std::memcpy(source.mapped_data.data() + i * 4, &value, 4);
+        }
+        Shader::PushData push{};
+        push.ud_regs[0] = 500;
+        push.buf_offsets[0] = 16;
+        push.buf_offsets[1] = 20;
+        const std::array<BbMetalFX::ShaderBinding, 2> bindings{{
+            {BbMetalFX::ShaderResourceKind::Buffer, 0, 0, source.buffer.metal->NativeHandle(), 256, 3000, false},
+            {BbMetalFX::ShaderResourceKind::Buffer, 1, 0, destination.buffer.metal->NativeHandle(), 512, 3000, true}}};
+        const auto push_bytes = std::span{reinterpret_cast<const uint8_t*>(&push), sizeof(push)};
+        auto invalid = bindings;
+        invalid[1].offset = 4096;
+        assert(kernel.Dispatch(invalid, push_bytes, {8, 1, 1}) == BbMetalFX::CommandResult::Unavailable);
+        assert(kernel.Dispatch(bindings, {}, {8, 1, 1}) == BbMetalFX::CommandResult::Unavailable);
+        runtime.FillBuffer(&destination, 0, 4096, 0xa5a5a5a5);
+        const std::array<vk::Buffer, 2> handles{source.Handle(), destination.Handle()};
+        const auto ownership = [&](bool release) {
+            scheduler.Record([handles, family = instance.GetGraphicsQueueFamilyIndex(), release, dispatch](vk::CommandBuffer command) {
+                std::array<vk::BufferMemoryBarrier2, 2> barriers;
+                for (size_t i = 0; i < handles.size(); ++i) barriers[i] = {
+                    .srcStageMask = release ? vk::PipelineStageFlagBits2::eAllCommands : vk::PipelineStageFlagBits2::eNone,
+                    .srcAccessMask = release ? vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite : vk::AccessFlags2{},
+                    .dstStageMask = release ? vk::PipelineStageFlagBits2::eNone : vk::PipelineStageFlagBits2::eAllCommands,
+                    .dstAccessMask = release ? vk::AccessFlags2{} : vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
+                    .srcQueueFamilyIndex = release ? family : VK_QUEUE_FAMILY_EXTERNAL,
+                    .dstQueueFamilyIndex = release ? VK_QUEUE_FAMILY_EXTERNAL : family,
+                    .buffer = handles[i], .offset = 0, .size = VK_WHOLE_SIZE};
+                command.pipelineBarrier2(vk::DependencyInfo{
+                    .bufferMemoryBarrierCount = 2, .pBufferMemoryBarriers = barriers.data()}, dispatch);
+            });
+        };
+        bool retired = false;
+        scheduler.DeferOperation([&] { retired = true; });
+        const auto tick = scheduler.CurrentTick();
+        ownership(true);
+        scheduler.FinishForExternal();
+        assert(!retired && scheduler.CurrentTick() == tick);
+        assert(kernel.Dispatch(bindings, push_bytes, {8, 1, 1}) == BbMetalFX::CommandResult::Complete);
+        ownership(false);
+        const vk::BufferCopy full{0, 0, 4096};
+        runtime.CopyBuffer(&destination, &readback, {&full, 1});
+        scheduler.Finish();
+        scheduler.PopPendingOperations();
+        assert(retired);
+        readback.Invalidate(0, 4096);
+        for (size_t i = 0; i < 4096; ++i)
+            assert(readback.mapped_data[i] == (i >= 532 && i < 2532 ? source.mapped_data[i - 260] : 0xa5));
+        std::printf("Native guest kernel: push/argument offsets, bounded writes, guard bytes and guest completion passed\n");
+        return 0;
+    }
     source.Flush(0, source.SizeBytes());
     std::vector<uint8_t> expected(4096, 0xa5);
     const vk::BufferCopy regions[]{{16, 64, 256}, {512, 1024, 512}, {2048, 3072, 1024}};
@@ -678,8 +779,225 @@ int main(int argc, char** argv) {
     depth_info.pixel_format = vk::Format::eD32Sfloat;
     depth_info.props.is_depth = 1;
     VideoCore::Image depth(instance, runtime, views, depth_info);
-    assert(depth.GetImage() && !depth.backing->image.metal); // Unsupported format keeps VMA ownership.
-    std::puts("PASS: nine color formats, native uploads/downloads, Vulkan reference, padded rows/layers, untouched bytes/pixels, preserved staging tick, rejected copies and depth fallback");
+    assert(depth.GetImage() && bool(depth.backing->image.metal) == native);
+    if (native) {
+        VideoCore::ImageInfo texture_info{};
+        texture_info.type = AmdGpu::ImageType::Color2D;
+        texture_info.pixel_format = vk::Format::eR8G8B8A8Unorm;
+        texture_info.size = {8, 8, 1}; texture_info.resources = {3, 2};
+        VideoCore::Image texture(instance, runtime, views, texture_info);
+        VideoCore::ImageInfo output_info{};
+        output_info.type = AmdGpu::ImageType::Color2D;
+        output_info.pixel_format = vk::Format::eR8G8B8A8Unorm; output_info.size = {32, 32, 1};
+        VideoCore::Image output(instance, runtime, views, output_info), reference(instance, runtime, views, output_info);
+        depth_info.size = {32, 32, 1};
+        VideoCore::Image target_depth(instance, runtime, views, depth_info);
+        VideoCore::ImageViewInfo sampled_info;
+        sampled_info.range = {{1, 1}, {2, 1}};
+        sampled_info.mapping = {vk::ComponentSwizzle::eB, vk::ComponentSwizzle::eR, vk::ComponentSwizzle::eG, vk::ComponentSwizzle::eOne};
+        VideoCore::ImageView sampled_view(instance, sampled_info, texture);
+        VideoCore::ImageViewInfo target_info;
+        target_info.range = {{0, 0}, {1, 1}};
+        VideoCore::ImageView output_view(instance, target_info, output), reference_view(instance, target_info, reference);
+        target_info.format = vk::Format::eD32Sfloat;
+        VideoCore::ImageView depth_view(instance, target_info, target_depth);
+        assert(BbMetalFX::FindNativeImageView(*sampled_view.image_view).sampled);
+        assert(BbMetalFX::FindNativeImageView(*output_view.image_view).attachment);
+        assert(BbMetalFX::FindNativeImageView(*depth_view.image_view).attachment);
+        const vk::SamplerCreateInfo sampler_ci{.magFilter = vk::Filter::eNearest, .minFilter = vk::Filter::eNearest,
+            .mipmapMode = vk::SamplerMipmapMode::eNearest, .addressModeU = vk::SamplerAddressMode::eClampToEdge,
+            .addressModeV = vk::SamplerAddressMode::eClampToEdge, .addressModeW = vk::SamplerAddressMode::eClampToEdge,
+            .mipLodBias = 0.25f, .maxLod = 1};
+        auto sampler = Vulkan::Check(instance.GetDevice().createSamplerUnique(sampler_ci, nullptr, dispatch));
+        BbMetalFX::Sampler native_sampler(*sampler, static_cast<VkSamplerCreateInfo>(sampler_ci));
+        assert(BbMetalFX::FindNativeSampler(*sampler));
+        Buffer upload(instance, 0, 1024, MemoryType::HostUncached), actual(instance, 0, 4096, MemoryType::HostCached),
+            expected(instance, 0, 4096, MemoryType::HostCached), vertex_data(instance, 0, 512, MemoryType::HostUncached),
+            index_data(instance, 0, 64, MemoryType::HostUncached);
+        std::vector<vk::BufferImageCopy> regions;
+        u64 offset = 0;
+        for (u32 mip = 0; mip < 3; ++mip) {
+            const u32 side = 8 >> mip;
+            regions.push_back({.bufferOffset = offset, .imageSubresource = {vk::ImageAspectFlagBits::eColor, mip, 0, 2},
+                .imageExtent = {side, side, 1}});
+            for (u32 layer = 0; layer < 2; ++layer) for (u32 y = 0; y < side; ++y) for (u32 x = 0; x < side; ++x) {
+                auto* pixel = upload.mapped_data.data() + offset + ((layer * side + y) * side + x) * 4;
+                pixel[0] = 35 + mip * 40 + x * 6; pixel[1] = 70 + layer * 50 + y * 7; pixel[2] = 220 - x * 10; pixel[3] = 255;
+            }
+            offset += side * side * 4 * 2;
+        }
+        upload.Flush(0, offset);
+        runtime.UploadImage(&texture, &upload, regions);
+        const std::array<std::array<float, 4>, 5> points{{{99, 99, .5f, 1}, {-1, -1, .5f, 1}, {1, -1, .5f, 1},
+            {1, 1, .5f, 1}, {-1, 1, .5f, 1}}};
+        std::memcpy(vertex_data.mapped_data.data(), points.data(), sizeof(points)); vertex_data.Flush(0, 512);
+        const u16 indices[]{0xffff, 0xffff, 0, 1, 2, 2, 3, 0};
+        std::memcpy(index_data.mapped_data.data(), indices, sizeof(indices)); index_data.Flush(0, 64);
+        const vk::DescriptorSetLayoutBinding descriptor_bindings[]{
+            {.binding = 0, .descriptorType = vk::DescriptorType::eSampledImage, .descriptorCount = 1, .stageFlags = vk::ShaderStageFlagBits::eFragment},
+            {.binding = 1, .descriptorType = vk::DescriptorType::eSampler, .descriptorCount = 1, .stageFlags = vk::ShaderStageFlagBits::eFragment}};
+        auto descriptor_layout = Vulkan::Check(instance.GetDevice().createDescriptorSetLayoutUnique({
+            .flags = vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR, .bindingCount = 2, .pBindings = descriptor_bindings}, nullptr, dispatch));
+        const vk::PushConstantRange push_range{vk::ShaderStageFlagBits::eFragment, 0, 16};
+        const vk::DescriptorSetLayout set_layout = *descriptor_layout;
+        auto layout = Vulkan::Check(instance.GetDevice().createPipelineLayoutUnique({.setLayoutCount = 1, .pSetLayouts = &set_layout,
+            .pushConstantRangeCount = 1, .pPushConstantRanges = &push_range}, nullptr, dispatch));
+        const auto vs = Vulkan::CompileSPV(METAL_DRAW_VERT, instance.GetDevice()), fs = Vulkan::CompileSPV(METAL_DRAW_FRAG, instance.GetDevice());
+        const vk::PipelineShaderStageCreateInfo stages[]{
+            {.stage = vk::ShaderStageFlagBits::eVertex, .module = vs, .pName = "main"},
+            {.stage = vk::ShaderStageFlagBits::eFragment, .module = fs, .pName = "main"}};
+        const vk::Format color_format = output_info.pixel_format;
+        const vk::PipelineRenderingCreateInfo rendering{.colorAttachmentCount = 1, .pColorAttachmentFormats = &color_format,
+            .depthAttachmentFormat = vk::Format::eD32Sfloat};
+        const vk::VertexInputBindingDescription vertex_binding{0, 16, vk::VertexInputRate::eVertex};
+        const vk::VertexInputAttributeDescription attribute{0, 0, vk::Format::eR32G32B32Sfloat, 0};
+        const vk::PipelineVertexInputStateCreateInfo vertex_input{.vertexBindingDescriptionCount = 1, .pVertexBindingDescriptions = &vertex_binding,
+            .vertexAttributeDescriptionCount = 1, .pVertexAttributeDescriptions = &attribute};
+        const vk::PipelineInputAssemblyStateCreateInfo assembly{.topology = vk::PrimitiveTopology::eTriangleList};
+        const vk::PipelineRasterizationStateCreateInfo raster{.polygonMode = vk::PolygonMode::eFill, .frontFace = vk::FrontFace::eCounterClockwise, .lineWidth = 1};
+        const vk::PipelineViewportStateCreateInfo viewport_info{.viewportCount = 1, .scissorCount = 1};
+        const vk::PipelineMultisampleStateCreateInfo samples{.rasterizationSamples = vk::SampleCountFlagBits::e1};
+        const auto mask = vk::ColorComponentFlagBits::eR | vk::ColorComponentFlagBits::eB | vk::ColorComponentFlagBits::eA;
+        const vk::PipelineColorBlendAttachmentState blend{.blendEnable = true, .srcColorBlendFactor = vk::BlendFactor::eSrcAlpha,
+            .dstColorBlendFactor = vk::BlendFactor::eOneMinusSrcAlpha, .colorBlendOp = vk::BlendOp::eAdd,
+            .srcAlphaBlendFactor = vk::BlendFactor::eOne, .dstAlphaBlendFactor = vk::BlendFactor::eZero,
+            .alphaBlendOp = vk::BlendOp::eAdd, .colorWriteMask = mask};
+        const vk::PipelineColorBlendStateCreateInfo blending{.attachmentCount = 1, .pAttachments = &blend};
+        const vk::PipelineDepthStencilStateCreateInfo depth_state{.depthTestEnable = true, .depthWriteEnable = true, .depthCompareOp = vk::CompareOp::eLess};
+        const vk::DynamicState dynamic_items[]{vk::DynamicState::eViewport, vk::DynamicState::eScissor};
+        const vk::PipelineDynamicStateCreateInfo dynamic_ci{.dynamicStateCount = 2, .pDynamicStates = dynamic_items};
+        const vk::GraphicsPipelineCreateInfo pipeline_info{.pNext = &rendering, .stageCount = 2, .pStages = stages,
+            .pVertexInputState = &vertex_input, .pInputAssemblyState = &assembly, .pViewportState = &viewport_info,
+            .pRasterizationState = &raster, .pMultisampleState = &samples, .pDepthStencilState = &depth_state,
+            .pColorBlendState = &blending, .pDynamicState = &dynamic_ci, .layout = *layout};
+        auto vk_pipeline = Vulkan::Check(instance.GetDevice().createGraphicsPipelineUnique({}, pipeline_info, nullptr, dispatch));
+        BbMetalFX::RenderPipeline metal_pipeline(METAL_DRAW_VERT, METAL_DRAW_FRAG, static_cast<VkGraphicsPipelineCreateInfo>(pipeline_info));
+        assert(metal_pipeline.Available());
+        Vulkan::DynamicState dynamic;
+        dynamic.viewports.push_back({4, 5, 16, 14, 0, 1}); dynamic.scissors.push_back({{7, 8}, {10, 9}});
+        dynamic.line_width = 1; dynamic.front_face = raster.frontFace; dynamic.color_write_masks[0] = mask;
+        dynamic.depth_test_enabled = true; dynamic.depth_write_enabled = true; dynamic.depth_compare_op = vk::CompareOp::eLess;
+        Vulkan::RenderState state{};
+        state.width = state.height = 32; state.num_layers = state.num_color_attachments = 1;
+        state.color_attachments[0].image_view = *output_view.image_view;
+        state.color_attachments[0].image_layout = vk::ImageLayout::eGeneral; state.color_attachments[0].is_clear = true;
+        const std::array<float, 4> clear{.05f, .1f, .2f, 1};
+        std::memcpy(state.color_attachments[0].clear_value.data(), clear.data(), sizeof(clear));
+        state.depth_stencil_attachment.image_view = *depth_view.image_view; state.depth_stencil_attachment.image_layout = vk::ImageLayout::eGeneral;
+        state.depth_stencil_attachment.has_depth = state.depth_stencil_attachment.depth_clear = true;
+        state.depth_stencil_attachment.clear_value[0] = std::bit_cast<u32>(1.f);
+        const std::array<float, 4> tint{1, .5f, .25f, .75f};
+        const std::span<const u8> push{reinterpret_cast<const u8*>(tint.data()), sizeof(tint)};
+        const BbMetalFX::ShaderBinding shader_bindings[]{
+            {BbMetalFX::ShaderResourceKind::Texture, 0, 0, BbMetalFX::FindNativeImageView(*sampled_view.image_view).sampled, 0, 0, false},
+            {BbMetalFX::ShaderResourceKind::Sampler, 1, 0, BbMetalFX::FindNativeSampler(*sampler), 0, 0, false}};
+        const VkVertexInputAttributeDescription2EXT native_attribute{.sType = VK_STRUCTURE_TYPE_VERTEX_INPUT_ATTRIBUTE_DESCRIPTION_2_EXT,
+            .location = 0, .binding = 0, .format = VK_FORMAT_R32G32B32_SFLOAT, .offset = 0};
+        BbMetalFX::VertexBufferBinding native_vertex{{.sType = VK_STRUCTURE_TYPE_VERTEX_INPUT_BINDING_DESCRIPTION_2_EXT,
+            .binding = 0, .stride = 16, .inputRate = VK_VERTEX_INPUT_RATE_VERTEX, .divisor = 1},
+            vertex_data.buffer.metal->NativeHandle(), 0, 512};
+        const BbMetalFX::DrawCommand draw{6, 1, 0, 1, index_data.buffer.metal->NativeHandle(), 4, VK_INDEX_TYPE_UINT16};
+        assert(metal_pipeline.Draw(state, dynamic, {&native_attribute, 1}, {&native_vertex, 1}, shader_bindings, {}, draw) == BbMetalFX::CommandResult::Unavailable);
+        const auto ownership = [&](bool release, Vulkan::SubmitInfo* external = nullptr, u64 value = 0) {
+            std::vector<vk::ImageMemoryBarrier2> images;
+            for (auto* image : {&texture, &output, &target_depth}) {
+                if (release) runtime.Transit(image, vk::ImageLayout::eGeneral, vk::PipelineStageFlagBits2::eAllCommands,
+                    vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite);
+                images.push_back({.srcStageMask = release ? vk::PipelineStageFlagBits2::eAllCommands : vk::PipelineStageFlagBits2::eNone,
+                    .srcAccessMask = release ? vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite : vk::AccessFlags2{},
+                    .dstStageMask = release ? vk::PipelineStageFlagBits2::eNone : vk::PipelineStageFlagBits2::eAllCommands,
+                    .dstAccessMask = release ? vk::AccessFlags2{} : vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
+                    .oldLayout = vk::ImageLayout::eGeneral, .newLayout = vk::ImageLayout::eGeneral,
+                    .srcQueueFamilyIndex = release ? instance.GetGraphicsQueueFamilyIndex() : VK_QUEUE_FAMILY_EXTERNAL,
+                    .dstQueueFamilyIndex = release ? VK_QUEUE_FAMILY_EXTERNAL : instance.GetGraphicsQueueFamilyIndex(),
+                    .image = image->GetImage(), .subresourceRange = {image->aspect_mask, 0, image->info.resources.levels, 0, image->info.resources.layers}});
+            }
+            runtime.FlushBarriers();
+            scheduler.Record([images, &dispatch](vk::CommandBuffer command) {
+                command.pipelineBarrier2(vk::DependencyInfo{.imageMemoryBarrierCount = u32(images.size()), .pImageMemoryBarriers = images.data()}, dispatch);
+            });
+            if (external && release) scheduler.FlushForExternal(*external, value);
+            else if (!external) scheduler.FinishForExternal();
+        };
+        ownership(true);
+        const auto drawn = metal_pipeline.Draw(state, dynamic, {&native_attribute, 1}, {&native_vertex, 1}, shader_bindings, push, draw);
+        if (drawn != BbMetalFX::CommandResult::Complete) std::fprintf(stderr, "native graphics unavailable: %.*s\n", int(metal_pipeline.Error().size()), metal_pipeline.Error().data());
+        assert(drawn == BbMetalFX::CommandResult::Complete);
+        ownership(false);
+        const vk::BufferImageCopy whole{.imageSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1}, .imageExtent = {32, 32, 1}};
+        runtime.DownloadImage(&output, &actual, {&whole, 1});
+        runtime.Transit(&reference, vk::ImageLayout::eGeneral, vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite);
+        runtime.Transit(&target_depth, vk::ImageLayout::eGeneral, vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite);
+        runtime.FlushBarriers();
+        state.color_attachments[0].image_view = *reference_view.image_view;
+        scheduler.BeginRendering(state);
+        scheduler.Record([&](vk::CommandBuffer command) {
+            command.bindPipeline(vk::PipelineBindPoint::eGraphics, *vk_pipeline, dispatch);
+            command.setViewport(0, dynamic.viewports, dispatch); command.setScissor(0, dynamic.scissors, dispatch);
+            const vk::Buffer vertex = vertex_data.Handle(); const vk::DeviceSize offset = 0;
+            command.bindVertexBuffers(0, 1, &vertex, &offset, dispatch);
+            command.bindIndexBuffer(index_data.Handle(), 4, vk::IndexType::eUint16, dispatch);
+            const vk::DescriptorImageInfo image_info{{}, *sampled_view.image_view, vk::ImageLayout::eGeneral}, sampler_info{*sampler, {}, vk::ImageLayout::eUndefined};
+            const vk::WriteDescriptorSet writes[]{
+                {.dstBinding = 0, .descriptorCount = 1, .descriptorType = vk::DescriptorType::eSampledImage, .pImageInfo = &image_info},
+                {.dstBinding = 1, .descriptorCount = 1, .descriptorType = vk::DescriptorType::eSampler, .pImageInfo = &sampler_info}};
+            command.pushDescriptorSetKHR(vk::PipelineBindPoint::eGraphics, *layout, 0, writes, dispatch);
+            command.pushConstants(*layout, vk::ShaderStageFlagBits::eFragment, 0, 16, tint.data(), dispatch);
+            command.drawIndexed(6, 1, 0, 1, 0, dispatch);
+        });
+        scheduler.EndRendering();
+        runtime.DownloadImage(&reference, &expected, {&whole, 1}); scheduler.Finish();
+        actual.Invalidate(0, 4096); expected.Invalidate(0, 4096);
+        unsigned differences = 0;
+        for (u32 i = 0; i < 4096; ++i) {
+            const int delta = std::abs(int(actual.mapped_data[i])-int(expected.mapped_data[i]));
+            if (delta > 1 && differences++ < 8) std::fprintf(stderr, "native graphics mismatch byte %u: %u versus %u\n", i, actual.mapped_data[i], expected.mapped_data[i]);
+        }
+        assert(!differences);
+        assert(actual.mapped_data[10 * 32 * 4 + 10 * 4] != actual.mapped_data[0]); // The scissored draw actually wrote pixels.
+        for (size_t i = 0; i < points.size(); ++i) std::memcpy(vertex_data.mapped_data.data() + i * 32, points[i].data(), 16);
+        vertex_data.Flush(0, 512); native_vertex.input.stride = 32;
+        state.color_attachments[0].image_view = *output_view.image_view;
+        ownership(true);
+        assert(metal_pipeline.Draw(state, dynamic, {&native_attribute, 1}, {&native_vertex, 1}, shader_bindings, push, draw) == BbMetalFX::CommandResult::Complete);
+        ownership(false);
+        runtime.DownloadImage(&output, &actual, {&whole, 1}); scheduler.Finish(); actual.Invalidate(0, 4096);
+        for (u32 i = 0; i < 4096; ++i) assert(std::abs(int(actual.mapped_data[i])-int(expected.mapped_data[i])) <= 1);
+        std::atomic<unsigned> completed{0};
+        bool retired = false;
+        const auto tick = scheduler.CurrentTick();
+        scheduler.DeferOperation([&] { retired = true; });
+        scheduler.ExternalSemaphore();
+        u64 previous_value = 0;
+        for (unsigned i = 0; i < 2; ++i) {
+            std::function<bool(float*)> work;
+            assert(metal_pipeline.Draw(state, dynamic, {&native_attribute, 1}, {&native_vertex, 1}, shader_bindings,
+                push, draw, nullptr, &work) == BbMetalFX::CommandResult::Prepared);
+            assert(work);
+            const auto value = scheduler.NextExternalValue();
+            assert(value > previous_value);
+            previous_value = value;
+            auto fence = std::make_shared<vk::UniqueFence>(Vulkan::Check(instance.GetDevice().createFenceUnique({}, nullptr, dispatch)));
+            Vulkan::SubmitInfo release{};
+            release.fence = **fence;
+            ownership(true, &release, value);
+            scheduler.EnqueueExternal(std::move(fence), value, [work = std::move(work), &completed] {
+                if (!work(nullptr)) return false;
+                completed.fetch_add(1, std::memory_order_release);
+                return true;
+            });
+            ownership(false, &release, value); // Only record the acquire; Vulkan waits on the native completion.
+            assert(scheduler.CurrentTick() == tick);
+            assert(!retired);
+        }
+        runtime.DownloadImage(&output, &actual, {&whole, 1}); scheduler.Finish(); scheduler.PopPendingOperations();
+        assert(completed.load(std::memory_order_acquire) == 2 && retired);
+        actual.Invalidate(0, 4096);
+        for (u32 i = 0; i < 4096; ++i) assert(std::abs(int(actual.mapped_data[i])-int(expected.mapped_data[i])) <= 1);
+        instance.GetDevice().destroyShaderModule(vs, nullptr, dispatch); instance.GetDevice().destroyShaderModule(fs, nullptr, dispatch);
+        std::puts("PASS: native indexed textured graphics versus Vulkan, mip/layer/swizzle views, sampler LOD bias, base vertex/index offset, dynamic stride, blend/channel mask, depth, viewport/scissor, untouched pixels and ordered async completion preserving the guest tick");
+    }
+    std::puts("PASS: nine color formats, native uploads/downloads, Vulkan reference, padded rows/layers, untouched bytes/pixels, preserved staging tick, rejected copies and shared depth allocation");
     std::puts(native ? "PASS: shared cache ownership, BDA, moves, 128 MiB stream, native copies, untouched bytes, preserved staging tick and callbacks" :
                       "PASS: original Vulkan allocation and copy fallback");
 }

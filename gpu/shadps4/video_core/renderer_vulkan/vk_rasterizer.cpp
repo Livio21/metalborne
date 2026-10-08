@@ -116,7 +116,16 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
     });
 }
 
-Rasterizer::~Rasterizer() = default;
+Rasterizer::~Rasterizer() {
+#ifdef __APPLE__
+    draw_pipe.reset();
+    if (metal_async_issued) {
+        scheduler.Finish();
+        scheduler.PopPendingOperations();
+        scheduler.SetSubmitCallback({});
+    }
+#endif
+}
 
 inline const AmdGpu::Regs& Rasterizer::Regs() const {
     return stage_regs ? *stage_regs : liverpool->regs;
@@ -1131,7 +1140,19 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
     }
     UpdateDynamicState(pipeline, is_indexed);
     MarkPass(pipeline, state);
-    scheduler.BeginRendering(state);
+    bool native_draw = false;
+#ifdef __APPLE__
+    if (pipeline->metal_pipeline && pipeline->metal_pipeline->Available()) {
+        native_draw = ExecuteMetal(pipeline, {}, &state, is_indexed);
+        if (!native_draw) {
+            // An attempted native command may have submitted the current Vulkan buffer.
+            EmitVertexBuffers();
+            if (is_indexed) EmitIndexBuffer();
+            pipeline->BindResources(set_writes, push_data);
+            UpdateDynamicState(pipeline, is_indexed);
+        }
+    }
+#endif
 
     const auto& vs_info = pipeline->GetStage(Shader::SwStage::Vertex);
     const auto& fetch_shader = pipeline->GetFetchShader();
@@ -1142,14 +1163,17 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
     const u32 num_instances = regs.num_instances.NumInstances();
     const u32 first_vertex = vertex_offset;
     const u32 first_instance = instance_offset;
-    scheduler.Record([=](vk::CommandBuffer cmdbuf) {
+    if (!native_draw) {
+        scheduler.BeginRendering(state);
+        scheduler.Record([=](vk::CommandBuffer cmdbuf) {
         cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, handle);
         if (is_indexed) {
             cmdbuf.drawIndexed(num_indices, num_instances, 0, s32(first_vertex), first_instance);
         } else {
             cmdbuf.draw(num_indices, num_instances, first_vertex, first_instance);
         }
-    });
+        });
+    }
     if (FrameCapture::Active()) {
         const auto* ps = pipeline->GetStages()[u32(Shader::SwStage::Fragment)];
         FrameCapture::Draw(vs_info.pgm_hash, ps ? ps->pgm_hash : 0, num_indices, num_instances);
@@ -1307,6 +1331,348 @@ void Rasterizer::DispatchDirect() {
     DispatchRecord(pipeline);
 }
 
+#ifdef __APPLE__
+bool Rasterizer::DispatchMetal(const ComputePipeline* pipeline, std::array<u32, 3> groups) {
+    return ExecuteMetal(pipeline, groups);
+}
+
+bool Rasterizer::ExecuteMetal(const Pipeline* pipeline, std::array<u32, 3> groups,
+                             const RenderState* render, bool indexed) {
+    const auto* graphics = render ? static_cast<const GraphicsPipeline*>(pipeline) : nullptr;
+    const auto* kernel = render ? nullptr : static_cast<const ComputePipeline*>(pipeline)->metal_kernel.get();
+    const auto* native_draw = graphics ? graphics->metal_pipeline.get() : nullptr;
+    if (render ? !native_draw || !native_draw->Available() : !kernel || !kernel->Available()) return false;
+    for (const auto* stage : pipeline->GetStages()) if (stage && stage->uses_dma) return false;
+    if (!render) {
+        const auto& cs = pipeline->GetStage(Shader::SwStage::Compute);
+        // Texture compute reached a command-stream fault during loading; retain Vulkan until its outputs are compared.
+        if (!cs.images.empty() || !cs.samplers.empty()) return false;
+        const auto& program = CsRegs();
+        if (kernel->WorkgroupSize() != std::array<u32, 3>{program.num_thread_x.full,
+                program.num_thread_y.full, program.num_thread_z.full}) return false;
+    }
+    struct Input {
+        vk::DescriptorBufferInfo descriptor;
+        u64 guest;
+        size_t binding;
+    };
+    struct Clone {
+        u64 begin, end;
+        std::vector<Input> inputs;
+        std::shared_ptr<BbMetalFX::SharedBuffer> buffer;
+    };
+    struct Copy {
+        vk::Buffer source, destination;
+        vk::BufferCopy region;
+    };
+    std::vector<BbMetalFX::ShaderBinding> bindings;
+    std::vector<Input> inputs;
+    std::vector<vk::Buffer> shared;
+    const auto share = [&](vk::Buffer buffer) {
+        if (std::find(shared.begin(), shared.end(), buffer) == shared.end()) shared.push_back(buffer);
+    };
+    struct ImageOwner {
+        VideoCore::Image* image;
+        std::vector<std::pair<u32, u32>> subresources;
+    };
+    std::vector<ImageOwner> images;
+    const auto image_view = [&](vk::ImageView handle, bool attachment) {
+        const auto view = BbMetalFX::FindNativeImageView(handle);
+        if (!view.image || (attachment ? !view.attachment : !view.sampled && !view.storage)) return false;
+        auto owner = std::find_if(images.begin(), images.end(), [&](const auto& entry) { return entry.image->GetImage() == view.image; });
+        if (owner == images.end()) {
+            VideoCore::Image* image = nullptr;
+            const auto find = [&](VideoCore::ImageId id) {
+                if (id && texture_cache.GetImage(id).GetImage() == view.image) image = &texture_cache.GetImage(id);
+            };
+            for (const auto id : bound_images) find(id);
+            for (const auto& target : cb_descs) find(target.first);
+            find(db_desc.first);
+            if (!image) return false;
+            images.push_back({image, {}}); owner = images.end()-1;
+        }
+        const u32 levels = attachment ? 1 : view.range.levelCount;
+        const u32 layers = attachment ? render->num_layers : view.range.layerCount;
+        for (u32 mip = view.range.baseMipLevel; mip < view.range.baseMipLevel + levels; ++mip)
+            for (u32 layer = view.range.baseArrayLayer; layer < view.range.baseArrayLayer + layers; ++layer) {
+                const auto subresource = std::pair{mip, layer};
+                if (std::find(owner->subresources.begin(), owner->subresources.end(), subresource) == owner->subresources.end())
+                    owner->subresources.push_back(subresource);
+            }
+        return true;
+    };
+    const auto buffer_binding = [&](vk::DescriptorBufferInfo descriptor, u32 number, bool written, u64 guest = 0) {
+        if (!descriptor.buffer || !descriptor.range || descriptor.range > 512 * 1024 * 1024) return false;
+        const auto binding = bindings.size();
+        bindings.push_back({BbMetalFX::ShaderResourceKind::Buffer, number, 0,
+            BbMetalFX::FindNativeBuffer(descriptor.buffer), descriptor.offset, descriptor.range, written});
+        if (bindings.back().native) { share(descriptor.buffer); return true; }
+        if (!guest) {
+            const auto found = std::find_if(bound_buffers.begin(), bound_buffers.end(), [&](const auto& bound) {
+                return bound.buffer->Handle() == descriptor.buffer && bound.buffer->mem_type == VideoCore::MemoryType::Sparse &&
+                    descriptor.offset <= bound.buffer->SizeBytes() && descriptor.range <= bound.buffer->SizeBytes() - descriptor.offset;
+            });
+            if (found == bound_buffers.end()) return false;
+            guest = found->buffer->cpu_addr + descriptor.offset;
+        }
+        if (guest > UINT64_MAX - descriptor.range) return false;
+        inputs.push_back({descriptor, guest, binding});
+        return true;
+    };
+    std::vector<BbMetalFX::ShaderResource> resources;
+    const auto add_resources = [&](auto list) {
+        for (const auto& resource : list) if (std::none_of(resources.begin(), resources.end(), [&](const auto& previous) {
+            return previous.kind == resource.kind && previous.binding == resource.binding && previous.count == resource.count;
+        })) resources.push_back(resource);
+    };
+    if (render) { add_resources(native_draw->Resources(0)); add_resources(native_draw->Resources(4)); }
+    else add_resources(kernel->Resources());
+    for (const auto& resource : resources) {
+        const auto found = std::find_if(set_writes.begin(), set_writes.end(), [&](const auto& write) { return write.dstBinding == resource.binding; });
+        if (found == set_writes.end() || found->descriptorCount < resource.count) return false;
+        for (u32 element = 0; element < resource.count; ++element) {
+            if (resource.kind == BbMetalFX::ShaderResourceKind::Buffer) {
+                if (!found->pBufferInfo || resource.count != 1) return false;
+                const auto descriptor = found->pBufferInfo[element];
+                const bool written = std::any_of(bound_buffers.begin(), bound_buffers.end(), [&](const auto& bound) {
+                    return bound.is_written && bound.buffer->Handle() == descriptor.buffer &&
+                        bound.offset < descriptor.offset + descriptor.range && descriptor.offset < bound.offset + bound.size;
+                });
+                if (!buffer_binding(descriptor, resource.binding, written)) return false;
+            } else {
+                if (!found->pImageInfo) return false;
+                const auto descriptor = found->pImageInfo[element];
+                void* native = nullptr;
+                const bool written = found->descriptorType == vk::DescriptorType::eStorageImage;
+                if (resource.kind == BbMetalFX::ShaderResourceKind::Sampler) native = BbMetalFX::FindNativeSampler(descriptor.sampler);
+                else {
+                    if (!image_view(descriptor.imageView, false)) return false;
+                    const auto view = BbMetalFX::FindNativeImageView(descriptor.imageView);
+                    native = written ? view.storage : view.sampled;
+                    if (render) {
+                        for (u32 i = 0; i < render->num_color_attachments; ++i)
+                            if (view.image == BbMetalFX::FindNativeImageView(render->color_attachments[i].image_view).image) return false;
+                        if (view.image == BbMetalFX::FindNativeImageView(render->depth_stencil_attachment.image_view).image) return false;
+                    }
+                }
+                if (!native) return false;
+                bindings.push_back({resource.kind, resource.binding, element, native, 0, 0, written});
+            }
+        }
+    }
+    std::vector<size_t> vertex_indices;
+    size_t index_binding = SIZE_MAX;
+    if (render) {
+        for (u32 i = 0; i < render->num_color_attachments; ++i)
+            if (render->color_attachments[i].image_view && !image_view(render->color_attachments[i].image_view, true)) return false;
+        if (render->depth_stencil_attachment.image_view && !image_view(render->depth_stencil_attachment.image_view, true)) return false;
+        for (u32 i = 0; i < vertex_binds.num_buffers; ++i) {
+            vertex_indices.push_back(bindings.size());
+            if (!buffer_binding({vertex_binds.host_buffers[i], vertex_binds.host_offsets[i], vertex_binds.host_sizes[i]},
+                    UINT32_MAX-i, false, vertex_binds.host_guests[i])) return false;
+        }
+        if (indexed) {
+            index_binding = bindings.size();
+            const u64 bytes = u64(Regs().num_indices) * (index_bind.type == vk::IndexType::eUint16 ? 2 : 4);
+            if (!buffer_binding({index_bind.handle, index_bind.offset, bytes}, UINT32_MAX-32, false, index_bind.guest)) return false;
+        }
+    }
+    std::vector<vk::ImageMemoryBarrier2> image_barriers;
+    for (const auto& owner : images) {
+        auto& image = *owner.image;
+        for (const auto [mip, layer] : owner.subresources) {
+            const auto& states = image.backing->subresource_states;
+            const auto layout = states.empty() ? image.backing->state.layout : states[mip * image.info.resources.layers + layer].layout;
+            if (layout == vk::ImageLayout::eUndefined) return false;
+            image_barriers.push_back({.oldLayout = layout, .newLayout = vk::ImageLayout::eGeneral,
+                .image = image.GetImage(), .subresourceRange = {image.aspect_mask, mip, 1, layer, 1}});
+        }
+    }
+    std::sort(inputs.begin(), inputs.end(), [](const auto& a, const auto& b) { return a.guest < b.guest; });
+    std::vector<Clone> clones;
+    // Preserve aliases even when GetArena merged two logical arenas after an earlier bind.
+    for (const auto& input : inputs) {
+        if (clones.empty() || input.guest > clones.back().end)
+            clones.push_back({input.guest, input.guest + input.descriptor.range, {}, {}});
+        auto& clone = clones.back();
+        clone.end = std::max<u64>(clone.end, input.guest + input.descriptor.range);
+        clone.inputs.push_back(input);
+    }
+    std::vector<Copy> uploads, downloads;
+    if (metal_clone_pool.size() < clones.size()) metal_clone_pool.resize(clones.size());
+    u64 retained = 0;
+    for (size_t i = 0; i < metal_clone_pool.size(); ++i)
+        retained += std::max(metal_clone_pool[i].first, i < clones.size() ? clones[i].end - clones[i].begin : u64{0});
+    if (retained > 512 * 1024 * 1024) {
+        metal_clone_pool.clear();
+        metal_clone_pool.resize(clones.size());
+    }
+    u64 total_cloned = 0;
+    for (size_t slot = 0; slot < clones.size(); ++slot) {
+        auto& clone = clones[slot];
+        const u64 size = clone.end - clone.begin;
+        total_cloned += size;
+        if (total_cloned > 512 * 1024 * 1024) return false;
+        auto& cached = metal_clone_pool[slot];
+        if (!cached.second || cached.first < size) {
+            cached = {size, std::make_shared<BbMetalFX::SharedBuffer>(instance.GetDevice(),
+                static_cast<VkPhysicalDeviceMemoryProperties>(instance.GetMemoryProperties()), size,
+                VULKAN_HPP_DEFAULT_DISPATCHER.vkGetDeviceProcAddr)};
+        }
+        clone.buffer = cached.second;
+        if (!clone.buffer->Handle()) return false;
+        share(clone.buffer->Handle());
+        std::vector<u64> points;
+        for (const auto& input : clone.inputs) {
+            auto& binding = bindings[input.binding];
+            binding.native = clone.buffer->NativeHandle();
+            binding.offset = input.guest - clone.begin;
+            points.push_back(input.guest);
+            points.push_back(input.guest + input.descriptor.range);
+        }
+        std::sort(points.begin(), points.end());
+        points.erase(std::unique(points.begin(), points.end()), points.end());
+        for (size_t i = 1; i < points.size(); ++i) {
+            const auto first = points[i - 1], last = points[i];
+            const Input* source = nullptr;
+            const Input* written = nullptr;
+            for (const auto& input : clone.inputs) {
+                if (input.guest <= first && input.guest + input.descriptor.range >= last) {
+                    if (!source) source = &input;
+                    if (bindings[input.binding].written) written = &input;
+                }
+            }
+            if (!source) return false;
+            uploads.push_back({source->descriptor.buffer, clone.buffer->Handle(),
+                {source->descriptor.offset + first - source->guest, first - clone.begin, last - first}});
+            if (written) downloads.push_back({clone.buffer->Handle(), written->descriptor.buffer,
+                {first - clone.begin, written->descriptor.offset + first - written->guest, last - first}});
+        }
+    }
+    const u32 family = instance.GetGraphicsQueueFamilyIndex();
+    const auto ownership = [&](bool release, std::vector<Copy> copies) {
+        scheduler.Record([shared, image_barriers, family, release, copies = std::move(copies)](vk::CommandBuffer command) {
+            const vk::MemoryBarrier2 before{
+                .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+                .srcAccessMask = vk::AccessFlagBits2::eMemoryWrite,
+                .dstStageMask = vk::PipelineStageFlagBits2::eCopy,
+                .dstAccessMask = vk::AccessFlagBits2::eTransferRead | vk::AccessFlagBits2::eTransferWrite,
+            };
+            if (release && !copies.empty()) {
+                command.pipelineBarrier2(vk::DependencyInfo{.memoryBarrierCount = 1, .pMemoryBarriers = &before});
+                for (const auto& copy : copies) command.copyBuffer(copy.source, copy.destination, copy.region);
+            }
+            std::vector<vk::BufferMemoryBarrier2> barriers;
+            for (const auto buffer : shared) barriers.push_back({
+                .srcStageMask = release ? vk::PipelineStageFlagBits2::eAllCommands : vk::PipelineStageFlagBits2::eNone,
+                .srcAccessMask = release ? vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite : vk::AccessFlags2{},
+                .dstStageMask = release ? vk::PipelineStageFlagBits2::eNone : vk::PipelineStageFlagBits2::eAllCommands,
+                .dstAccessMask = release ? vk::AccessFlags2{} : vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
+                .srcQueueFamilyIndex = release ? family : VK_QUEUE_FAMILY_EXTERNAL,
+                .dstQueueFamilyIndex = release ? VK_QUEUE_FAMILY_EXTERNAL : family,
+                .buffer = buffer, .offset = 0, .size = VK_WHOLE_SIZE,
+            });
+            if (!barriers.empty()) command.pipelineBarrier2(vk::DependencyInfo{
+                .bufferMemoryBarrierCount = u32(barriers.size()), .pBufferMemoryBarriers = barriers.data()});
+            if (!image_barriers.empty()) {
+                auto barriers = image_barriers;
+                for (auto& barrier : barriers) {
+                    barrier.srcStageMask = release ? vk::PipelineStageFlagBits2::eAllCommands : vk::PipelineStageFlagBits2::eNone;
+                    barrier.srcAccessMask = release ? vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite : vk::AccessFlags2{};
+                    barrier.dstStageMask = release ? vk::PipelineStageFlagBits2::eNone : vk::PipelineStageFlagBits2::eAllCommands;
+                    barrier.dstAccessMask = release ? vk::AccessFlags2{} : vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite;
+                    barrier.srcQueueFamilyIndex = release ? family : VK_QUEUE_FAMILY_EXTERNAL;
+                    barrier.dstQueueFamilyIndex = release ? VK_QUEUE_FAMILY_EXTERNAL : family;
+                    if (!release) std::swap(barrier.oldLayout, barrier.newLayout);
+                }
+                command.pipelineBarrier2(vk::DependencyInfo{.imageMemoryBarrierCount = u32(barriers.size()), .pImageMemoryBarriers = barriers.data()});
+            }
+            if (!release && !copies.empty()) {
+                for (const auto& copy : copies) command.copyBuffer(copy.source, copy.destination, copy.region);
+                const vk::MemoryBarrier2 after{
+                    .srcStageMask = vk::PipelineStageFlagBits2::eCopy,
+                    .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
+                    .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+                    .dstAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
+                };
+                command.pipelineBarrier2(vk::DependencyInfo{.memoryBarrierCount = 1, .pMemoryBarriers = &after});
+            }
+        });
+    };
+    float gpu_ms = NAN;
+    const std::span<const u8> push{reinterpret_cast<const u8*>(&push_data), sizeof(push_data)};
+    BbMetalFX::CommandResult result = BbMetalFX::CommandResult::Unavailable;
+    std::function<bool(float*)> work;
+    if (render) {
+        std::vector<VkVertexInputAttributeDescription2EXT> attributes;
+        for (const auto& attribute : vertex_binds.attributes) attributes.push_back(static_cast<VkVertexInputAttributeDescription2EXT>(attribute));
+        std::vector<BbMetalFX::VertexBufferBinding> vertices;
+        for (size_t i = 0; i < vertex_indices.size(); ++i) {
+            const auto& buffer = bindings[vertex_indices[i]];
+            vertices.push_back({static_cast<VkVertexInputBindingDescription2EXT>(vertex_binds.bindings[i]), buffer.native, buffer.offset, buffer.size});
+        }
+        const auto [vertex, instance] = GetDrawOffsets(Regs(), graphics->GetStage(Shader::SwStage::Vertex), graphics->GetFetchShader());
+        BbMetalFX::DrawCommand draw{Regs().num_indices, Regs().num_instances.NumInstances(), instance, s32(vertex)};
+        if (indexed) {
+            const auto& buffer = bindings[index_binding];
+            draw.index_buffer = buffer.native; draw.index_offset = buffer.offset; draw.index_type = static_cast<VkIndexType>(index_bind.type);
+        }
+        result = native_draw->Draw(*render, scheduler.GetDynamicState(), attributes, vertices, bindings, push, draw, &gpu_ms, &work);
+        if (result != BbMetalFX::CommandResult::Prepared) return false;
+    }
+    // ponytail: sparse clones stay synchronous until native arena ownership removes per-draw copies and bounds in-flight memory.
+    static const bool asynchronous = [] {
+        const char* value = std::getenv("BB_METAL_GRAPHICS_ASYNC");
+        return value && std::string_view(value) == "1";
+    }();
+    scheduler.EndRendering();
+    runtime.FlushBarriers();
+    ownership(true, std::move(uploads));
+    const bool queued = render && asynchronous && clones.empty();
+    if (queued) {
+        scheduler.ExternalSemaphore();
+        const auto value = scheduler.NextExternalValue();
+        auto fence = std::make_shared<vk::UniqueFence>(Check(instance.GetDevice().createFenceUnique({})));
+        SubmitInfo release{};
+        release.fence = **fence;
+        scheduler.FlushForExternal(release, value);
+        scheduler.EnqueueExternal(std::move(fence), value, [work = std::move(work)] {
+            float timing = NAN;
+            const bool complete = work(&timing);
+            static std::atomic<u64> completed{0};
+            const auto count = complete ? completed.fetch_add(1, std::memory_order_relaxed) + 1 : 0;
+            if (count && (count <= 3 || count % 300 == 0))
+                std::fprintf(stderr, "Native Metal guest async draw completed #%llu: GPU %.3f ms.\n",
+                    static_cast<unsigned long long>(count), timing);
+            return complete;
+        });
+        ownership(false, {});
+        metal_async_issued = true;
+    } else {
+        scheduler.FinishForExternal();
+        result = render ? (work(&gpu_ms) ? BbMetalFX::CommandResult::Complete : BbMetalFX::CommandResult::Failed)
+                        : kernel->Dispatch(bindings, push, groups, &gpu_ms);
+        if (result == BbMetalFX::CommandResult::Failed)
+            UNREACHABLE_MSG("Native guest command failed after submission; refusing to replay partial writes");
+        ownership(false, result == BbMetalFX::CommandResult::Complete ? std::move(downloads) : std::vector<Copy>{});
+        scheduler.FinishForExternal(); // Retire clones without retiring the guest tick.
+        if (result != BbMetalFX::CommandResult::Complete) return false;
+    }
+    for (const auto& bound : bound_buffers) runtime.AccessBuffer(bound.buffer, bound.offset, bound.size,
+        vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eMemoryRead |
+        (bound.is_written ? vk::AccessFlagBits2::eMemoryWrite : vk::AccessFlags2{}));
+    bound_buffers.clear();
+    static u64 completed[2]{};
+    const auto count = ++completed[render ? 1 : 0];
+    const auto& shader = pipeline->GetStage(render ? Shader::SwStage::Vertex : Shader::SwStage::Compute);
+    if (count <= 3 || count % 300 == 0)
+        std::fprintf(stderr, "Native Metal guest %s #%llu: shader %016llx, %zu textures, %zu sparse clones, %s GPU %.3f ms.\n",
+            render ? "draw" : "dispatch", static_cast<unsigned long long>(count), static_cast<unsigned long long>(shader.pgm_hash),
+            images.size(), clones.size(), queued ? "queued;" : "completed;", gpu_ms);
+    return true;
+}
+#endif
+
 void Rasterizer::DispatchRecord(const ComputePipeline* pipeline) {
     FrameCapture::Poll();
     gbuffer_draw = false;
@@ -1343,6 +1709,12 @@ void Rasterizer::DispatchRecord(const ComputePipeline* pipeline) {
     scheduler.EndRendering();
     mark();
 #ifdef __APPLE__
+    if (DispatchMetal(pipeline, {cs_program.dim_x, cs_program.dim_y, cs_program.dim_z})) {
+        ResetBindings(true);
+        DebugState.IncDispatch();
+        scheduler.KickRecording();
+        return;
+    }
     std::vector<std::vector<u8>> metal_before;
     std::array<std::unique_ptr<BbMetalFX::SharedBuffer>, 2> metal_shared;
     // ponytail: prove one simple buffer-only shader first; images/aliasing need their own contract.
@@ -1886,6 +2258,7 @@ void Rasterizer::ResolveVertexBuffers(const GraphicsPipeline* pipeline,
     v.host_offsets.clear();
     v.host_sizes.clear();
     v.host_strides.clear();
+    v.host_guests.clear();
     auto& attributes = v.attributes;
     auto& bindings = v.bindings;
     attributes.clear();
@@ -1999,9 +2372,12 @@ void Rasterizer::ResolveVertexBuffers(const GraphicsPipeline* pipeline,
             host_buffers.emplace_back(host_buffer_info->buffer->Handle());
             host_offsets.push_back(host_buffer_info->offset + buffer.base_address -
                                    host_buffer_info->base_address);
+            v.host_guests.push_back(host_buffer_info->buffer->mem_type == VideoCore::MemoryType::Sparse ?
+                host_buffer_info->buffer->cpu_addr + host_offsets.back() : 0);
         } else {
             host_buffers.emplace_back(VK_NULL_HANDLE);
             host_offsets.push_back(0);
+            v.host_guests.push_back(0);
         }
         host_sizes.push_back(buffer.GetSize());
         host_strides.push_back(buffer.GetStride());
@@ -2037,7 +2413,8 @@ void Rasterizer::ResolveIndexBuffer(u32 index_offset) {
     const auto [buffer, offset] =
         buffer_cache.ObtainBuffer(index_address, index_buffer_size, false);
     needs_barrier |= runtime.IsBufferAccessed(buffer, offset, index_buffer_size);
-    index_bind = {buffer->Handle(), offset, index_type};
+    index_bind = {buffer->Handle(), offset, index_type,
+        buffer->mem_type == VideoCore::MemoryType::Sparse ? buffer->cpu_addr + offset : 0};
 }
 
 void Rasterizer::ResetBindings(bool is_compute) {

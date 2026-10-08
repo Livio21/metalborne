@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <utility>
+#include <cstdlib>
 #include <boost/container/small_vector.hpp>
 
 #include "common/assert.h"
@@ -426,6 +427,22 @@ GraphicsPipeline::GraphicsPipeline(
                vk::to_string(pipeline_result));
     pipeline = std::move(pipe);
     SetObjectName(device, *pipeline, "Graphics Pipeline {}", debug_str);
+#ifdef __APPLE__
+    static const char* native = std::getenv("BB_METAL_GRAPHICS");
+    if (native && std::string_view(native) == "1") {
+        std::vector<u32> vertex, fragment;
+        for (const auto& stage : shader_stages) {
+            if (stage.stage == vk::ShaderStageFlagBits::eVertex) vertex = MetalShaderCode(stage.module, device);
+            if (stage.stage == vk::ShaderStageFlagBits::eFragment) fragment = MetalShaderCode(stage.module, device);
+        }
+        metal_pipeline = std::make_unique<BbMetalFX::RenderPipeline>(vertex, fragment,
+            static_cast<VkGraphicsPipelineCreateInfo>(pipeline_info));
+        static unsigned compiled = 0;
+        if (++compiled <= 8) std::fprintf(stderr, "Native Metal graphics candidate %s: %s%.*s\n", debug_str.c_str(),
+            metal_pipeline->Available() ? "shaders ready" : "unavailable: ",
+            metal_pipeline->Available() ? 0 : int(metal_pipeline->Error().size()), metal_pipeline->Error().data());
+    }
+#endif
 }
 
 GraphicsPipeline::~GraphicsPipeline() = default;
