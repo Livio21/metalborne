@@ -1036,12 +1036,12 @@ Scheduler hooks run before allocating recording-chunk capture data, issuing a
 host-copy sequence number, changing render-pass state or allocating an external
 completion value. `WaitHostCopies` keeps a batch open when neither recorder
 copies nor copy-pool work is pending; real pending copies still flush it before
-the wait. `WaitDeferredSignals` likewise keeps it open without outstanding
-deferred guest signals, while preserving flushes for pending signals and the
-disabled ordered-write mode. The scheduler fixture checks both idle waits,
-queued copy items, an active copy-pool task and a deferred guest signal. Hooks
-clear the callback before invoking it and run before the submission mutex is
-taken. A batch release suppresses the submit callback's
+the wait. Liverpool's packet loop skips `WaitDeferredSignals` when no deferred
+guest signal is pending and ordered writes are enabled; explicit calls still
+flush pending external work. The scheduler fixture checks the idle predicate,
+queued copy items, an active copy-pool task and an outstanding deferred signal.
+Hooks clear the callback before invoking it and run before the submission mutex
+is taken. A batch release suppresses the submit callback's
 Runtime barrier flush: a following draw may already have accumulated transitions,
 which must remain after the earlier batch's acquire. Sparse arena bindings still
 submit normally.

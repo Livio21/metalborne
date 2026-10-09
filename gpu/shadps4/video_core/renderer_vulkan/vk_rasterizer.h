@@ -127,6 +127,9 @@ public:
     void WaitDeferredSignals() {
         scheduler.WaitDeferredSignals();
     }
+    [[nodiscard]] bool ShouldWaitDeferredSignals() const {
+        return scheduler.ShouldWaitDeferredSignals();
+    }
     /// Runs `signal` after the guest memory copies issued so far, without waiting here.
     void SignalAfterHostCopies(std::function<void()> signal) {
         scheduler.SignalAfterHostCopies(std::move(signal));

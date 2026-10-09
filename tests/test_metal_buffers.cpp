@@ -94,12 +94,7 @@ int main(int argc, char** argv) {
         assert(!BbCopy::HasPending());
         scheduler.FlushPendingExternal();
         assert(idle_copy_flushes == 1);
-        unsigned idle_signal_flushes = 0;
-        scheduler.SetPendingExternal([&] { ++idle_signal_flushes; });
-        scheduler.WaitDeferredSignals();
-        assert(idle_signal_flushes == 0);
-        scheduler.FlushPendingExternal();
-        assert(idle_signal_flushes == 1);
+        assert(!scheduler.ShouldWaitDeferredSignals());
         if (BbCopy::Enabled()) {
             BbCopy::QueueCopy({.run = [](const BbCopy::Item&) {}, .size = 1});
             assert(BbCopy::HasPending());
@@ -126,6 +121,7 @@ int main(int argc, char** argv) {
             started.get_future().wait();
             std::atomic<bool> signal_completed = false;
             scheduler.SignalAfterHostCopies([&] { signal_completed.store(true, std::memory_order_release); });
+            assert(scheduler.ShouldWaitDeferredSignals());
             unsigned pending_signal_flushes = 0;
             scheduler.SetPendingExternal([&] { ++pending_signal_flushes; release.set_value(); });
             scheduler.WaitDeferredSignals();

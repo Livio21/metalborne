@@ -756,7 +756,9 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                   reinterpret_cast<const PM4DmaData*>(header)->dst_addr_lo == 0x3022C)) {
                 rasterizer->DrainDrawPipe(static_cast<u32>(opcode));
                 // They may write guest memory: not before fences deferred earlier.
-                rasterizer->WaitDeferredSignals();
+                if (rasterizer->ShouldWaitDeferredSignals()) {
+                    rasterizer->WaitDeferredSignals();
+                }
             }
             switch (opcode) {
             case PM4ItOpcode::Nop: {
