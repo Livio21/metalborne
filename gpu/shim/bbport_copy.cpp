@@ -50,6 +50,11 @@ public:
         return !threads.empty();
     }
 
+    bool HasPending() {
+        std::scoped_lock lk{mutex};
+        return pending != 0 || epochs.size() > 1 || draining;
+    }
+
     void Async(std::function<void()> task) {
         {
             std::scoped_lock lk{mutex};
@@ -292,6 +297,10 @@ void WaitAsync() {
         batch.bytes = 0;
     }
     GetPool().WaitAll();
+}
+
+bool HasPending() {
+    return !batch.items.empty() || GetPool().HasPending();
 }
 
 void ParallelFor(std::size_t count, const std::function<void(std::size_t)>& task) {

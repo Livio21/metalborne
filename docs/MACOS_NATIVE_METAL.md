@@ -1034,8 +1034,11 @@ reservations and deferred deletion.
 
 Scheduler hooks run before allocating recording-chunk capture data, issuing a
 host-copy sequence number, changing render-pass state or allocating an external
-completion value. They clear the callback before invoking it and run before the
-submission mutex is taken. A batch release suppresses the submit callback's
+completion value. `WaitHostCopies` keeps a batch open when neither recorder
+copies nor copy-pool work is pending; real pending copies still flush it before
+the wait. The scheduler fixture checks idle waits, queued copy items and an
+active copy-pool task. Hooks clear the callback before invoking it and run
+before the submission mutex is taken. A batch release suppresses the submit callback's
 Runtime barrier flush: a following draw may already have accumulated transitions,
 which must remain after the earlier batch's acquire. Sparse arena bindings still
 submit normally.
@@ -1056,23 +1059,31 @@ completes. Direct/threaded recording, Vulkan fallback, native buffer compute,
 scene MetalFX and the 64-command queue stress check passed. The fixtures do not
 directly instantiate the game's Rasterizer or stress 512 MiB cache eviction.
 
-Three game runs used the same GPU library and probe hashes, AC power, unchanged
-source-save hashes, 60-second nominal-pressure cooldown, 15-second warmup and
-35-second measurement. The only renderer setting that differed between the
-first pair was `BB_METAL_GRAPHICS_BATCH`. Unbatched measured **8.18 FPS**
-(7.3–8.9); batched measured **9.23 FPS** (8.9–9.5), with similar draws/frame
-(784–787 versus 778–791). Both had six windows, zero shader/pipeline compiles,
-nominal pressure and clean exits. The initial pair suggests a 12.8% gain, but
-the repeated unbatched run averaged **11.28 FPS** and swung from 14.0 FPS in
-three windows to 8.0–9.5 FPS in the next three, despite nominal pressure and
-786–790 draws/frame. The FPS change is therefore not attributable to batching
-yet; draw counts and the workload gate do not prove an identical game state.
-All runs stayed below the 30 FPS target, and nominal pressure does not report
-temperature or clock speed.
+An earlier same-build comparison measured **8.18 FPS** unbatched and **9.23 FPS**
+batched, but its repeated unbatched run swung from 14 FPS to 8–9.5 FPS despite
+nominal pressure. That comparison was inconclusive.
 
-In the batched run the process logged 49,092 native draws across 37,800 Metal
-command-buffer groups (1.30 draws/group on average, maximum six), including
-startup/menu work. That is about 23% fewer command-buffer submissions for the
-logged draws, but most groups still held one draw. Repeat with a reproducible
-stationary scene or recorded route and alternating runs before claiming a
-throughput or pacing improvement. Full-game stability remains unverified.
+After the idle-wait boundary fix, an AC A-B-A-B sequence used the same GPU
+library and probe hashes, unchanged source-save hashes, 60-second nominal
+cooldowns, 15-second warmups and 35-second measurements. The unbatched runs
+averaged **8.07 FPS** (7.8–8.4) and **8.35 FPS** (7.7–9.2); batched runs averaged
+**9.32 FPS** (9.0–9.9) and **9.25 FPS** (9.0–9.4). The batched mean was **13.1%**
+above the average of the two controls. Draws/frame were similar: 784–787 and
+785–787 unbatched, 784–798 and 784–797 batched. Each run had six windows, no
+shader/pipeline compiles, nominal pressure and a clean exit. All four stayed
+below the 30 FPS target. OS thermal pressure does not report temperature or
+clock speed, and these measurements cover one game view.
+
+Both batched runs showed median intervals of 100–116.67 ms, versus 116.67–133.33
+and 100–133.33 ms for the controls. Worst guest-window p99 was 183/200 ms in the
+controls and 133/217 ms in the batched runs, so improved worst-case frame pacing
+is not established. Host present-call p99 was lower in both batched runs, but
+those API calls do not measure scanout.
+
+Across each complete batched process, including startup/menu work, logs showed
+50,331 draws in 37,500 groups and 50,098 draws in 38,700 groups: about **1.32
+draws/group** and **24% fewer Metal command buffers** than one per draw, maximum
+group size six. This verifies reduced submission count and a repeatable
+throughput candidate in the tested view; repeat on another scene and exercise
+movement/combat before broadening the opt-in path. Full-game stability remains
+unverified.

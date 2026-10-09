@@ -12,6 +12,7 @@
 #include <fstream>
 #include <map>
 #include "macos_metal_shader.h"
+#include "bbport_copy.h"
 #include "shader_recompiler/resource.h"
 #include <vector>
 #include <limits>
@@ -85,6 +86,32 @@ int main(int argc, char** argv) {
     Vulkan::Scheduler scheduler(instance, threaded);
     assert(scheduler.IsRecordingDeferred() == threaded);
     {
+        unsigned idle_copy_flushes = 0;
+        scheduler.SetPendingExternal([&] { ++idle_copy_flushes; });
+        scheduler.WaitHostCopies();
+        assert(idle_copy_flushes == 0);
+        assert(!BbCopy::HasPending());
+        scheduler.FlushPendingExternal();
+        assert(idle_copy_flushes == 1);
+        if (BbCopy::Enabled()) {
+            BbCopy::QueueCopy({.run = [](const BbCopy::Item&) {}, .size = 1});
+            assert(BbCopy::HasPending());
+            unsigned queued_copy_flushes = 0;
+            scheduler.SetPendingExternal([&] { ++queued_copy_flushes; });
+            scheduler.WaitHostCopies();
+            assert(queued_copy_flushes == 1 && !BbCopy::HasPending());
+            std::puts("PASS: a queued copy-pool item flushes the native batch before WaitHostCopies waits");
+
+            std::promise<void> started, release;
+            auto release_copy = release.get_future().share();
+            BbCopy::Async([&] { started.set_value(); release_copy.wait(); });
+            started.get_future().wait();
+            unsigned active_copy_flushes = 0;
+            scheduler.SetPendingExternal([&] { ++active_copy_flushes; release.set_value(); });
+            scheduler.WaitHostCopies();
+            assert(active_copy_flushes == 1 && !BbCopy::HasPending());
+            std::puts("PASS: an active copy-pool task flushes the native batch before WaitHostCopies waits");
+        }
         unsigned pending_flushes = 0;
         const auto pending = [&] {
             scheduler.SetPendingExternal([&] {
@@ -113,7 +140,7 @@ int main(int argc, char** argv) {
         pending(); scheduler.WaitDeferredSignals(); assert(pending_flushes == 5);
         pending(); scheduler.FinishForExternal(); assert(pending_flushes == 6);
         assert(scheduler.CurrentTick() == pending_tick);
-        std::puts("PASS: pending native work flushes before recording storage, host-copy counters, guest signals and external timeline allocation without retiring the guest tick");
+        std::puts("PASS: idle host-copy waits retain native batches; pending work flushes before recording storage, copy counters, guest signals and external timeline allocation without retiring the guest tick");
     }
     Vulkan::Runtime runtime(instance, scheduler);
     using VideoCore::Buffer;

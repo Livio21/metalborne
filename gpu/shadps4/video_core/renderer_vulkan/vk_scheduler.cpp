@@ -216,13 +216,16 @@ void Scheduler::WaitDeferredSignals() {
 }
 
 void Scheduler::WaitHostCopies() {
-    FlushPendingExternal();
-    if (host_copies_done.load(std::memory_order_acquire) < host_copies_issued) {
+    const u64 issued = host_copies_issued;
+    const bool recorded_pending = host_copies_done.load(std::memory_order_acquire) < issued;
+    const bool copy_pending = BbCopy::HasPending();
+    if (recorded_pending || copy_pending) FlushPendingExternal();
+    if (recorded_pending) {
         BbStats::WaitTimer timer{BbStats::host_copies_wait_ns};
         BbStats::host_copy_waits.fetch_add(1, std::memory_order_relaxed);
         KickRecording(true);
         for (u64 done = host_copies_done.load(std::memory_order_acquire);
-             done < host_copies_issued; done = host_copies_done.load(std::memory_order_acquire)) {
+             done < issued; done = host_copies_done.load(std::memory_order_acquire)) {
 #ifdef __APPLE__
             // Release the core while the recorder copies; fences retain the same sequence.
             host_copies_done.wait(done, std::memory_order_acquire);
@@ -231,8 +234,11 @@ void Scheduler::WaitHostCopies() {
 #endif
         }
     }
-    BbStats::WaitTimer timer{BbStats::copy_threads_wait_ns};
-    BbCopy::WaitAsync();
+    if (copy_pending || BbCopy::HasPending()) {
+        FlushPendingExternal();
+        BbStats::WaitTimer timer{BbStats::copy_threads_wait_ns};
+        BbCopy::WaitAsync();
+    }
 }
 
 void Scheduler::KickRecording(bool force) {

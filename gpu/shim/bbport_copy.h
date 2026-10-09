@@ -37,6 +37,9 @@ void FlushBatch();
 /// has finished.
 void WaitAsync();
 
+/// Whether WaitAsync on this thread would have queued work to drain.
+bool HasPending();
+
 /// Starts the calling thread's batch and runs `callback` once every task passed to Async() so
 /// far has finished (at once when none is pending), on whichever thread finishes last.
 /// Callbacks run in the order they were registered.
