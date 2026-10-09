@@ -200,12 +200,11 @@ void Scheduler::SignalAfterHostCopies(std::function<void()> signal) {
 }
 
 void Scheduler::WaitDeferredSignals() {
-    FlushPendingExternal();
     const u64 issued = deferred_signals_issued.load(std::memory_order_relaxed);
-    if (deferred_signals_done->load(std::memory_order_acquire) >= issued ||
-        BbToggle::Disabled(BbToggle::OrderedGuestWrites)) {
-        return;
-    }
+    const bool pending = deferred_signals_done->load(std::memory_order_acquire) < issued;
+    const bool ordered = !BbToggle::Disabled(BbToggle::OrderedGuestWrites);
+    if (pending || !ordered) FlushPendingExternal();
+    if (!pending || !ordered) return;
     BbStats::WaitTimer timer{BbStats::host_copies_wait_ns};
     KickRecording(true);
     while (deferred_signals_done->load(std::memory_order_acquire) < issued) {

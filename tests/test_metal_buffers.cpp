@@ -3,6 +3,7 @@
 #include <cassert>
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -93,6 +94,12 @@ int main(int argc, char** argv) {
         assert(!BbCopy::HasPending());
         scheduler.FlushPendingExternal();
         assert(idle_copy_flushes == 1);
+        unsigned idle_signal_flushes = 0;
+        scheduler.SetPendingExternal([&] { ++idle_signal_flushes; });
+        scheduler.WaitDeferredSignals();
+        assert(idle_signal_flushes == 0);
+        scheduler.FlushPendingExternal();
+        assert(idle_signal_flushes == 1);
         if (BbCopy::Enabled()) {
             BbCopy::QueueCopy({.run = [](const BbCopy::Item&) {}, .size = 1});
             assert(BbCopy::HasPending());
@@ -111,6 +118,19 @@ int main(int argc, char** argv) {
             scheduler.WaitHostCopies();
             assert(active_copy_flushes == 1 && !BbCopy::HasPending());
             std::puts("PASS: an active copy-pool task flushes the native batch before WaitHostCopies waits");
+        }
+        if (threaded && BbCopy::Enabled()) {
+            std::promise<void> started, release;
+            auto release_copy = release.get_future().share();
+            BbCopy::Async([&] { started.set_value(); release_copy.wait(); });
+            started.get_future().wait();
+            std::atomic<bool> signal_completed = false;
+            scheduler.SignalAfterHostCopies([&] { signal_completed.store(true, std::memory_order_release); });
+            unsigned pending_signal_flushes = 0;
+            scheduler.SetPendingExternal([&] { ++pending_signal_flushes; release.set_value(); });
+            scheduler.WaitDeferredSignals();
+            assert(pending_signal_flushes == 1 && signal_completed.load(std::memory_order_acquire));
+            std::puts("PASS: an outstanding deferred guest signal flushes native work before waiting");
         }
         unsigned pending_flushes = 0;
         const auto pending = [&] {
