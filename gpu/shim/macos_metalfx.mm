@@ -45,6 +45,82 @@ void* FindNativeSampler(VkSampler sampler) {
     const auto found = native_samplers.find(sampler);
     return found == native_samplers.end() ? nullptr : found->second;
 }
+struct CommandQueue {
+    std::mutex mutex;
+    id<MTLCommandQueue> queue;
+};
+static CommandQueue& QueueFor(bool deferred) {
+    static CommandQueue queues[2];
+    return queues[deferred];
+}
+static id<MTLCommandQueue> GetQueue(CommandQueue& context, id<MTLDevice> device) {
+    if (!context.queue || context.queue.device != device) context.queue = [device newCommandQueue];
+    return context.queue;
+}
+struct GraphicsBatch::Impl {
+    id<MTLDevice> device;
+    id<MTLCommandBuffer> command;
+    id<MTLFence> fence;
+    uint32_t encoded_draws{};
+    std::mutex completion_mutex;
+    bool completed{}, success{};
+    float gpu_ms = NAN;
+    explicit Impl(void* native_device) : device((__bridge id<MTLDevice>)native_device) {}
+};
+GraphicsBatch::GraphicsBatch(void* device) : impl(std::make_unique<Impl>(device)) {}
+GraphicsBatch::~GraphicsBatch() = default;
+uint32_t GraphicsBatch::EncodedDrawCount() const { return impl->encoded_draws; }
+std::shared_ptr<GraphicsBatch> CreateGraphicsBatch(void* device) {
+    if (!device) return {};
+    return std::make_shared<GraphicsBatch>(device);
+}
+bool GraphicsBatch::Encode(const std::function<bool(id<MTLCommandBuffer>, id<MTLFence>)>& encode) {
+    if (!impl->device) return false;
+    auto& context = QueueFor(true);
+    std::lock_guard lock{context.mutex};
+    auto queue = GetQueue(context, impl->device);
+    if (!queue) return false;
+    if (!impl->command) {
+        impl->command = [queue commandBuffer];
+        impl->fence = [impl->device newFence];
+        id<MTLBlitCommandEncoder> release = [impl->command blitCommandEncoder];
+        if (!impl->command || !impl->fence || !release) {
+            [release endEncoding];
+            return false;
+        }
+        [release updateFence:impl->fence];
+        [release endEncoding];
+    } else {
+        id<MTLBlitCommandEncoder> previous = [impl->command blitCommandEncoder];
+        if (!previous) return false;
+        [previous updateFence:impl->fence];
+        [previous endEncoding];
+    }
+    if (!encode(impl->command, impl->fence)) return false;
+    ++impl->encoded_draws;
+    return true;
+}
+bool GraphicsBatch::Complete(float* timing) {
+    std::lock_guard lock{impl->completion_mutex};
+    if (!impl->completed) {
+        impl->completed = true;
+        if (impl->command && impl->encoded_draws) {
+            @autoreleasepool {
+                [impl->command commit];
+                [impl->command waitUntilCompleted];
+                impl->success = impl->command.status == MTLCommandBufferStatusCompleted;
+                if (impl->success && impl->command.GPUStartTime > 0 &&
+                    impl->command.GPUEndTime >= impl->command.GPUStartTime)
+                    impl->gpu_ms = 1000 * (impl->command.GPUEndTime - impl->command.GPUStartTime);
+                if (!impl->success)
+                    std::fprintf(stderr, "Native Metal graphics batch failed: %s.\n",
+                                 (impl->command.error.localizedDescription ?: @"command failed").UTF8String);
+            }
+        }
+    }
+    if (timing) *timing = impl->gpu_ms;
+    return impl->success;
+}
 struct SharedBuffer::Impl {
     VkDevice device;
     VkBuffer buffer{};
@@ -146,21 +222,20 @@ uint64_t SharedBuffer::DeviceAddress() const { return impl->address; }
 
 bool RunCommands(id<MTLDevice> device,
                         const std::function<bool(id<MTLCommandBuffer>, id<MTLFence>)>& encode,
-                        float* gpu_ms, bool* submitted, std::function<bool(float*)>* deferred) {
+                        float* gpu_ms, bool* submitted, std::function<bool(float*)>* deferred,
+                        std::shared_ptr<GraphicsBatch> graphics_batch) {
     if (gpu_ms) *gpu_ms = NAN;
     if (submitted) *submitted = false;
     @autoreleasepool {
-        // ponytail: one command per call; batch with guest submissions once ownership is native.
-        struct Queue {
-            std::mutex mutex;
-            id<MTLCommandQueue> queue;
-        };
+        if (graphics_batch) {
+            if (!deferred || !graphics_batch->Encode(encode)) return false;
+            *deferred = [graphics_batch](float* timing) { return graphics_batch->Complete(timing); };
+            return true;
+        }
         // Deferred draws may fill their queue before a helper signals their Vulkan dependency.
-        static Queue queues[2];
-        auto& context = queues[deferred != nullptr];
+        auto& context = QueueFor(deferred != nullptr);
         std::lock_guard lock{context.mutex};
-        auto& queue = context.queue;
-        if (!queue || queue.device != device) queue = [device newCommandQueue];
+        auto queue = GetQueue(context, device);
         id<MTLCommandBuffer> command = [queue commandBuffer];
         id<MTLFence> fence = [device newFence];
         id<MTLBlitCommandEncoder> release = [command blitCommandEncoder];

@@ -84,6 +84,37 @@ int main(int argc, char** argv) {
     }
     Vulkan::Scheduler scheduler(instance, threaded);
     assert(scheduler.IsRecordingDeferred() == threaded);
+    {
+        unsigned pending_flushes = 0;
+        const auto pending = [&] {
+            scheduler.SetPendingExternal([&] {
+                ++pending_flushes;
+                scheduler.FinishForExternal(); // Re-enters recording and submission without the hook.
+            });
+        };
+        const auto pending_tick = scheduler.CurrentTick();
+        pending();
+        scheduler.RecordHostCopy([] {}); // The flush must precede host_copies_issued.
+        scheduler.WaitHostCopies();
+        assert(pending_flushes == 1);
+        pending();
+        const std::array<u32, 4> payload{3, 5, 7, 11};
+        const auto captured = scheduler.RecordData(std::span<const u32>(payload));
+        assert(pending_flushes == 2); // Flush before allocating capture storage, not inside Record.
+        scheduler.Record([captured](vk::CommandBuffer) { assert(captured[3] == 11); });
+        scheduler.KickRecording(true);
+        scheduler.SyncRecording();
+        u64 nested_value = 0;
+        scheduler.SetPendingExternal([&] { nested_value = scheduler.NextExternalValue(); });
+        const auto following_value = scheduler.NextExternalValue();
+        assert(nested_value && following_value > nested_value);
+        pending(); scheduler.EndRendering(); assert(pending_flushes == 3);
+        pending(); scheduler.CommandBuffer(); assert(pending_flushes == 4);
+        pending(); scheduler.WaitDeferredSignals(); assert(pending_flushes == 5);
+        pending(); scheduler.FinishForExternal(); assert(pending_flushes == 6);
+        assert(scheduler.CurrentTick() == pending_tick);
+        std::puts("PASS: pending native work flushes before recording storage, host-copy counters, guest signals and external timeline allocation without retiring the guest tick");
+    }
     Vulkan::Runtime runtime(instance, scheduler);
     using VideoCore::Buffer;
     using VideoCore::MemoryType;
@@ -1091,6 +1122,40 @@ int main(int argc, char** argv) {
         assert(std::memcmp(mirror_readback.mapped_data.data(), vertex_data.mapped_data.data(), 512) == 0);
         actual.Invalidate(0, 4096);
         for (u32 i = 0; i < 4096; ++i) assert(std::abs(int(actual.mapped_data[i])-int(expected.mapped_data[i])) <= 1);
+        std::array<std::function<bool(float*)>, 2> batch;
+        std::shared_ptr<BbMetalFX::GraphicsBatch> metal_batch;
+        for (auto& work : batch)
+            assert(metal_pipeline.Draw(state, dynamic, {&native_attribute, 1}, {&native_vertex, 1}, shader_bindings,
+                push, draw, nullptr, &work, &metal_batch) == BbMetalFX::CommandResult::Prepared);
+        assert(metal_batch && metal_batch->EncodedDrawCount() == batch.size());
+        refresh_mirror();
+        completed.store(0);
+        retired = false;
+        const auto batch_tick = scheduler.CurrentTick();
+        scheduler.DeferOperation([&] { retired = true; });
+        unsigned releases = 0;
+        scheduler.SetPendingExternal([&, batch = std::move(batch)] {
+            ++releases;
+            const auto value = scheduler.NextExternalValue();
+            auto fence = std::make_shared<vk::UniqueFence>(Vulkan::Check(instance.GetDevice().createFenceUnique({}, nullptr, dispatch)));
+            Vulkan::SubmitInfo release{};
+            release.fence = **fence;
+            ownership(true, &release, value);
+            scheduler.EnqueueExternal(std::move(fence), value, [batch, &completed] {
+                if (!batch.back()(nullptr)) return false;
+                completed.fetch_add(batch.size(), std::memory_order_release);
+                return true;
+            });
+            ownership(false, &release, value);
+        });
+        assert(releases == 0 && !retired);
+        runtime.DownloadImage(&output, &actual, {&whole, 1});
+        assert(releases == 1 && scheduler.CurrentTick() == batch_tick && !retired);
+        scheduler.Finish(); scheduler.PopPendingOperations();
+        assert(completed.load(std::memory_order_acquire) == 2 && retired);
+        actual.Invalidate(0, 4096);
+        for (u32 i = 0; i < 4096; ++i) assert(std::abs(int(actual.mapped_data[i])-int(expected.mapped_data[i])) <= 1);
+        std::puts("PASS: two native draws encode into one Metal command buffer and one ownership release; dependent Vulkan download matches pixels and guest retirement waits for completion");
         ownership(true);
         std::array<std::function<bool(float*)>, 64> prepared;
         // Apple's default queue allows 64 uncompleted commands. Helpers must progress while it is full.

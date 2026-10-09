@@ -14,9 +14,24 @@ namespace BbMetalFX {
 bool RunCommands(id<MTLDevice> device,
                  const std::function<bool(id<MTLCommandBuffer>, id<MTLFence>)>& encode,
                  float* gpu_ms = nullptr, bool* submitted = nullptr,
-                 std::function<bool(float*)>* deferred = nullptr);
+                 std::function<bool(float*)>* deferred = nullptr,
+                 std::shared_ptr<class GraphicsBatch> graphics_batch = {});
 MTLPixelFormat ImageFormat(VkFormat format);
 #endif
+class GraphicsBatch {
+public:
+    explicit GraphicsBatch(void* device);
+    ~GraphicsBatch();
+    uint32_t EncodedDrawCount() const;
+#ifdef __OBJC__
+    bool Encode(const std::function<bool(id<MTLCommandBuffer>, id<MTLFence>)>& encode);
+    bool Complete(float* gpu_ms);
+#endif
+private:
+    struct Impl;
+    std::unique_ptr<Impl> impl;
+};
+std::shared_ptr<GraphicsBatch> CreateGraphicsBatch(void* device);
 void* FindNativeBuffer(VkBuffer buffer);
 void* FindNativeImage(VkImage image);
 struct NativeImageView {

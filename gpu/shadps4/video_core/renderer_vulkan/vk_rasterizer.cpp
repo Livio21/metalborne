@@ -111,6 +111,10 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
     // bbport: this thread joins the texture binding helper before it changes image state.
     runtime.SetImageAccessHook(&JoinBindHelper, this);
     scheduler.SetSubmitCallback([this](Vulkan::SubmitInfo& info) {
+#ifdef __APPLE__
+        // A batch can flush while Runtime is recording the following draw's barriers.
+        if (!metal_batch_submitting)
+#endif
         runtime.FlushBarriers();
         buffer_cache.SubmitPendingArenaBinds(info);
     });
@@ -119,6 +123,7 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
 Rasterizer::~Rasterizer() {
 #ifdef __APPLE__
     draw_pipe.reset();
+    scheduler.FlushPendingExternal();
     if (metal_async_issued) {
         scheduler.Finish();
         scheduler.PopPendingOperations();
@@ -1034,11 +1039,6 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
             ResolveIndexBuffer(index_offset);
         }
     }
-    EmitVertexBuffers();
-    if (is_indexed) {
-        EmitIndexBuffer();
-    }
-
     if (needs_barrier) {
         runtime.FlushBarriers();
     }
@@ -1130,7 +1130,6 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
             });
         }
     }
-    pipeline->BindResources(set_writes, push_data);
     // bbport: jitter geometry drawn with the scene depth, not full-screen passes (a shifted
     // full-screen quad leaves an edge column unwritten).
     draw_jitter = {};
@@ -1138,19 +1137,12 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
         (regs.num_indices > 6 || regs.num_instances.NumInstances() > 1)) {
         draw_jitter = upscaler->Jitter();
     }
-    UpdateDynamicState(pipeline, is_indexed);
     MarkPass(pipeline, state);
     bool native_draw = false;
 #ifdef __APPLE__
     if (pipeline->metal_pipeline && pipeline->metal_pipeline->Available()) {
+        UpdateDynamicState(pipeline, is_indexed, false);
         native_draw = ExecuteMetal(pipeline, {}, &state, is_indexed);
-        if (!native_draw) {
-            // An attempted native command may have submitted the current Vulkan buffer.
-            EmitVertexBuffers();
-            if (is_indexed) EmitIndexBuffer();
-            pipeline->BindResources(set_writes, push_data);
-            UpdateDynamicState(pipeline, is_indexed);
-        }
     }
 #endif
 
@@ -1164,6 +1156,11 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
     const u32 first_vertex = vertex_offset;
     const u32 first_instance = instance_offset;
     if (!native_draw) {
+        scheduler.FlushPendingExternal();
+        EmitVertexBuffers();
+        if (is_indexed) EmitIndexBuffer();
+        pipeline->BindResources(set_writes, push_data);
+        UpdateDynamicState(pipeline, is_indexed);
         scheduler.BeginRendering(state);
         scheduler.Record([=](vk::CommandBuffer cmdbuf) {
         cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, handle);
@@ -1336,6 +1333,88 @@ bool Rasterizer::DispatchMetal(const ComputePipeline* pipeline, std::array<u32, 
     return ExecuteMetal(pipeline, groups);
 }
 
+void Rasterizer::RecordMetalOwnership(const std::vector<vk::Buffer>& shared,
+        const std::vector<vk::ImageMemoryBarrier2>& image_barriers, bool release,
+        std::vector<MetalBufferCopy> copies) {
+    const u32 family = instance.GetGraphicsQueueFamilyIndex();
+    scheduler.Record([shared, image_barriers, family, release, copies = std::move(copies)](vk::CommandBuffer command) {
+        const vk::MemoryBarrier2 before{
+            .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+            .srcAccessMask = vk::AccessFlagBits2::eMemoryWrite,
+            .dstStageMask = vk::PipelineStageFlagBits2::eCopy,
+            .dstAccessMask = vk::AccessFlagBits2::eTransferRead | vk::AccessFlagBits2::eTransferWrite,
+        };
+        if (release && !copies.empty()) {
+            command.pipelineBarrier2(vk::DependencyInfo{.memoryBarrierCount = 1, .pMemoryBarriers = &before});
+            for (const auto& copy : copies) command.copyBuffer(copy.source, copy.destination, copy.region);
+        }
+        std::vector<vk::BufferMemoryBarrier2> barriers;
+        for (const auto buffer : shared) barriers.push_back({
+            .srcStageMask = release ? vk::PipelineStageFlagBits2::eAllCommands : vk::PipelineStageFlagBits2::eNone,
+            .srcAccessMask = release ? vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite : vk::AccessFlags2{},
+            .dstStageMask = release ? vk::PipelineStageFlagBits2::eNone : vk::PipelineStageFlagBits2::eAllCommands,
+            .dstAccessMask = release ? vk::AccessFlags2{} : vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
+            .srcQueueFamilyIndex = release ? family : VK_QUEUE_FAMILY_EXTERNAL,
+            .dstQueueFamilyIndex = release ? VK_QUEUE_FAMILY_EXTERNAL : family,
+            .buffer = buffer, .offset = 0, .size = VK_WHOLE_SIZE,
+        });
+        if (!barriers.empty()) command.pipelineBarrier2(vk::DependencyInfo{
+            .bufferMemoryBarrierCount = u32(barriers.size()), .pBufferMemoryBarriers = barriers.data()});
+        if (!image_barriers.empty()) {
+            auto barriers = image_barriers;
+            for (auto& barrier : barriers) {
+                barrier.srcStageMask = release ? vk::PipelineStageFlagBits2::eAllCommands : vk::PipelineStageFlagBits2::eNone;
+                barrier.srcAccessMask = release ? vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite : vk::AccessFlags2{};
+                barrier.dstStageMask = release ? vk::PipelineStageFlagBits2::eNone : vk::PipelineStageFlagBits2::eAllCommands;
+                barrier.dstAccessMask = release ? vk::AccessFlags2{} : vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite;
+                barrier.srcQueueFamilyIndex = release ? family : VK_QUEUE_FAMILY_EXTERNAL;
+                barrier.dstQueueFamilyIndex = release ? VK_QUEUE_FAMILY_EXTERNAL : family;
+                if (!release) std::swap(barrier.oldLayout, barrier.newLayout);
+            }
+            command.pipelineBarrier2(vk::DependencyInfo{.imageMemoryBarrierCount = u32(barriers.size()), .pImageMemoryBarriers = barriers.data()});
+        }
+        if (!release && !copies.empty()) {
+            for (const auto& copy : copies) command.copyBuffer(copy.source, copy.destination, copy.region);
+            const vk::MemoryBarrier2 after{
+                .srcStageMask = vk::PipelineStageFlagBits2::eCopy,
+                .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
+                .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+                .dstAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
+            };
+            command.pipelineBarrier2(vk::DependencyInfo{.memoryBarrierCount = 1, .pMemoryBarriers = &after});
+        }
+    });
+}
+
+void Rasterizer::FlushMetalDrawBatch() {
+    auto batch = std::exchange(metal_draw_batch, {});
+    ASSERT(!batch.work.empty() && !metal_batch_submitting);
+    const auto draw_count = batch.work.size();
+    metal_batch_submitting = true;
+    RecordMetalOwnership(batch.buffers, batch.images, true, std::move(batch.uploads));
+    scheduler.ExternalSemaphore();
+    const auto value = scheduler.NextExternalValue();
+    auto fence = std::make_shared<vk::UniqueFence>(Check(instance.GetDevice().createFenceUnique({})));
+    SubmitInfo release{};
+    release.fence = **fence;
+    scheduler.FlushForExternal(release, value);
+    metal_batch_submitting = false;
+    scheduler.EnqueueExternal(std::move(fence), value, [work = std::move(batch.work), draw_count] {
+        float gpu_ms = 0;
+        if (!work.back()(&gpu_ms)) return false;
+        static u64 batches = 0, draws = 0, maximum = 0;
+        draws += draw_count;
+        maximum = std::max<u64>(maximum, draw_count);
+        if (++batches <= 3 || batches % 300 == 0)
+            std::fprintf(stderr, "Native Metal guest batch #%llu: %zu draws, GPU %.3f ms; %llu draws total, max %llu.\n",
+                static_cast<unsigned long long>(batches), draw_count, gpu_ms,
+                static_cast<unsigned long long>(draws), static_cast<unsigned long long>(maximum));
+        return true;
+    });
+    RecordMetalOwnership(batch.buffers, batch.images, false);
+    metal_async_issued = true;
+}
+
 bool Rasterizer::ExecuteMetal(const Pipeline* pipeline, std::array<u32, 3> groups,
                              const RenderState* render, bool indexed) {
     const auto* graphics = render ? static_cast<const GraphicsPipeline*>(pipeline) : nullptr;
@@ -1363,10 +1442,6 @@ bool Rasterizer::ExecuteMetal(const Pipeline* pipeline, std::array<u32, 3> group
         MetalBufferMirror* mirror = nullptr;
         bool current = false;
         u64 generation = 0;
-    };
-    struct Copy {
-        vk::Buffer source, destination;
-        vk::BufferCopy region;
     };
     std::vector<BbMetalFX::ShaderBinding> bindings;
     std::vector<Input> inputs;
@@ -1501,7 +1576,7 @@ bool Rasterizer::ExecuteMetal(const Pipeline* pipeline, std::array<u32, 3> group
         clone.end = std::max<u64>(clone.end, input.guest + input.descriptor.range);
         clone.inputs.push_back(input);
     }
-    std::vector<Copy> uploads, downloads;
+    std::vector<MetalBufferCopy> uploads, downloads;
     constexpr u64 MirrorBudget = 512 * 1024 * 1024;
     u64 total_cloned = 0, additional = 0;
     for (const auto& clone : clones) {
@@ -1563,56 +1638,27 @@ bool Rasterizer::ExecuteMetal(const Pipeline* pipeline, std::array<u32, 3> group
                 {first - clone.begin, written->descriptor.offset + first - written->guest, last - first}});
         }
     }
-    const u32 family = instance.GetGraphicsQueueFamilyIndex();
-    const auto ownership = [&](bool release, std::vector<Copy> copies) {
-        scheduler.Record([shared, image_barriers, family, release, copies = std::move(copies)](vk::CommandBuffer command) {
-            const vk::MemoryBarrier2 before{
-                .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
-                .srcAccessMask = vk::AccessFlagBits2::eMemoryWrite,
-                .dstStageMask = vk::PipelineStageFlagBits2::eCopy,
-                .dstAccessMask = vk::AccessFlagBits2::eTransferRead | vk::AccessFlagBits2::eTransferWrite,
-            };
-            if (release && !copies.empty()) {
-                command.pipelineBarrier2(vk::DependencyInfo{.memoryBarrierCount = 1, .pMemoryBarriers = &before});
-                for (const auto& copy : copies) command.copyBuffer(copy.source, copy.destination, copy.region);
-            }
-            std::vector<vk::BufferMemoryBarrier2> barriers;
-            for (const auto buffer : shared) barriers.push_back({
-                .srcStageMask = release ? vk::PipelineStageFlagBits2::eAllCommands : vk::PipelineStageFlagBits2::eNone,
-                .srcAccessMask = release ? vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite : vk::AccessFlags2{},
-                .dstStageMask = release ? vk::PipelineStageFlagBits2::eNone : vk::PipelineStageFlagBits2::eAllCommands,
-                .dstAccessMask = release ? vk::AccessFlags2{} : vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
-                .srcQueueFamilyIndex = release ? family : VK_QUEUE_FAMILY_EXTERNAL,
-                .dstQueueFamilyIndex = release ? VK_QUEUE_FAMILY_EXTERNAL : family,
-                .buffer = buffer, .offset = 0, .size = VK_WHOLE_SIZE,
-            });
-            if (!barriers.empty()) command.pipelineBarrier2(vk::DependencyInfo{
-                .bufferMemoryBarrierCount = u32(barriers.size()), .pBufferMemoryBarriers = barriers.data()});
-            if (!image_barriers.empty()) {
-                auto barriers = image_barriers;
-                for (auto& barrier : barriers) {
-                    barrier.srcStageMask = release ? vk::PipelineStageFlagBits2::eAllCommands : vk::PipelineStageFlagBits2::eNone;
-                    barrier.srcAccessMask = release ? vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite : vk::AccessFlags2{};
-                    barrier.dstStageMask = release ? vk::PipelineStageFlagBits2::eNone : vk::PipelineStageFlagBits2::eAllCommands;
-                    barrier.dstAccessMask = release ? vk::AccessFlags2{} : vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite;
-                    barrier.srcQueueFamilyIndex = release ? family : VK_QUEUE_FAMILY_EXTERNAL;
-                    barrier.dstQueueFamilyIndex = release ? VK_QUEUE_FAMILY_EXTERNAL : family;
-                    if (!release) std::swap(barrier.oldLayout, barrier.newLayout);
-                }
-                command.pipelineBarrier2(vk::DependencyInfo{.imageMemoryBarrierCount = u32(barriers.size()), .pImageMemoryBarriers = barriers.data()});
-            }
-            if (!release && !copies.empty()) {
-                for (const auto& copy : copies) command.copyBuffer(copy.source, copy.destination, copy.region);
-                const vk::MemoryBarrier2 after{
-                    .srcStageMask = vk::PipelineStageFlagBits2::eCopy,
-                    .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
-                    .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
-                    .dstAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
-                };
-                command.pipelineBarrier2(vk::DependencyInfo{.memoryBarrierCount = 1, .pMemoryBarriers = &after});
-            }
-        });
+    static const bool asynchronous = [] {
+        const char* value = std::getenv("BB_METAL_GRAPHICS_ASYNC");
+        return value && std::string_view(value) == "1";
+    }();
+    static const bool batching = [] {
+        const char* value = std::getenv("BB_METAL_GRAPHICS_BATCH");
+        return value && std::string_view(value) == "1";
+    }();
+    const bool queued = render && asynchronous;
+    // ponytail: read-only buffers and unchanged uploads only; extend after native resource ownership.
+    const bool batchable = queued && batching &&
+        std::none_of(bindings.begin(), bindings.end(), [](const auto& binding) { return binding.written; });
+    const auto same_subresource = [](const auto& a, const auto& b) {
+        return a.image == b.image && a.subresourceRange == b.subresourceRange;
     };
+    const bool layout_conflict = std::any_of(image_barriers.begin(), image_barriers.end(), [&](const auto& image) {
+        return std::any_of(metal_draw_batch.images.begin(), metal_draw_batch.images.end(), [&](const auto& previous) {
+            return same_subresource(image, previous) && image.oldLayout != previous.oldLayout;
+        });
+    });
+    if (!batchable || !uploads.empty() || layout_conflict) scheduler.FlushPendingExternal();
     float gpu_ms = NAN;
     const std::span<const u8> push{reinterpret_cast<const u8*>(&push_data), sizeof(push_data)};
     BbMetalFX::CommandResult result = BbMetalFX::CommandResult::Unavailable;
@@ -1631,45 +1677,63 @@ bool Rasterizer::ExecuteMetal(const Pipeline* pipeline, std::array<u32, 3> group
             const auto& buffer = bindings[index_binding];
             draw.index_buffer = buffer.native; draw.index_offset = buffer.offset; draw.index_type = static_cast<VkIndexType>(index_bind.type);
         }
-        result = native_draw->Draw(*render, scheduler.GetDynamicState(), attributes, vertices, bindings, push, draw, &gpu_ms, &work);
-        if (result != BbMetalFX::CommandResult::Prepared) return false;
+        result = native_draw->Draw(*render, scheduler.GetDynamicState(), attributes, vertices, bindings, push,
+            draw, &gpu_ms, &work, batchable ? &metal_draw_batch.command : nullptr);
+        if (result != BbMetalFX::CommandResult::Prepared) {
+            if (metal_draw_batch.work.empty()) metal_draw_batch.command.reset();
+            return false;
+        }
     }
-    static const bool asynchronous = [] {
-        const char* value = std::getenv("BB_METAL_GRAPHICS_ASYNC");
-        return value && std::string_view(value) == "1";
-    }();
-    scheduler.EndRendering();
-    runtime.FlushBarriers();
-    ownership(true, std::move(uploads));
-    const bool queued = render && asynchronous;
-    if (queued) {
-        scheduler.ExternalSemaphore();
-        const auto value = scheduler.NextExternalValue();
-        auto fence = std::make_shared<vk::UniqueFence>(Check(instance.GetDevice().createFenceUnique({})));
-        SubmitInfo release{};
-        release.fence = **fence;
-        scheduler.FlushForExternal(release, value);
-        scheduler.EnqueueExternal(std::move(fence), value, [work = std::move(work)] {
-            float timing = NAN;
-            const bool complete = work(&timing);
-            static std::atomic<u64> completed{0};
-            const auto count = complete ? completed.fetch_add(1, std::memory_order_relaxed) + 1 : 0;
-            if (count && (count <= 3 || count % 300 == 0))
-                std::fprintf(stderr, "Native Metal guest async draw completed #%llu: GPU %.3f ms.\n",
-                    static_cast<unsigned long long>(count), timing);
-            return complete;
-        });
-        ownership(false, std::move(downloads));
-        metal_async_issued = true;
+    // DrawRecord already flushes actual hazards; reads alone need no boundary inside a batch.
+    if (metal_draw_batch.work.empty()) runtime.FlushBarriers();
+    if (batchable) {
+        if (metal_draw_batch.work.empty()) {
+            scheduler.EndRendering();
+            metal_draw_batch.uploads = std::move(uploads);
+            scheduler.SetPendingExternal([this] { FlushMetalDrawBatch(); });
+        }
+        for (const auto buffer : shared)
+            if (std::find(metal_draw_batch.buffers.begin(), metal_draw_batch.buffers.end(), buffer) == metal_draw_batch.buffers.end())
+                metal_draw_batch.buffers.push_back(buffer);
+        for (const auto& image : image_barriers)
+            if (std::none_of(metal_draw_batch.images.begin(), metal_draw_batch.images.end(), [&](const auto& previous) {
+                return same_subresource(image, previous);
+            })) metal_draw_batch.images.push_back(image);
+        metal_draw_batch.work.push_back(std::move(work));
+        // Leave headroom in Metal's 64-command queue for other prepared operations.
+        if (metal_draw_batch.work.size() == 32) scheduler.FlushPendingExternal();
     } else {
-        scheduler.FinishForExternal();
-        result = render ? (work(&gpu_ms) ? BbMetalFX::CommandResult::Complete : BbMetalFX::CommandResult::Failed)
-                        : kernel->Dispatch(bindings, push, groups, &gpu_ms);
-        if (result == BbMetalFX::CommandResult::Failed)
-            UNREACHABLE_MSG("Native guest command failed after submission; refusing to replay partial writes");
-        ownership(false, result == BbMetalFX::CommandResult::Complete ? std::move(downloads) : std::vector<Copy>{});
-        scheduler.FinishForExternal(); // Retire clones without retiring the guest tick.
-        if (result != BbMetalFX::CommandResult::Complete) return false;
+        scheduler.EndRendering();
+        RecordMetalOwnership(shared, image_barriers, true, std::move(uploads));
+        if (queued) {
+            scheduler.ExternalSemaphore();
+            const auto value = scheduler.NextExternalValue();
+            auto fence = std::make_shared<vk::UniqueFence>(Check(instance.GetDevice().createFenceUnique({})));
+            SubmitInfo release{};
+            release.fence = **fence;
+            scheduler.FlushForExternal(release, value);
+            scheduler.EnqueueExternal(std::move(fence), value, [work = std::move(work)] {
+                float timing = NAN;
+                const bool complete = work(&timing);
+                static std::atomic<u64> completed{0};
+                const auto count = complete ? completed.fetch_add(1, std::memory_order_relaxed) + 1 : 0;
+                if (count && (count <= 3 || count % 300 == 0))
+                    std::fprintf(stderr, "Native Metal guest async draw completed #%llu: GPU %.3f ms.\n",
+                        static_cast<unsigned long long>(count), timing);
+                return complete;
+            });
+            RecordMetalOwnership(shared, image_barriers, false, std::move(downloads));
+            metal_async_issued = true;
+        } else {
+            scheduler.FinishForExternal();
+            result = render ? (work(&gpu_ms) ? BbMetalFX::CommandResult::Complete : BbMetalFX::CommandResult::Failed)
+                            : kernel->Dispatch(bindings, push, groups, &gpu_ms);
+            if (result == BbMetalFX::CommandResult::Failed)
+                UNREACHABLE_MSG("Native guest command failed after submission; refusing to replay partial writes");
+            RecordMetalOwnership(shared, image_barriers, false, result == BbMetalFX::CommandResult::Complete ? std::move(downloads) : std::vector<MetalBufferCopy>{});
+            scheduler.FinishForExternal(); // Retire clones without retiring the guest tick.
+            if (result != BbMetalFX::CommandResult::Complete) return false;
+        }
     }
     for (auto& clone : clones) clone.mirror->generation = clone.generation;
     for (const auto& bound : bound_buffers) runtime.AccessBuffer(bound.buffer, bound.offset, bound.size,
@@ -3734,13 +3798,15 @@ void Rasterizer::UnmapMemory(VAddr addr, u64 size) {
     }
 }
 
-void Rasterizer::UpdateDynamicState(const GraphicsPipeline* pipeline, const bool is_indexed) const {
+void Rasterizer::UpdateDynamicState(const GraphicsPipeline* pipeline, const bool is_indexed, bool emit) const {
     UpdateViewportScissorState();
     UpdateDepthStencilState();
     UpdatePrimitiveState(is_indexed);
     UpdateRasterizationState();
     UpdateColorBlendingState(pipeline);
 
+    if (!emit) return;
+    scheduler.FlushPendingExternal(); // Submission invalidates every field, before CommitWith visits them.
     auto& dynamic_state = scheduler.GetDynamicState();
     dynamic_state.CommitWith(instance.IsDepthBoundsSupported(),
                              instance.IsDynamicColorWriteMaskSupported(),

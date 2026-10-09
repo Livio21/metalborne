@@ -60,6 +60,7 @@ Scheduler::~Scheduler() {
 }
 
 void Scheduler::BeginRendering(const RenderState& new_state) {
+    FlushPendingExternal();
     if (is_rendering && render_state == new_state) {
         return;
     }
@@ -130,6 +131,7 @@ void Scheduler::BeginRendering(const RenderState& new_state) {
 }
 
 void Scheduler::EndRendering() {
+    FlushPendingExternal();
     if (!is_rendering) {
         return;
     }
@@ -198,6 +200,7 @@ void Scheduler::SignalAfterHostCopies(std::function<void()> signal) {
 }
 
 void Scheduler::WaitDeferredSignals() {
+    FlushPendingExternal();
     const u64 issued = deferred_signals_issued.load(std::memory_order_relaxed);
     if (deferred_signals_done->load(std::memory_order_acquire) >= issued ||
         BbToggle::Disabled(BbToggle::OrderedGuestWrites)) {
@@ -213,6 +216,7 @@ void Scheduler::WaitDeferredSignals() {
 }
 
 void Scheduler::WaitHostCopies() {
+    FlushPendingExternal();
     if (host_copies_done.load(std::memory_order_acquire) < host_copies_issued) {
         BbStats::WaitTimer timer{BbStats::host_copies_wait_ns};
         BbStats::host_copy_waits.fetch_add(1, std::memory_order_relaxed);
@@ -361,6 +365,7 @@ vk::Semaphore Scheduler::ExternalSemaphore() {
 }
 
 u64 Scheduler::NextExternalValue() {
+    FlushPendingExternal();
     std::scoped_lock lock{submit_mutex};
     external_next_value = std::max(external_next_value, external_wait_value) + 1;
     return external_next_value;
@@ -463,6 +468,7 @@ void Scheduler::AllocateWorkerCommandBuffers() {
 }
 
 void Scheduler::SubmitExecution(SubmitInfo& info, bool complete_tick, u64 external_value) {
+    FlushPendingExternal(); // The callback may submit; run it before taking submit_mutex.
     std::unique_lock lk{submit_mutex};
     ASSERT(!external_value || external_value > external_wait_value);
     const u64 signal_value = complete_tick ? work_semaphore.NextTick() : CurrentTick();

@@ -425,7 +425,7 @@ std::span<const ShaderResource> RenderPipeline::Resources(uint32_t stage) const 
 CommandResult RenderPipeline::Draw(const Vulkan::RenderState& state, const Vulkan::DynamicState& dynamic,
         std::span<const VkVertexInputAttributeDescription2EXT> attributes, std::span<const VertexBufferBinding> vertices,
         std::span<const ShaderBinding> bindings, std::span<const uint8_t> push, const DrawCommand& draw, float* gpu_ms,
-        std::function<bool(float*)>* deferred) const {
+        std::function<bool(float*)>* deferred, std::shared_ptr<GraphicsBatch>* graphics_batch) const {
     @autoreleasepool {
         if (!Available() || dynamic.viewports.empty() || dynamic.scissors.empty() || dynamic.depth_bounds_test_enabled ||
             dynamic.feedback_loop_enabled || dynamic.line_width != 1 || state.num_layers != 1 ||
@@ -556,6 +556,9 @@ CommandResult RenderPipeline::Draw(const Vulkan::RenderState& state, const Vulka
                 uint64_t(draw.count) * (draw.index_type == VK_INDEX_TYPE_UINT16 ? 2 : 4) > indices.length - draw.index_offset))
             return CommandResult::Unavailable;
         const auto primitive = MTLPrimitiveType(impl->topology);
+        if (graphics_batch && !*graphics_batch)
+            *graphics_batch = CreateGraphicsBatch((__bridge void*)vs.device);
+        if (graphics_batch && !*graphics_batch) return CommandResult::Unavailable;
         bool submitted = false;
         const bool complete = RunCommands(vs.device, [&](id<MTLCommandBuffer> command, id<MTLFence> fence) {
             auto encoder = [command renderCommandEncoderWithDescriptor:pass];
@@ -610,7 +613,7 @@ CommandResult RenderPipeline::Draw(const Vulkan::RenderState& state, const Vulka
                            instanceCount:draw.instances baseInstance:draw.first_instance];
             [encoder endEncoding];
             return true;
-        }, gpu_ms, &submitted, deferred);
+        }, gpu_ms, &submitted, deferred, graphics_batch ? *graphics_batch : nullptr);
         return complete ? deferred ? CommandResult::Prepared : CommandResult::Complete : submitted ? CommandResult::Failed : CommandResult::Unavailable;
     }
 }

@@ -1013,3 +1013,66 @@ environment differences were the two native graphics flags. This sequential
 reference confirms the native path is still substantially slower in the tested
 scene. Use Vulkan guest rendering while native submission/ownership work
 continues; neither run demonstrates stable 30 FPS or actual scanout pacing.
+
+### Conservative native draw ownership batches (2026-10-09)
+
+`BB_METAL_GRAPHICS_BATCH=1`, together with `BB_METAL_GRAPHICS=1` and
+`BB_METAL_GRAPHICS_ASYNC=1`, lets consecutive supported draws share a Vulkan
+ownership release, one external completion value and an acquire. The batch is
+limited to 32 prepared draws. Each draw now gets its own Metal render encoder
+inside one deferred Metal command buffer; an MTLFence orders consecutive
+encoders, and the worker commits and waits once per group. If batch creation or
+encoding is unavailable, the existing Vulkan fallback remains in place.
+
+The batch only accepts read-only shader resources. Storage writes, sparse mirror
+refreshes, actual image/buffer hazards, intervening Vulkan commands, guest signal
+boundaries, cache eviction and full submissions close it. Native draws update
+dynamic state without emitting unused Vulkan descriptors/vertex bindings;
+fallback draws emit all bindings after the pending batch is released. The logical
+guest tick stays unretired until the ordinary full submission, protecting stream
+reservations and deferred deletion.
+
+Scheduler hooks run before allocating recording-chunk capture data, issuing a
+host-copy sequence number, changing render-pass state or allocating an external
+completion value. They clear the callback before invoking it and run before the
+submission mutex is taken. A batch release suppresses the submit callback's
+Runtime barrier flush: a following draw may already have accumulated transitions,
+which must remain after the earlier batch's acquire. Sparse arena bindings still
+submit normally.
+
+The first gameplay attempt produced exclusively single-draw batches. Its
+diagnostic follow-up (`20261008-232719-222247-native-batch-boundaries`) sampled
+90 flush stacks: 57 entered `SmallGuestCopy`, 21 `WaitHostCopies` and 12
+`EndRendering`. The small-copy samples came through read-only stream-buffer
+reservations. A fresh reservation cannot overlap pending draws, so this case now
+copies synchronously while a native batch is pending. Existing-resource uploads
+and guest signal boundaries retain their flushes. Temporary stack tracing was
+removed before measurement.
+
+The headless check exercises two native render encoders in one Metal command
+buffer, followed by a dependent Vulkan download. It checks the pixels against
+the Vulkan reference and confirms guest callbacks retire only after the batch
+completes. Direct/threaded recording, Vulkan fallback, native buffer compute,
+scene MetalFX and the 64-command queue stress check passed. The fixtures do not
+directly instantiate the game's Rasterizer or stress 512 MiB cache eviction.
+
+Three game runs used the same GPU library and probe hashes, AC power, unchanged
+source-save hashes, 60-second nominal-pressure cooldown, 15-second warmup and
+35-second measurement. The only renderer setting that differed between the
+first pair was `BB_METAL_GRAPHICS_BATCH`. Unbatched measured **8.18 FPS**
+(7.3–8.9); batched measured **9.23 FPS** (8.9–9.5), with similar draws/frame
+(784–787 versus 778–791). Both had six windows, zero shader/pipeline compiles,
+nominal pressure and clean exits. The initial pair suggests a 12.8% gain, but
+the repeated unbatched run averaged **11.28 FPS** and swung from 14.0 FPS in
+three windows to 8.0–9.5 FPS in the next three, despite nominal pressure and
+786–790 draws/frame. The FPS change is therefore not attributable to batching
+yet; draw counts and the workload gate do not prove an identical game state.
+All runs stayed below the 30 FPS target, and nominal pressure does not report
+temperature or clock speed.
+
+In the batched run the process logged 49,092 native draws across 37,800 Metal
+command-buffer groups (1.30 draws/group on average, maximum six), including
+startup/menu work. That is about 23% fewer command-buffer submissions for the
+logged draws, but most groups still held one draw. Repeat with a reproducible
+stationary scene or recorded route and alternating runs before claiming a
+throughput or pacing improvement. Full-game stability remains unverified.

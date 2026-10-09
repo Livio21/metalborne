@@ -14,6 +14,8 @@ namespace Vulkan { struct RenderState; struct DynamicState; }
 
 namespace BbMetalFX {
 
+class GraphicsBatch;
+
 enum class ShaderResourceKind { Buffer, Texture, Sampler };
 struct ShaderResource {
     ShaderResourceKind kind;
@@ -97,7 +99,8 @@ public:
                        std::span<const VkVertexInputAttributeDescription2EXT>,
                        std::span<const VertexBufferBinding>, std::span<const ShaderBinding>,
                        std::span<const uint8_t> push, const DrawCommand&, float* gpu_ms = nullptr,
-                       std::function<bool(float*)>* deferred = nullptr) const;
+                       std::function<bool(float*)>* deferred = nullptr,
+                       std::shared_ptr<GraphicsBatch>* graphics_batch = nullptr) const;
 private:
     struct Impl;
     std::unique_ptr<Impl> impl;

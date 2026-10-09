@@ -712,6 +712,23 @@ public:
         this->on_submit = std::move(on_submit);
     }
 
+    /// Pending external work must precede the next Vulkan command or guest submission.
+    void SetPendingExternal(std::function<void()> flush) {
+        ASSERT(!pending_external);
+        pending_external = std::move(flush);
+    }
+
+    bool HasPendingExternal() const { return bool(pending_external); }
+
+    void FlushPendingExternal() {
+#ifdef __APPLE__
+        if (pending_external) {
+            auto flush = std::exchange(pending_external, {});
+            flush();
+        }
+#endif
+    }
+
     /// Returns the current render state.
     const RenderState& GetRenderState() const {
         return render_state;
@@ -727,6 +744,7 @@ public:
     /// records directly (Record() included, so callers may mix both) until the next
     /// KickRecording() or submission.
     [[gnu::noinline]] vk::CommandBuffer CommandBuffer() {
+        FlushPendingExternal();
         if (recorder_thread.joinable() && !direct_mode) {
             SyncRecording();
             direct_mode = true;
@@ -743,6 +761,7 @@ public:
     /// everything it uses (capture by value): it may run later on the recording thread.
     template <typename Func>
     void Record(Func&& func) {
+        FlushPendingExternal();
         if (!recorder_thread.joinable() || direct_mode) {
             func(current_cmdbuf);
             return;
@@ -762,7 +781,8 @@ public:
     }
 
     /// True when Record() defers commands (and RecordData() copies into chunks).
-    [[nodiscard]] bool IsRecordingDeferred() const noexcept {
+    [[nodiscard]] bool IsRecordingDeferred() {
+        FlushPendingExternal();
         return recorder_thread.joinable() && !direct_mode &&
                !BbToggle::Disabled(BbToggle::ThreadedRecording);
     }
@@ -812,6 +832,7 @@ public:
     /// work anyway, so small copies cost no wakeup); WaitHostCopies() covers it.
     template <typename Func>
     void RecordHostCopy(Func&& copy) {
+        FlushPendingExternal(); // Before issuing a copy a partial submission would wait for.
         Record([copy = std::forward<Func>(copy), this,
                 seq = ++host_copies_issued](vk::CommandBuffer) {
             copy();
@@ -906,6 +927,7 @@ private:
     CommandPool command_pool;
     DynamicState dynamic_state;
     SubmitFunc on_submit{};
+    std::function<void()> pending_external;
     vk::CommandBuffer current_cmdbuf;
     std::condition_variable_any event_cv;
     struct PendingOp {

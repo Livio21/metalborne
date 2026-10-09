@@ -201,7 +201,7 @@ private:
     void DepthStencilCopy(bool is_depth, bool is_stencil);
     void EliminateFastClear();
 
-    void UpdateDynamicState(const GraphicsPipeline* pipeline, bool is_indexed) const;
+    void UpdateDynamicState(const GraphicsPipeline* pipeline, bool is_indexed, bool emit = true) const;
     void UpdateViewportScissorState() const;
     void UpdateDepthStencilState() const;
     void UpdatePrimitiveState(bool is_indexed) const;
@@ -238,6 +238,22 @@ private:
     bool DispatchMetal(const ComputePipeline* pipeline, std::array<u32, 3> groups);
     bool ExecuteMetal(const Pipeline* pipeline, std::array<u32, 3> groups,
                       const RenderState* render = nullptr, bool indexed = false);
+    struct MetalBufferCopy {
+        vk::Buffer source, destination;
+        vk::BufferCopy region;
+    };
+    void RecordMetalOwnership(const std::vector<vk::Buffer>& shared,
+                              const std::vector<vk::ImageMemoryBarrier2>& image_barriers,
+                              bool release, std::vector<MetalBufferCopy> copies = {});
+    void FlushMetalDrawBatch();
+    struct MetalDrawBatch {
+        std::vector<std::function<bool(float*)>> work;
+        std::shared_ptr<BbMetalFX::GraphicsBatch> command;
+        std::vector<vk::Buffer> buffers;
+        std::vector<vk::ImageMemoryBarrier2> images;
+        std::vector<MetalBufferCopy> uploads;
+    } metal_draw_batch;
+    bool metal_batch_submitting = false;
     struct MetalBufferMirror {
         std::shared_ptr<BbMetalFX::SharedBuffer> buffer;
         u64 generation = UINT64_MAX;

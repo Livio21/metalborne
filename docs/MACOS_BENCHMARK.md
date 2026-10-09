@@ -76,6 +76,13 @@ python3 tools/benchmark_macos.py --manual --seconds 30
 python3 tools/benchmark_macos.py --self-check
 ```
 
+The experimental guest-graphics path requires `BB_METAL_GRAPHICS=1` and
+`BB_METAL_GRAPHICS_ASYNC=1`; `BB_METAL_GRAPHICS_BATCH=1` enables shared Metal
+command buffers for eligible read-only draws. For an A/B, keep those two flags,
+the MetalFX settings, save, power source and route fixed, and change only the
+batch flag between runs. This path remains opt-in and has not established a
+stable 30 FPS result.
+
 For a recorded walking/camera route, pass `--replay /absolute/path/route.txt`.
 The runtime's existing `BB_PAD_RECORD` / F9 mechanism creates recordings with
 eight values per line: milliseconds, buttons, four stick axes and two triggers.
