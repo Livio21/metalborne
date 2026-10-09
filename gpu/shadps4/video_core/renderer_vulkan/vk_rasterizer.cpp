@@ -1231,6 +1231,12 @@ void Rasterizer::DrawIndirectRecord(const GraphicsPipeline* pipeline, bool is_in
     const VAddr count_address = indirect.count;
     const u32 stride = indirect.stride;
     const u32 max_count = indirect.max_count;
+    if (!max_count) return;
+    const u32 command_size = is_indexed ? sizeof(VkDrawIndexedIndirectCommand) : sizeof(VkDrawIndirectCommand);
+    const u64 argument_bytes = u64(stride) * (max_count - 1) + command_size;
+    if (stride < command_size || stride % 4 || argument_bytes > UINT32_MAX) {
+        return;
+    }
 
     // Indirect arguments may be GPU-written: leave these draws on camera fallback.
     motion_draw = false;
@@ -1253,8 +1259,8 @@ void Rasterizer::DrawIndirectRecord(const GraphicsPipeline* pipeline, bool is_in
     }
 
     const auto [buffer, base] =
-        buffer_cache.ObtainBuffer(indirect.args, stride * max_count, false);
-    needs_barrier |= runtime.IsBufferAccessed(buffer, base, stride * max_count);
+        buffer_cache.ObtainBuffer(indirect.args, static_cast<u32>(argument_bytes), false);
+    needs_barrier |= runtime.IsBufferAccessed(buffer, base, argument_bytes);
 
     const VideoCore::Buffer* count_buffer;
     u64 count_offset;
@@ -1279,30 +1285,40 @@ void Rasterizer::DrawIndirectRecord(const GraphicsPipeline* pipeline, bool is_in
     }
     UpdateDynamicState(pipeline, is_indexed);
     MarkPass(pipeline, state);
-    scheduler.BeginRendering(state);
-
-    ASSERT(stride == (is_indexed ? sizeof(VkDrawIndexedIndirectCommand)
-                                 : sizeof(VkDrawIndirectCommand)));
+    bool native_draw = false;
+#ifdef __APPLE__
+    if (!is_indexed && !count_address && !FrameCapture::Active() && pipeline->metal_pipeline &&
+        pipeline->metal_pipeline->Available()) {
+        const MetalIndirectDraw metal_indirect{{buffer->Handle(), base, argument_bytes}, indirect.args,
+                                               max_count, stride};
+        native_draw = ExecuteMetal(pipeline, {}, &state, false, &metal_indirect);
+    }
+#endif
     const vk::Pipeline handle = pipeline->Handle();
     const vk::Buffer args = buffer->Handle();
     const u64 args_offset = base;
     const vk::Buffer counts = count_address != 0 ? count_buffer->Handle() : vk::Buffer{};
     const u64 counts_offset = count_address != 0 ? count_offset : 0;
-    scheduler.Record([=](vk::CommandBuffer cmdbuf) {
-        cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, handle);
-        if (is_indexed) {
-            if (counts) {
-                cmdbuf.drawIndexedIndirectCount(args, args_offset, counts, counts_offset, max_count,
-                                                stride);
+    if (!native_draw) {
+        scheduler.BeginRendering(state);
+        scheduler.Record([=](vk::CommandBuffer cmdbuf) {
+            cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, handle);
+            if (is_indexed) {
+                if (counts) {
+                    cmdbuf.drawIndexedIndirectCount(args, args_offset, counts, counts_offset, max_count,
+                                                    stride);
+                } else {
+                    cmdbuf.drawIndexedIndirect(args, args_offset, max_count, stride);
+                }
+            } else if (counts) {
+                cmdbuf.drawIndirectCount(args, args_offset, counts, counts_offset, max_count, stride);
             } else {
-                cmdbuf.drawIndexedIndirect(args, args_offset, max_count, stride);
+                cmdbuf.drawIndirect(args, args_offset, max_count, stride);
             }
-        } else if (counts) {
-            cmdbuf.drawIndirectCount(args, args_offset, counts, counts_offset, max_count, stride);
-        } else {
-            cmdbuf.drawIndirect(args, args_offset, max_count, stride);
-        }
-    });
+        });
+    }
+    runtime.AccessBuffer(buffer, base, argument_bytes, vk::PipelineStageFlagBits2::eDrawIndirect,
+                         vk::AccessFlagBits2::eIndirectCommandRead);
     DebugState.IncDrawCall();
 
     ResetBindings(false);
@@ -1416,7 +1432,8 @@ void Rasterizer::FlushMetalDrawBatch() {
 }
 
 bool Rasterizer::ExecuteMetal(const Pipeline* pipeline, std::array<u32, 3> groups,
-                             const RenderState* render, bool indexed) {
+                             const RenderState* render, bool indexed,
+                             const MetalIndirectDraw* indirect) {
     const auto* graphics = render ? static_cast<const GraphicsPipeline*>(pipeline) : nullptr;
     const auto* kernel = render ? nullptr : static_cast<const ComputePipeline*>(pipeline)->metal_kernel.get();
     const auto* native_draw = graphics ? graphics->metal_pipeline.get() : nullptr;
@@ -1497,6 +1514,14 @@ bool Rasterizer::ExecuteMetal(const Pipeline* pipeline, std::array<u32, 3> group
         inputs.push_back({descriptor, guest, binding});
         return true;
     };
+    size_t indirect_binding = SIZE_MAX;
+    if (indirect) {
+        if (indexed || !indirect->count || indirect->stride < sizeof(VkDrawIndirectCommand) ||
+            indirect->stride % 4 || indirect->args.range !=
+                u64(indirect->count - 1) * indirect->stride + sizeof(VkDrawIndirectCommand)) return false;
+        indirect_binding = bindings.size();
+        if (!buffer_binding(indirect->args, UINT32_MAX - 33, false, indirect->guest)) return false;
+    }
     std::vector<BbMetalFX::ShaderResource> resources;
     const auto add_resources = [&](auto list) {
         for (const auto& resource : list) if (std::none_of(resources.begin(), resources.end(), [&](const auto& previous) {
@@ -1673,12 +1698,21 @@ bool Rasterizer::ExecuteMetal(const Pipeline* pipeline, std::array<u32, 3> group
         }
         const auto [vertex, instance] = GetDrawOffsets(Regs(), graphics->GetStage(Shader::SwStage::Vertex), graphics->GetFetchShader());
         BbMetalFX::DrawCommand draw{Regs().num_indices, Regs().num_instances.NumInstances(), instance, s32(vertex)};
+        if (indirect) {
+            const auto& buffer = bindings[indirect_binding];
+            draw.indirect_buffer = buffer.native;
+            draw.indirect_offset = buffer.offset;
+            draw.indirect_count = indirect->count;
+            draw.indirect_stride = indirect->stride;
+        }
         if (indexed) {
             const auto& buffer = bindings[index_binding];
             draw.index_buffer = buffer.native; draw.index_offset = buffer.offset; draw.index_type = static_cast<VkIndexType>(index_bind.type);
         }
         result = native_draw->Draw(*render, scheduler.GetDynamicState(), attributes, vertices, bindings, push,
             draw, &gpu_ms, &work, batchable ? &metal_draw_batch.command : nullptr);
+        if (result == BbMetalFX::CommandResult::Failed)
+            UNREACHABLE_MSG("Native guest graphics draw failed after submission; refusing to replay partial writes");
         if (result != BbMetalFX::CommandResult::Prepared) {
             if (metal_draw_batch.work.empty()) metal_draw_batch.command.reset();
             return false;

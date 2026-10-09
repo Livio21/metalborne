@@ -84,6 +84,10 @@ struct DrawCommand {
     void* index_buffer = nullptr;
     uint64_t index_offset = 0;
     VkIndexType index_type = VK_INDEX_TYPE_UINT16;
+    void* indirect_buffer = nullptr;
+    uint64_t indirect_offset = 0;
+    uint32_t indirect_count = 0;
+    uint32_t indirect_stride = 0;
 };
 
 class RenderPipeline {

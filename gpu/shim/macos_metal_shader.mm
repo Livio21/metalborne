@@ -3,6 +3,7 @@
 #include "macos_metalfx.h"
 #include <spirv_cross/spirv_msl.hpp>
 #include <algorithm>
+#include <cstddef>
 #include <cstring>
 #include <stdexcept>
 #include <string>
@@ -10,6 +11,17 @@
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 
 namespace BbMetalFX {
+static_assert(sizeof(MTLDrawPrimitivesIndirectArguments) == sizeof(VkDrawIndirectCommand));
+static_assert(offsetof(MTLDrawPrimitivesIndirectArguments, vertexCount) == offsetof(VkDrawIndirectCommand, vertexCount));
+static_assert(offsetof(MTLDrawPrimitivesIndirectArguments, instanceCount) == offsetof(VkDrawIndirectCommand, instanceCount));
+static_assert(offsetof(MTLDrawPrimitivesIndirectArguments, vertexStart) == offsetof(VkDrawIndirectCommand, firstVertex));
+static_assert(offsetof(MTLDrawPrimitivesIndirectArguments, baseInstance) == offsetof(VkDrawIndirectCommand, firstInstance));
+static_assert(sizeof(MTLDrawIndexedPrimitivesIndirectArguments) == sizeof(VkDrawIndexedIndirectCommand));
+static_assert(offsetof(MTLDrawIndexedPrimitivesIndirectArguments, indexCount) == offsetof(VkDrawIndexedIndirectCommand, indexCount));
+static_assert(offsetof(MTLDrawIndexedPrimitivesIndirectArguments, instanceCount) == offsetof(VkDrawIndexedIndirectCommand, instanceCount));
+static_assert(offsetof(MTLDrawIndexedPrimitivesIndirectArguments, indexStart) == offsetof(VkDrawIndexedIndirectCommand, firstIndex));
+static_assert(offsetof(MTLDrawIndexedPrimitivesIndirectArguments, baseVertex) == offsetof(VkDrawIndexedIndirectCommand, vertexOffset));
+static_assert(offsetof(MTLDrawIndexedPrimitivesIndirectArguments, baseInstance) == offsetof(VkDrawIndexedIndirectCommand, firstInstance));
 static uint32_t TextureScalar(MTLPixelFormat format) {
     switch (format) {
 #define U(f) case MTLPixelFormat##f:
@@ -555,6 +567,17 @@ CommandResult RenderPipeline::Draw(const Vulkan::RenderState& state, const Vulka
                 draw.index_offset % (draw.index_type == VK_INDEX_TYPE_UINT16 ? 2 : 4) || draw.index_offset > indices.length ||
                 uint64_t(draw.count) * (draw.index_type == VK_INDEX_TYPE_UINT16 ? 2 : 4) > indices.length - draw.index_offset))
             return CommandResult::Unavailable;
+        id<MTLBuffer> indirect = (__bridge id<MTLBuffer>)draw.indirect_buffer;
+        if (draw.indirect_buffer || draw.indirect_count || draw.indirect_stride) {
+            const uint64_t argument_size = indices ? sizeof(MTLDrawIndexedPrimitivesIndirectArguments)
+                                                   : sizeof(MTLDrawPrimitivesIndirectArguments);
+            if (!indirect || indirect.device != vs.device || !draw.indirect_count ||
+                draw.indirect_offset % 4 || draw.indirect_stride < argument_size || draw.indirect_stride % 4 ||
+                draw.indirect_count - 1 > (UINT64_MAX - draw.indirect_offset) / draw.indirect_stride)
+                return CommandResult::Unavailable;
+            const uint64_t last = draw.indirect_offset + uint64_t(draw.indirect_count - 1) * draw.indirect_stride;
+            if (last > indirect.length || argument_size > indirect.length - last) return CommandResult::Unavailable;
+        }
         const auto primitive = MTLPrimitiveType(impl->topology);
         if (graphics_batch && !*graphics_batch)
             *graphics_batch = CreateGraphicsBatch((__bridge void*)vs.device);
@@ -606,7 +629,17 @@ CommandResult RenderPipeline::Draw(const Vulkan::RenderState& state, const Vulka
             };
             bind(vs, vertex_args, true);
             if (fs) bind(*fs, fragment_args, false);
-            if (indices) [encoder drawIndexedPrimitives:primitive indexCount:draw.count
+            if (indirect) {
+                [encoder useResource:indirect usage:MTLResourceUsageRead stages:MTLRenderStageVertex];
+                for (uint32_t i = 0; i < draw.indirect_count; ++i) {
+                    const uint64_t offset = draw.indirect_offset + uint64_t(i) * draw.indirect_stride;
+                    if (indices) [encoder drawIndexedPrimitives:primitive
+                        indexType:draw.index_type == VK_INDEX_TYPE_UINT16 ? MTLIndexTypeUInt16 : MTLIndexTypeUInt32
+                        indexBuffer:indices indexBufferOffset:draw.index_offset
+                        indirectBuffer:indirect indirectBufferOffset:offset];
+                    else [encoder drawPrimitives:primitive indirectBuffer:indirect indirectBufferOffset:offset];
+                }
+            } else if (indices) [encoder drawIndexedPrimitives:primitive indexCount:draw.count
                 indexType:draw.index_type == VK_INDEX_TYPE_UINT16 ? MTLIndexTypeUInt16 : MTLIndexTypeUInt32
                 indexBuffer:indices indexBufferOffset:draw.index_offset instanceCount:draw.instances baseVertex:draw.first_vertex baseInstance:draw.first_instance];
             else [encoder drawPrimitives:primitive vertexStart:draw.first_vertex vertexCount:draw.count

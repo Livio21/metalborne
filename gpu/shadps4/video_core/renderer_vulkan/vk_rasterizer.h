@@ -239,8 +239,14 @@ private:
     void DispatchRecord(const ComputePipeline* pipeline);
 #ifdef __APPLE__
     bool DispatchMetal(const ComputePipeline* pipeline, std::array<u32, 3> groups);
+    struct MetalIndirectDraw {
+        vk::DescriptorBufferInfo args;
+        VAddr guest;
+        u32 count, stride;
+    };
     bool ExecuteMetal(const Pipeline* pipeline, std::array<u32, 3> groups,
-                      const RenderState* render = nullptr, bool indexed = false);
+                      const RenderState* render = nullptr, bool indexed = false,
+                      const MetalIndirectDraw* indirect = nullptr);
     struct MetalBufferCopy {
         vk::Buffer source, destination;
         vk::BufferCopy region;

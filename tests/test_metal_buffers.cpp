@@ -921,7 +921,7 @@ int main(int argc, char** argv) {
         assert(BbMetalFX::FindNativeSampler(*sampler));
         Buffer upload(instance, 0, 1024, MemoryType::HostUncached), actual(instance, 0, 4096, MemoryType::HostCached),
             expected(instance, 0, 4096, MemoryType::HostCached), vertex_data(instance, 0, 512, MemoryType::HostUncached),
-            index_data(instance, 0, 64, MemoryType::HostUncached);
+            index_data(instance, 0, 64, MemoryType::HostUncached), indirect_data(instance, 0, 48, MemoryType::HostUncached);
         Buffer vertex_mirror(instance, 0, 512, MemoryType::DeviceLocal), native_written(instance, 0, 512, MemoryType::DeviceLocal),
             mirror_readback(instance, 0, 512, MemoryType::HostCached);
         const auto refresh_mirror = [&] {
@@ -1066,9 +1066,9 @@ int main(int argc, char** argv) {
             scheduler.Record([images, &dispatch](vk::CommandBuffer command) {
                 command.pipelineBarrier2(vk::DependencyInfo{.imageMemoryBarrierCount = u32(images.size()), .pImageMemoryBarriers = images.data()}, dispatch);
             });
-            const std::array handles{vertex_mirror.Handle(), index_data.Handle(), native_written.Handle()};
+            const std::array handles{vertex_mirror.Handle(), index_data.Handle(), native_written.Handle(), indirect_data.Handle()};
             scheduler.Record([handles, release, family = instance.GetGraphicsQueueFamilyIndex(), &dispatch](vk::CommandBuffer command) {
-                std::array<vk::BufferMemoryBarrier2, 3> barriers;
+                std::array<vk::BufferMemoryBarrier2, 4> barriers;
                 for (size_t i = 0; i < handles.size(); ++i) barriers[i] = {
                     .srcStageMask = release ? vk::PipelineStageFlagBits2::eAllCommands : vk::PipelineStageFlagBits2::eNone,
                     .srcAccessMask = release ? vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite : vk::AccessFlags2{},
@@ -1217,6 +1217,52 @@ int main(int argc, char** argv) {
         ownership(false);
         assert(helper_ready);
         std::puts("PASS: synchronous native helper completes while 64 deferred graphics commands fill their queue");
+        std::memcpy(vertex_data.mapped_data.data(), points.data(), sizeof(points));
+        vertex_data.Flush(0, vertex_data.SizeBytes());
+        native_vertex.input.stride = 16;
+        refresh_mirror();
+        const VkDrawIndirectCommand indirect_commands[]{{3, 1, 1, 0}, {3, 1, 2, 0}};
+        std::memset(indirect_data.mapped_data.data(), 0xcd, indirect_data.SizeBytes());
+        std::memcpy(indirect_data.mapped_data.data(), &indirect_commands[0], sizeof(indirect_commands[0]));
+        std::memcpy(indirect_data.mapped_data.data() + 32, &indirect_commands[1], sizeof(indirect_commands[1]));
+        indirect_data.Flush(0, indirect_data.SizeBytes());
+        state.color_attachments[0].image_view = *output_view.image_view;
+        BbMetalFX::DrawCommand indirect_draw{};
+        indirect_draw.indirect_buffer = indirect_data.buffer.metal->NativeHandle();
+        indirect_draw.indirect_count = std::size(indirect_commands);
+        indirect_draw.indirect_stride = 32;
+        ownership(true);
+        assert(metal_pipeline.Draw(state, dynamic, {&native_attribute, 1}, {&native_vertex, 1}, shader_bindings,
+            push, indirect_draw) == BbMetalFX::CommandResult::Complete);
+        ownership(false);
+        runtime.Transit(&target_depth, vk::ImageLayout::eGeneral, vk::PipelineStageFlagBits2::eAllCommands,
+                        vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite);
+        runtime.Transit(&reference, vk::ImageLayout::eGeneral, vk::PipelineStageFlagBits2::eAllCommands,
+                        vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite);
+        runtime.FlushBarriers();
+        state.color_attachments[0].image_view = *reference_view.image_view;
+        scheduler.BeginRendering(state);
+        scheduler.Record([&](vk::CommandBuffer command) {
+            command.bindPipeline(vk::PipelineBindPoint::eGraphics, *vk_pipeline, dispatch);
+            command.setViewport(0, dynamic.viewports, dispatch); command.setScissor(0, dynamic.scissors, dispatch);
+            const vk::Buffer vertex = vertex_data.Handle(); const vk::DeviceSize offset = 0;
+            command.bindVertexBuffers(0, 1, &vertex, &offset, dispatch);
+            const vk::DescriptorImageInfo image_info{{}, *sampled_view.image_view, vk::ImageLayout::eGeneral}, sampler_info{*sampler, {}, vk::ImageLayout::eUndefined};
+            const vk::WriteDescriptorSet writes[]{
+                {.dstBinding = 0, .descriptorCount = 1, .descriptorType = vk::DescriptorType::eSampledImage, .pImageInfo = &image_info},
+                {.dstBinding = 1, .descriptorCount = 1, .descriptorType = vk::DescriptorType::eSampler, .pImageInfo = &sampler_info}};
+            command.pushDescriptorSetKHR(vk::PipelineBindPoint::eGraphics, *layout, 0, writes, dispatch);
+            command.pushConstants(*layout, vk::ShaderStageFlagBits::eFragment, 0, 16, tint.data(), dispatch);
+            command.drawIndirect(indirect_data.Handle(), 0, std::size(indirect_commands), 32, dispatch);
+        });
+        scheduler.EndRendering();
+        runtime.DownloadImage(&output, &actual, {&whole, 1});
+        runtime.DownloadImage(&reference, &expected, {&whole, 1});
+        scheduler.Finish(); actual.Invalidate(0, 4096); expected.Invalidate(0, 4096);
+        for (u32 i = 0; i < 4096; ++i) assert(std::abs(int(actual.mapped_data[i])-int(expected.mapped_data[i])) <= 1);
+        assert(actual.mapped_data[10 * 32 * 4 + 10 * 4] != actual.mapped_data[0]);
+        state.color_attachments[0].image_view = *output_view.image_view;
+        std::puts("PASS: two non-indexed Metal indirect draws with Vulkan-compatible arguments and stride match the Vulkan reference pixels");
         instance.GetDevice().destroyShaderModule(vs, nullptr, dispatch); instance.GetDevice().destroyShaderModule(fs, nullptr, dispatch);
         std::puts("PASS: native indexed textured graphics versus Vulkan, mip/layer/swizzle views, sampler LOD bias, base vertex/index offset, dynamic stride, blend/channel mask, depth, viewport/scissor, untouched pixels, queued mirror refresh/native writeback and ordered async completion preserving the guest tick");
     }

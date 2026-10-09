@@ -799,7 +799,10 @@ reflection checks sampled texture dimension, integer/float type and depth
 requirements. Dynamic vertex stride, index offset/base vertex, color masks,
 blending and depth/stencil share the existing Vulkan state. Geometry,
 tessellation, fan/adjacency/patch topology and unsupported draw/state contracts
-remain on Vulkan. Direct draws are covered; indirect draws are not replaced.
+remain on Vulkan. Direct draws are covered. Non-indexed, non-counted indirect
+draws now translate the Vulkan argument layout directly into Metal's indirect
+draw API. Indexed indirect draws, count-buffer draws and frame capture retain
+the Vulkan path; the current indirect coverage is not a measured speedup.
 
 Ordinary exportable buffers bind their shared storage directly. Sparse arenas
 use persistent placement-buffer mirrors populated by Vulkan copies. Overlapping
@@ -822,6 +825,11 @@ per-command ownership transfers and waits.
   resource/copy/MetalFX checks also passed. Local log:
   `out/macos-native-metal/graphics-check.log`. A texture type warning in that
   log was corrected; the updated async and threaded checks pass without it.
+- Added a second fixture for two non-indexed indirect commands with padded stride
+  and a Vulkan pixel reference. Static layout assertions cover both Vulkan/Metal
+  indirect argument structs. It compiles, but the current host's MoltenVK reports
+  the emulator-required `robustBufferAccess2` feature unavailable, so no pixel
+  result is claimed here.
 - The real game buffer-copy shader still passed its offset/push/output-guard
   comparison: `out/macos-native-metal/guest-compute-regression-check.log`.
 - `out/benchmarks/20261008-123758-997428-native-graphics-isolated/` booted the
